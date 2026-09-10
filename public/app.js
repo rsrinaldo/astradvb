@@ -1,9 +1,9 @@
-const state = { status: null, streams: [], adapters: [], sessions: [], logs: [], config: null, query: '', editing: null, editingProfile: null, editingAdapter: null, token: sessionStorage.getItem('astra-token') || '' };
+const state = { status: null, streams: [], adapters: [], sessions: [], logs: [], config: null, query: '', editing: null, editingProfile: null, editingAdapter: null };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
 async function api(path, options = {}) {
-  const headers = { ...(options.body ? { 'content-type': 'application/json' } : {}), ...(state.token ? { authorization: `Bearer ${state.token}` } : {}), ...(options.headers || {}) };
+  const headers = { ...(options.body ? { 'content-type': 'application/json' } : {}), ...(options.headers || {}) };
   const response = await fetch(path, { ...options, headers });
   const value = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(value.error || `Request failed: ${response.status}`);
@@ -21,18 +21,13 @@ async function refresh() {
 }
 
 async function loadConfig() {
-  try { state.config = await api('/api/config'); $('#auth-state').textContent = 'Configuration access granted.'; fillSettings(); return state.config; }
-  catch (error) { $('#auth-state').textContent = error.message; throw error; }
+  state.config = await api('/api/config'); fillSettings(); return state.config;
 }
 
 function render() {
   const status = state.status || { engine: 'offline', uptimeSeconds: 0, streams: {}, sessions: 0, memory: {} };
   $('#engine-status').textContent = status.engine === 'online' ? 'Engine online' : 'Engine offline';
   $('#engine-detail').textContent = `Uptime ${duration(status.uptimeSeconds)} · v${status.version || '?'}`;
-  const protectedAccess = status.authentication === 'enabled';
-  $('#token-controls').classList.toggle('hidden', !protectedAccess);
-  $('#auth-help').textContent = protectedAccess ? 'Enter the token configured in ASTRA_ADMIN_TOKEN. It stays in this browser tab.' : 'Anyone who can reach this server can change its configuration.';
-  if (!protectedAccess) $('#auth-state').textContent = 'Open access enabled';
   for (const [id, path] of [['playlist-url', '/playlist.m3u'], ['epg-xml-url', '/epg.xml'], ['epg-json-url', '/api/epg']]) { const link = $(`#${id}`); link.href = path; link.textContent = `${location.origin}${path}`; }
   const bitrate = state.streams.reduce((sum, stream) => sum + (stream.bitrateKbps || 0), 0);
   const running = state.streams.filter((stream) => stream.state === 'running').length;
@@ -171,7 +166,7 @@ async function openStream(id = null, initialInput = '') {
     $('#stream-dialog-title').textContent = id ? stream.name : 'New stream';
     $('#delete-stream').classList.toggle('hidden', !id);
     selectTab('general'); $('#stream-dialog').showModal();
-  } catch (error) { toast(error.message, true); if (state.status?.authentication === 'enabled') showView('settings'); }
+  } catch (error) { toast(error.message, true); }
 }
 
 async function saveStream(event) {
@@ -217,7 +212,6 @@ $('#new-cas-profile').addEventListener('click', () => openCASProfile());
 $('#cas-profiles').addEventListener('click', (event) => { const row = event.target.closest('[data-profile]'); if (row) openCASProfile(row.dataset.profile); });
 $('#cas-profile-form').addEventListener('submit', saveCASProfile);
 $('#delete-cas-profile').addEventListener('click', deleteCASProfile);
-$('#save-token').addEventListener('click', () => { state.token = $('#admin-token').value; sessionStorage.setItem('astra-token', state.token); state.config = null; loadConfig().then(() => toast('Administrator access enabled')).catch((error) => toast(error.message, true)); });
 $('#adapter-form').addEventListener('submit', saveAdapter);
 $('#delete-adapter').addEventListener('click', deleteAdapter);
 $('#use-adapter-stream').addEventListener('click', useAdapterInStream);
@@ -236,6 +230,5 @@ $('#export-form').addEventListener('submit', (event) => {
   $('#export-dialog').close();
 });
 
-$('#admin-token').value = state.token;
 refresh(); setInterval(refresh, 3000);
 const events = new EventSource('/api/events'); events.addEventListener('status', (event) => { state.status = JSON.parse(event.data); render(); }); events.addEventListener('log', (event) => { state.logs.unshift(JSON.parse(event.data)); state.logs = state.logs.slice(0, 100); renderLogs(); });

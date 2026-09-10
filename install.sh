@@ -37,13 +37,11 @@ if [[ ! -f /var/lib/astra-linux/config.json ]]; then
   install -o astra -g astra -m 0600 config.example.json /var/lib/astra-linux/config.json
 fi
 if [[ ! -f /etc/astra-linux/environment ]]; then
-  token="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
   secret="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
-  printf 'ASTRA_ADMIN_TOKEN=%s\nASTRA_SECRET_KEY=%s\nASTRA_TSDECRYPT=/usr/local/bin/tsdecrypt\n' "$token" "$secret" > /etc/astra-linux/environment
+  printf 'ASTRA_SECRET_KEY=%s\nASTRA_TSDECRYPT=/usr/local/bin/tsdecrypt\n' "$secret" > /etc/astra-linux/environment
   chmod 0600 /etc/astra-linux/environment
-  echo "Administrator token: $token"
-  echo "Store it securely; it is not shown again."
 fi
+sed -i '/^ASTRA_ADMIN_TOKEN=/d' /etc/astra-linux/environment
 if ! grep -q '^ASTRA_SECRET_KEY=' /etc/astra-linux/environment; then
   secret="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
   printf 'ASTRA_SECRET_KEY=%s\nASTRA_TSDECRYPT=/usr/local/bin/tsdecrypt\n' "$secret" >> /etc/astra-linux/environment

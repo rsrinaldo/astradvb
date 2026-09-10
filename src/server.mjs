@@ -20,7 +20,6 @@ await manager.start();
 const startedAt = Date.now();
 const sessions = new Map();
 const sseClients = new Set();
-const adminToken = process.env.ASTRA_ADMIN_TOKEN || '';
 let adapterCache = { expires: 0, value: [] };
 
 logger.on('entry', (entry) => broadcast('log', entry));
@@ -32,8 +31,6 @@ function json(response, status, value) {
 }
 
 function error(response, status, message) { json(response, status, { error: message }); }
-function authorized(request) { return !adminToken || request.headers.authorization === `Bearer ${adminToken}`; }
-function requireAdmin(request, response) { if (authorized(request)) return true; error(response, 401, 'Administrator token required'); return false; }
 
 function requestBase(request) {
   if (store.value.server.publicBaseUrl) return store.value.server.publicBaseUrl;
@@ -68,10 +65,10 @@ async function body(request, limit = 1024 * 1024) {
 function status() {
   const streams = manager.list();
   return {
-    version: '0.5.1',
+    version: '0.6.0',
     uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
     engine: 'online',
-    authentication: adminToken ? 'enabled' : 'disabled',
+    authentication: 'disabled',
     streams: { total: streams.length, running: streams.filter((stream) => stream.state === 'running').length, warning: streams.filter((stream) => stream.state === 'warning' || stream.state === 'error').length },
     sessions: sessions.size,
     memory: process.memoryUsage(),
@@ -130,7 +127,6 @@ const server = http.createServer(async (request, response) => {
       const value = xmltv(document); response.writeHead(200, { 'content-type': 'application/xml; charset=utf-8', 'content-length': Buffer.byteLength(value), 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }); response.end(value); return;
     }
     if (request.method === 'GET' && path === '/api/config') {
-      if (!requireAdmin(request, response)) return;
       return json(response, 200, publicConfig());
     }
     if (request.method === 'GET' && path === '/api/events') {
@@ -153,30 +149,24 @@ const server = http.createServer(async (request, response) => {
 
     const streamRoute = path.match(/^\/api\/streams\/([a-zA-Z0-9_-]+)$/);
     if (request.method === 'PUT' && streamRoute) {
-      if (!requireAdmin(request, response)) return;
       const value = normalizeStream({ ...(await body(request)), id: streamRoute[1] });
       const saved = await manager.upsert(value); broadcast('config', { resource: 'stream', id: saved.id }); return json(response, 200, saved);
     }
     if (request.method === 'POST' && path === '/api/streams') {
-      if (!requireAdmin(request, response)) return;
       const value = normalizeStream(await body(request));
       if (manager.get(value.id)) return error(response, 409, 'Stream already exists');
       const saved = await manager.upsert(value); broadcast('config', { resource: 'stream', id: saved.id }); return json(response, 201, saved);
     }
     if (request.method === 'DELETE' && streamRoute) {
-      if (!requireAdmin(request, response)) return;
       const removed = await manager.remove(streamRoute[1]); return removed ? json(response, 200, { removed: true }) : error(response, 404, 'Stream not found');
     }
     if (request.method === 'PUT' && path === '/api/settings') {
-      if (!requireAdmin(request, response)) return;
       const next = await store.save({ ...store.value, settings: { ...store.value.settings, ...(await body(request)) } }); manager.reconcile(next); return json(response, 200, next.settings);
     }
     if (request.method === 'PUT' && path === '/api/adapters') {
-      if (!requireAdmin(request, response)) return;
       const next = await store.save({ ...store.value, adapters: (await body(request)).adapters || [] }); adapterCache.expires = 0; manager.reconcile(next); return json(response, 200, { adapters: await adapterStatus(true) });
     }
     if (request.method === 'PUT' && path === '/api/cas-profiles') {
-      if (!requireAdmin(request, response)) return;
       const incoming = (await body(request)).profiles || []; const existing = new Map(store.value.casProfiles.map((profile) => [profile.id, profile]));
       const profiles = incoming.map((profile) => {
         let lineEncrypted = existing.get(profile.id)?.lineEncrypted || '';

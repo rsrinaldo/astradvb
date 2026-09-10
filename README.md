@@ -21,7 +21,7 @@ A clean-room Linux broadcast control and MPEG-TS relay service. It does not cont
 - M3U, XSPF, plain-URL, and JSON playlist exports
 - Native per-stream Newcamd descrambling through a bundled tsdecrypt bridge
 - DVB EIT collection with XMLTV and JSON EPG publishing
-- Optional bearer-token protection for administrative APIs
+- Open control API with network-level access control
 - systemd hardening, Docker Compose, health-oriented CLI, and automated tests
 
 The service automatically detects frontends exposed as `/dev/dvb/adapterN/frontendN`. A tuner must be visible there before Linux can control physical hardware.
@@ -34,25 +34,24 @@ Node.js 20 or newer is required.
 cd linux
 cp config.example.json data/config.json
 export ASTRA_CONFIG="$PWD/data/config.json"
-export ASTRA_ADMIN_TOKEN="replace-with-a-long-random-token"
 node src/server.mjs
 ```
 
-Open `http://server-address:8000/`, go to Settings, and enter the administrator token. All example streams are disabled.
+Open `http://server-address:8000/`. No login or administrator token is used. All example streams are disabled.
 
 ## Docker
 
 ```bash
 cd linux
-export ASTRA_ADMIN_TOKEN="replace-with-a-long-random-token"
+export ASTRA_SECRET_KEY="$(openssl rand -hex 32)"
 docker compose up -d --build
 ```
 
-Host networking is intentional for multicast. Limit port 8000 with a firewall or reverse proxy and use HTTPS for remote administration.
+Host networking is intentional for multicast. The application has no authentication, so limit port 8000 with a firewall, private VLAN, or VPN.
 
 ## Native installation
 
-Review `install.sh`, then run it from the `linux` directory as root. It creates an unprivileged `astra` service user, a protected configuration file, a random administrator token, and a hardened systemd unit.
+Review `install.sh`, then run it from the `linux` directory as root. It creates an unprivileged `astra` service user, a protected configuration file, an encryption key for CAS credentials, and a hardened systemd unit. It does not create or require an administrator token.
 
 For a complete Ubuntu walkthrough, including Node.js, firewall, multicast, DVB, Newcamd, upgrades, backups, and troubleshooting, read [`INSTALL-UBUNTU.md`](INSTALL-UBUNTU.md).
 
@@ -82,7 +81,7 @@ Append `?include_disabled=1` to a playlist URL to include disabled HTTP streams.
 
 The native installer adds `dvb-tools` and grants the service user access to the `video` group. When a supported PCIe or USB tuner and driver create `/dev/dvb` nodes, the dashboard discovers it automatically. Click the detected adapter, configure its delivery system and tuning parameters, save it, then use the displayed `dvb://<adapter-id>` URL as a stream input. The engine runs `dvbv5-zap`, reads the full transport stream, and publishes the stream through the normal HTTP, HLS, UDP, and RTP outputs.
 
-Administrative operations require `Authorization: Bearer <ASTRA_ADMIN_TOKEN>` when a token is configured:
+Configuration operations are open to every client that can reach the service:
 
 - `GET /api/config`
 - `POST /api/streams`

@@ -5,7 +5,6 @@ services:
     network_mode: host
     environment:
       ASTRA_CONFIG: /var/lib/astra/config.json
-      ASTRA_ADMIN_TOKEN: ${ASTRA_ADMIN_TOKEN:-}
       ASTRA_SECRET_KEY: ${ASTRA_SECRET_KEY:?set a 64-character hexadecimal secret key}
       ASTRA_TSDECRYPT: /usr/local/bin/tsdecrypt
     volumes:

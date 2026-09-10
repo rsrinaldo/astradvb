@@ -41,25 +41,23 @@ node --version
 
 Review downloaded setup scripts before executing them if that is required by your security policy.
 
-## 2. Copy and extract the release
+## 2. Download the release
 
-Copy `astra-linux-control-v0.5.1.tar.gz` to the Ubuntu server, then run:
+Install directly from GitHub:
 
 ```bash
-mkdir -p "$HOME/astra-release"
-tar -xzf astra-linux-control-v0.5.1.tar.gz -C "$HOME/astra-release"
-cd "$HOME/astra-release/linux"
+cd "$HOME"
+git clone https://github.com/rsrinaldo/astradvb.git
+cd astradvb
 ```
 
-The archive deliberately contains a top-level `linux` directory.
+For a reproducible installation, check out the release commit or tag specified with the release instead of following a moving branch.
 
 ## 3. Run the native installer
 
 ```bash
 sudo ./install.sh
 ```
-
-On the first installation, the script prints a randomly generated administrator token. Save that token in a password manager. It is not displayed again.
 
 The installer:
 
@@ -68,10 +66,10 @@ The installer:
 - creates an unprivileged `astra` system account with DVB `video` group access
 - installs the application under `/opt/astra-linux`
 - stores persistent configuration at `/var/lib/astra-linux/config.json`
-- stores secrets and the administrator token in `/etc/astra-linux/environment`
+- stores the CAS credential encryption key in `/etc/astra-linux/environment`
 - installs and starts the `astra-linux.service` systemd unit
 
-An upgrade preserves both the persistent JSON configuration and environment file.
+An upgrade preserves both the persistent JSON configuration and encryption key. Version 0.6.0 also removes any legacy `ASTRA_ADMIN_TOKEN` line from the environment file.
 
 ## 4. Verify the service
 
@@ -87,7 +85,7 @@ The health endpoint should return an `ok` response. Open the dashboard at:
 http://SERVER-IP:8000/
 ```
 
-Go to **Settings**, paste the administrator token, and choose **Use token**. The token is held by that browser so the control panel can save configuration.
+There is no login or administrator token. The dashboard and configuration API are immediately available to every client that can reach port 8000.
 
 ## 5. Restrict management access
 
@@ -100,29 +98,7 @@ sudo ufw enable
 sudo ufw status verbose
 ```
 
-For management outside the trusted network, place the service behind an HTTPS reverse proxy or VPN.
-
-### Optional open-administration mode
-
-The recommended configuration uses the administrator token. To deliberately remove it on a trusted, isolated network:
-
-```bash
-sudoedit /etc/astra-linux/environment
-```
-
-Change the token line to:
-
-```text
-ASTRA_ADMIN_TOKEN=
-```
-
-Then restart the service:
-
-```bash
-sudo systemctl restart astra-linux
-```
-
-This makes configuration-changing API calls available to every host that can reach port 8000. The play, playlist, and EPG URLs are already public and do not require the administrator token.
+For management outside the trusted network, use a VPN or add authentication at an HTTPS reverse proxy. The application itself intentionally performs no authentication.
 
 ## 6. Create a stream
 
@@ -237,10 +213,11 @@ sudo cp -a /var/lib/astra-linux/config.json /root/astra-linux-backup/
 sudo cp -a /etc/astra-linux/environment /root/astra-linux-backup/
 ```
 
-To upgrade, extract the new release into a fresh directory and run its installer:
+To upgrade a GitHub installation:
 
 ```bash
-cd "$HOME/astra-release-new/linux"
+cd "$HOME/astradvb"
+git pull --ff-only
 sudo ./install.sh
 ```
 
@@ -289,7 +266,7 @@ ip maddr
 
 Common causes:
 
-- **Dashboard opens but cannot save:** enter the administrator token in Settings, or verify that open-administration mode was intentionally enabled.
+- **Dashboard opens but cannot save:** inspect the browser error and service logs; authentication is never required.
 - **HTTP URL returns 404:** enable HTTP MPEG-TS for that stream and check the stream ID.
 - **HTTP connection opens but no video arrives:** inspect input state, bitrate, continuity errors, and service logs.
 - **Multicast input is idle:** confirm the multicast group reaches the correct NIC and Linux has a route for it.
@@ -306,7 +283,6 @@ Native systemd installation is recommended for direct DVB hardware access. For a
 cd linux
 mkdir -p data
 cp config.example.json data/config.json
-export ASTRA_ADMIN_TOKEN="replace-with-a-long-random-token"
 export ASTRA_SECRET_KEY="$(openssl rand -hex 32)"
 docker compose up -d --build
 ```
