@@ -1,0 +1,31 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "publicBaseUrl": ""
+  },
+  "settings": {
+    "inputTimeoutMs": 5000,
+    "failoverDelayMs": 1500,
+    "hlsSegmentSeconds": 6,
+    "hlsWindowSegments": 5,
+    "logLimit": 1000
+  },
+  "adapters": [],
+  "casProfiles": [],
+  "streams": [
+    {
+      "id": "demo-news",
+      "name": "Demo News",
+      "enabled": false,
+      "inputs": [
+        { "url": "udp://239.10.0.1:1234", "interface": "0.0.0.0" }
+      ],
+      "outputs": [],
+      "hls": true,
+      "http": true,
+      "onDemand": false,
+      "cam": { "enabled": false, "profile": "default" }
+    }
+  ]
+}

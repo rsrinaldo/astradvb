@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+base_url="${ASTRA_URL:-http://127.0.0.1:8000}"
+token="${ASTRA_ADMIN_TOKEN:-}"
+auth=()
+[[ -n "$token" ]] && auth=(-H "Authorization: Bearer $token")
+
+case "${1:-status}" in
+  status) curl -fsS "$base_url/api/status" ;;
+  streams) curl -fsS "$base_url/api/streams" ;;
+  sessions) curl -fsS "$base_url/api/sessions" ;;
+  logs) curl -fsS "$base_url/api/logs?limit=${2:-100}" ;;
+  config) curl -fsS "${auth[@]}" "$base_url/api/config" ;;
+  *) echo "Usage: astractl [status|streams|sessions|logs [limit]|config]" >&2; exit 2 ;;
+esac
+printf '\n'

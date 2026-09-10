@@ -1,0 +1,51 @@
+select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #10181d;
+  color: var(--text);
+  padding: 9px 10px;
+  font: inherit;
+  outline: none;
+}
+
+select:focus {
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 3px #52d8e516;
+}
+
+.notice {
+  color: var(--amber);
+  font-size: 11px;
+  border-left: 2px solid var(--amber);
+  padding-left: 10px;
+}
+
+.published {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  overflow: hidden;
+  margin: -12px 0 26px;
+  background: var(--line);
+}
+
+.published div { background: var(--panel); padding: 12px 14px; min-width: 0; }
+.published strong { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+.published a { color: var(--cyan); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 4px; font: 12px ui-monospace, monospace; }
+
+@media (max-width: 760px) { .published { grid-template-columns: 1fr; } }
+
+.card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.card-head h2 { margin-bottom: 2px; }
+.profile-list { display: grid; gap: 8px; margin-top: 14px; }
+.profile-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; cursor: pointer; }
+.profile-row:hover { border-color: #52d8e555; background: #ffffff05; }
+.profile-row strong { display: block; }
+.profile-row small { color: var(--muted); }
+.adapter-card .signal { grid-template-columns: 1fr auto; }
+.adapter-card .signal strong { color: var(--text); font-size: 12px; }
+.adapter-source { display: block; margin-top: 12px; color: var(--cyan); font-family: ui-monospace, SFMono-Regular, monospace; }
+select { width: 100%; border: 1px solid var(--line); border-radius: 7px; background: #10181d; color: var(--text); padding: 9px 10px; outline: none; }
+select:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px #52d8e516; }
+.profile-state { color: var(--green); font-size: 10px; font-weight: 800; text-transform: uppercase; }

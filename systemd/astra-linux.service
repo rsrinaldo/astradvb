@@ -1,0 +1,28 @@
+[Unit]
+Description=Astra-compatible Linux streaming service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astra
+Group=astra
+SupplementaryGroups=video
+WorkingDirectory=/opt/astra-linux
+Environment=NODE_ENV=production
+Environment=ASTRA_CONFIG=/var/lib/astra-linux/config.json
+EnvironmentFile=-/etc/astra-linux/environment
+ExecStart=/usr/bin/node /opt/astra-linux/src/server.mjs
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/astra-linux
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
