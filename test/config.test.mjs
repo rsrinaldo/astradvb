@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { normalizeConfig, normalizeDVBAdapter, normalizeStream } from '../src/config.mjs';
-import { parseMediaUrl } from '../src/input.mjs';
+import { ffmpegInputArgs, parseMediaUrl, usesFFmpegBridge } from '../src/input.mjs';
 
 test('normalizes stream inputs and delivery defaults', () => {
   const stream = normalizeStream({ id: 'news-1', inputs: ['udp://239.1.1.1:1234'] });
@@ -25,8 +25,28 @@ test('normalizes server and failover settings', () => {
 
 test('parses supported media URLs', () => {
   assert.equal(parseMediaUrl('rtp://239.1.1.2:5000').protocol, 'rtp');
+  assert.equal(parseMediaUrl('rtmp://media.example.test/live/channel').protocol, 'rtmp');
+  assert.equal(parseMediaUrl('tcp://192.0.2.20:9000').protocol, 'tcp');
   assert.equal(parseMediaUrl('dvb://sat-a').protocol, 'dvb');
   assert.throws(() => parseMediaUrl('ftp://example.test/a.ts'), /Unsupported input protocol/);
+});
+
+test('selects the FFmpeg bridge for adaptive and demuxed inputs', () => {
+  assert.equal(usesFFmpegBridge('https://media.example.test/live/channel.m3u8'), true);
+  assert.equal(usesFFmpegBridge('https://media.example.test/live/manifest.mpd'), true);
+  assert.equal(usesFFmpegBridge('https://media.example.test/live/channel.ts'), false);
+  assert.equal(usesFFmpegBridge('rtsp://camera.example.test/live'), true);
+  assert.equal(usesFFmpegBridge('file:///srv/media/channel.mp4'), true);
+  assert.equal(usesFFmpegBridge('file:///srv/media/channel.ts'), false);
+});
+
+test('builds resilient FFmpeg arguments without transcoding', () => {
+  const args = ffmpegInputArgs('https://media.example.test/live/channel.m3u8', { headers: { Authorization: 'Bearer example' }, timeoutMs: 9000 });
+  assert.ok(args.includes('-reconnect'));
+  assert.ok(args.includes('-headers'));
+  assert.equal(args.at(-5), '-c');
+  assert.equal(args.at(-4), 'copy');
+  assert.equal(args.at(-1), 'pipe:1');
 });
 
 test('normalizes DVB tuning and device settings', () => {

@@ -114,13 +114,20 @@ Supported input examples:
 ```text
 udp://239.10.0.1:1234
 rtp://239.10.0.2:5000
+tcp://192.0.2.20:9000
 http://upstream.example.net/channel.ts
 https://upstream.example.net/channel.ts
+https://upstream.example.net/channel.m3u8
+https://upstream.example.net/manifest.mpd
 srt://upstream.example.net:9000
 rtsp://camera.example.net/live
+rtmp://upstream.example.net/live/channel
+rist://upstream.example.net:9001
 file:///var/lib/astra-linux/sample.ts
 dvb://adapter0-frontend0
 ```
+
+The engine handles UDP, RTP, TCP, continuous HTTP MPEG-TS, and MPEG-TS files directly. It automatically starts and supervises its FFmpeg bridge for HLS, DASH, SRT, RTSP, RTMP/RTMPS, RIST, and non-TS media files. Enter the original URL in the dashboard; no separate FFmpeg command is required.
 
 For multicast reception on a specific interface, configure the input object through the API with an `interface` address. The default configuration uses `0.0.0.0`, allowing the kernel routing table to choose the interface.
 

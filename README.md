@@ -5,9 +5,10 @@ A clean-room Linux broadcast control and MPEG-TS relay service. It does not cont
 ## Implemented
 
 - UDP multicast/unicast and RTP MPEG-TS inputs
-- HTTP/HTTPS MPEG-TS inputs
-- SRT and RTSP inputs through an optional FFmpeg bridge
-- File input for testing
+- Continuous HTTP/HTTPS MPEG-TS inputs
+- Automatic HLS and MPEG-DASH ingest through the managed FFmpeg bridge
+- TCP, SRT, RTSP, RTMP/RTMPS, and RIST inputs
+- MPEG-TS files natively and other supported media files through FFmpeg
 - Automatic Linux DVB frontend discovery and DVB-S/S2, DVB-T/T2, DVB-C, and ATSC tuning
 - LNB, polarization, DiSEqC, Unicable, modulation, FEC, lock, signal, and quality controls
 - Ordered multi-input failover with configurable timeouts
@@ -24,7 +25,7 @@ A clean-room Linux broadcast control and MPEG-TS relay service. It does not cont
 - Open control API with network-level access control
 - systemd hardening, Docker Compose, health-oriented CLI, and automated tests
 
-The service automatically detects frontends exposed as `/dev/dvb/adapterN/frontendN`. A tuner must be visible there before Linux can control physical hardware.
+Paste source URLs directly into the stream editor. The engine automatically selects native transport handling or its managed FFmpeg bridge; no external bridge process is required. The service also detects frontends exposed as `/dev/dvb/adapterN/frontendN`. A tuner must be visible there before Linux can control physical hardware.
 
 ## Quick start on Linux
 
