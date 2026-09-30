@@ -224,9 +224,11 @@ $('#adapter-form').elements.id.addEventListener('input', (event) => { if (!state
 $('#export-form').addEventListener('submit', (event) => {
   event.preventDefault();
   const format = event.currentTarget.elements.format.value;
+  const delivery = event.currentTarget.elements.delivery.value;
   const paths = { m3u: '/playlist.m3u', xspf: '/playlist.xspf', txt: '/playlist.txt', json: '/api/playlist' };
-  const suffix = event.currentTarget.elements.includeDisabled.checked ? '?include_disabled=1' : '';
-  window.location.assign(`${paths[format]}${suffix}`);
+  const params = new URLSearchParams({ delivery });
+  if (event.currentTarget.elements.includeDisabled.checked) params.set('include_disabled', '1');
+  window.location.assign(`${paths[format]}?${params}`);
   $('#export-dialog').close();
 });
 

@@ -2,15 +2,14 @@ function xml(value) {
   return String(value).replace(/[<>&'\"]/g, (character) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' })[character]);
 }
 
-export function playlistEntries(streams, baseUrl, includeDisabled = false) {
+export function playlistEntries(streams, baseUrl, includeDisabled = false, delivery = 'mpegts') {
   const base = String(baseUrl).replace(/\/$/, '');
-  return streams.filter((stream) => stream.http && (includeDisabled || stream.enabled)).map((stream) => ({
-    id: stream.id,
-    name: stream.name,
-    enabled: stream.enabled,
-    url: `${base}/play/${encodeURIComponent(stream.id)}`,
-    hlsUrl: stream.hls ? `${base}/hls/${encodeURIComponent(stream.id)}/index.m3u8` : null,
-  }));
+  const useHls = delivery === 'hls';
+  return streams.filter((stream) => (useHls ? stream.hls : stream.http) && (includeDisabled || stream.enabled)).map((stream) => {
+    const mpegtsUrl = stream.http ? `${base}/play/${encodeURIComponent(stream.id)}` : null;
+    const hlsUrl = stream.hls ? `${base}/hls/${encodeURIComponent(stream.id)}/index.m3u8` : null;
+    return { id: stream.id, name: stream.name, enabled: stream.enabled, delivery: useHls ? 'hls' : 'mpegts', url: useHls ? hlsUrl : mpegtsUrl, mpegtsUrl, hlsUrl };
+  });
 }
 
 export function formatPlaylist(entries, format) {

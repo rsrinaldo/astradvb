@@ -19,7 +19,7 @@ A clean-room Linux broadcast control and MPEG-TS relay service. It does not cont
 - Persistent atomic JSON configuration
 - Stream CRUD, live adapter control, settings, status, sessions, logs, and SSE APIs
 - Browser-based control panel served by the engine
-- M3U, XSPF, plain-URL, and JSON playlist exports
+- M3U, XSPF, plain-URL, and JSON playlist exports selectable between HTTP MPEG-TS and HLS delivery
 - Native per-stream Newcamd descrambling through a bundled tsdecrypt bridge
 - DVB EIT collection with XMLTV and JSON EPG publishing
 - Open control API with network-level access control

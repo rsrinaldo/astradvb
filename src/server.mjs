@@ -65,7 +65,7 @@ async function body(request, limit = 1024 * 1024) {
 function status() {
   const streams = manager.list();
   return {
-    version: '0.7.6',
+    version: '0.7.7',
     uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
     engine: 'online',
     authentication: 'disabled',
@@ -116,9 +116,10 @@ const server = http.createServer(async (request, response) => {
     if (request.method === 'GET' && path === '/api/logs') return json(response, 200, { logs: logger.list(url.searchParams.get('limit')) });
     if (request.method === 'GET' && ['/playlist.m3u', '/playlist.txt', '/playlist.xspf', '/api/playlist'].includes(path)) {
       const format = path === '/api/playlist' ? 'json' : path.split('.').pop();
-      const entries = playlistEntries(store.value.streams, requestBase(request), url.searchParams.get('include_disabled') === '1');
+      const delivery = url.searchParams.get('delivery') === 'hls' ? 'hls' : 'mpegts';
+      const entries = playlistEntries(store.value.streams, requestBase(request), url.searchParams.get('include_disabled') === '1', delivery);
       const playlist = formatPlaylist(entries, format);
-      response.writeHead(200, { 'content-type': playlist.contentType, 'content-disposition': `attachment; filename="astra-streams.${playlist.extension}"`, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+      response.writeHead(200, { 'content-type': playlist.contentType, 'content-disposition': `attachment; filename="astra-streams-${delivery}.${playlist.extension}"`, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
       response.end(playlist.body); return;
     }
     if (request.method === 'GET' && (path === '/epg.xml' || path === '/api/epg')) {

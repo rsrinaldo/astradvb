@@ -14,6 +14,13 @@ test('exports enabled HTTP streams by default', () => {
   assert.equal(entries[0].url, 'http://10.0.0.1:8000/play/news');
 });
 
+test('exports HLS URLs when HLS delivery is selected', () => {
+  const entries = playlistEntries(streams, 'http://10.0.0.1:8000/', false, 'hls');
+  assert.deepEqual(entries.map((entry) => entry.id), ['news']);
+  assert.equal(entries[0].url, 'http://10.0.0.1:8000/hls/news/index.m3u8');
+  assert.match(formatPlaylist(entries, 'm3u').body, /\/hls\/news\/index\.m3u8/);
+});
+
 test('formats M3U, XSPF, plain text, and JSON playlists', () => {
   const entries = playlistEntries(streams, 'http://localhost:8000', true);
   assert.match(formatPlaylist(entries, 'm3u').body, /#EXTM3U/);
