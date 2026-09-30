@@ -8,8 +8,13 @@ test('normalizes stream inputs and delivery defaults', () => {
   assert.equal(stream.name, 'news-1');
   assert.equal(stream.inputs[0].url, 'udp://239.1.1.1:1234');
   assert.equal(stream.hls, true);
+  assert.equal(stream.hlsCompatibility, false);
   assert.equal(stream.enabled, false);
   assert.deepEqual(stream.cam, { enabled: false, profile: 'default' });
+});
+
+test('normalizes optional HLS compatibility mode', () => {
+  assert.equal(normalizeStream({ id: 'rai-1', hlsCompatibility: true }).hlsCompatibility, true);
 });
 
 test('rejects unsafe stream identifiers', () => {

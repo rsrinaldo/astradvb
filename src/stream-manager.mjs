@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { MPEGTSAnalyzer, TransportStreamFramer } from './mpegts.mjs';
 import { HLSSegmenter } from './hls.mjs';
+import { HLSCompatibilityBridge } from './hls-compat.mjs';
 import { isAdaptiveManifest, runInput, UDPOutput, usesFFmpegBridge } from './input.mjs';
 import { SoftcamBridge } from './softcam.mjs';
 import { EPGCollector, epgDocument } from './epg.mjs';
@@ -16,12 +17,19 @@ export class StreamWorker extends EventEmitter {
     this.analyzer = new MPEGTSAnalyzer(); this.epg = new EPGCollector();
     this.framer = new TransportStreamFramer(); this.outputFramer = new TransportStreamFramer(); this.cam = null; this.casProfiles = casProfiles; this.adapters = adapters;
     this.hls = new HLSSegmenter({ segmentSeconds: settings.hlsSegmentSeconds, windowSegments: settings.hlsWindowSegments });
+    this.hlsFramer = new TransportStreamFramer(); this.hlsBridge = null;
     this.clients = new Set(); this.outputs = []; this.activeInput = -1; this.state = 'stopped'; this.lastDataAt = 0; this.abort = null;
   }
   start() {
     if (this.abort || !this.config.enabled) return;
     this.abort = new AbortController(); this.state = 'starting';
     this.outputs = this.config.outputs.filter((output) => /^(udp|rtp):/.test(output.url)).map((output) => new UDPOutput(output.url));
+    if (this.config.hls && this.config.hlsCompatibility) {
+      this.hlsBridge = new HLSCompatibilityBridge((chunk) => {
+        const aligned = this.hlsFramer.push(chunk); if (aligned.length) this.hls.push(aligned);
+      }, (error) => this.logger.warn(this.config.id, error.message));
+      this.hlsBridge.start(); this.logger.info(this.config.id, 'HLS compatibility mode active');
+    }
     if (this.config.cam?.enabled) {
       try { const profile = this.casProfiles.find((item) => item.id === this.config.cam.profile); this.cam = new SoftcamBridge(this.config, profile, (chunk) => this.#deliver(this.outputFramer.push(chunk)), this.logger); this.cam.start(); }
       catch (error) { this.state = 'error'; this.logger.error(this.config.id, error.message); this.outputs.forEach((output) => output.close()); this.outputs = []; this.abort = null; return; }
@@ -29,7 +37,7 @@ export class StreamWorker extends EventEmitter {
     void this.#loop(this.abort.signal);
   }
   stop() {
-    this.abort?.abort(); this.abort = null; this.cam?.stop(); this.cam = null; this.outputs.forEach((output) => output.close()); this.outputs = []; this.state = 'stopped'; this.activeInput = -1;
+    this.abort?.abort(); this.abort = null; this.cam?.stop(); this.cam = null; this.hlsBridge?.stop(); this.hlsBridge = null; this.hlsFramer.reset(); this.outputs.forEach((output) => output.close()); this.outputs = []; this.state = 'stopped'; this.activeInput = -1;
     for (const client of this.clients) client.end(); this.clients.clear();
   }
   subscribe(response) {
@@ -51,7 +59,8 @@ export class StreamWorker extends EventEmitter {
   }
   #deliver(aligned) {
     if (!aligned.length) return;
-    this.lastDataAt = Date.now(); this.analyzer.push(aligned); this.epg.push(aligned); this.hls.push(aligned);
+    this.lastDataAt = Date.now(); this.analyzer.push(aligned); this.epg.push(aligned);
+    if (this.config.hls) { if (this.hlsBridge) this.hlsBridge.write(aligned); else this.hls.push(aligned); }
     for (const output of this.outputs) output.send(aligned);
     for (const client of this.clients) { if (!client.write(aligned)) client.once('drain', () => {}); }
     this.emit('data', aligned);

@@ -16,6 +16,7 @@ A clean-room Linux broadcast control and MPEG-TS relay service. It does not cont
 - UDP and RTP outputs
 - HTTP MPEG-TS relay with session tracking
 - Rolling in-memory HLS with random-access segment boundaries, repeated program tables, and discontinuity signaling
+- Optional per-stream HLS compatibility remux with repeated H.264 headers, AAC audio, and DVB data-track removal
 - Persistent atomic JSON configuration
 - Stream CRUD, live adapter control, settings, status, sessions, logs, and SSE APIs
 - Browser-based control panel served by the engine

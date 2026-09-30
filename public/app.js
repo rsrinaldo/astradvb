@@ -147,7 +147,7 @@ async function deleteCASProfile() {
 async function openStream(id = null, initialInput = '') {
   try {
     const config = state.config || await loadConfig();
-    const stream = id ? config.streams.find((item) => item.id === id) : { id: '', name: '', enabled: false, inputs: [], outputs: [], hls: true, http: true, onDemand: false, keepActiveSeconds: 0, cam: { enabled: false, profile: 'default' } };
+    const stream = id ? config.streams.find((item) => item.id === id) : { id: '', name: '', enabled: false, inputs: [], outputs: [], hls: true, hlsCompatibility: false, http: true, onDemand: false, keepActiveSeconds: 0, cam: { enabled: false, profile: 'default' } };
     if (!stream) throw new Error('Stream configuration not found');
     state.editing = id;
     const form = $('#stream-form');
@@ -157,7 +157,7 @@ async function openStream(id = null, initialInput = '') {
     form.elements.enabled.checked = Boolean(stream.enabled);
     form.elements.inputs.value = initialInput || (stream.inputs || []).map((input) => input.url).join('\n');
     form.elements.outputs.value = (stream.outputs || []).map((output) => output.url).join('\n');
-    form.elements.http.checked = stream.http !== false; form.elements.hls.checked = stream.hls !== false;
+    form.elements.http.checked = stream.http !== false; form.elements.hls.checked = stream.hls !== false; form.elements.hlsCompatibility.checked = Boolean(stream.hlsCompatibility);
     form.elements.onDemand.checked = Boolean(stream.onDemand); form.elements.keepActiveSeconds.value = stream.keepActiveSeconds || 0;
     form.elements.camEnabled.checked = Boolean(stream.cam?.enabled);
     const profiles = [{ id: 'default', name: 'Select a profile' }, ...(config.casProfiles || []).filter((profile) => profile.id !== 'default')];
@@ -173,7 +173,7 @@ async function saveStream(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const id = state.editing || form.elements.id.value.trim();
-  const value = { id, name: form.elements.name.value.trim(), enabled: form.elements.enabled.checked, inputs: lines(form.elements.inputs.value).map((url) => ({ url })), outputs: lines(form.elements.outputs.value).map((url) => ({ url })), http: form.elements.http.checked, hls: form.elements.hls.checked, onDemand: form.elements.onDemand.checked, keepActiveSeconds: Number(form.elements.keepActiveSeconds.value) || 0, cam: { enabled: form.elements.camEnabled.checked, profile: form.elements.camProfile.value.trim() || 'default' } };
+  const value = { id, name: form.elements.name.value.trim(), enabled: form.elements.enabled.checked, inputs: lines(form.elements.inputs.value).map((url) => ({ url })), outputs: lines(form.elements.outputs.value).map((url) => ({ url })), http: form.elements.http.checked, hls: form.elements.hls.checked, hlsCompatibility: form.elements.hlsCompatibility.checked, onDemand: form.elements.onDemand.checked, keepActiveSeconds: Number(form.elements.keepActiveSeconds.value) || 0, cam: { enabled: form.elements.camEnabled.checked, profile: form.elements.camProfile.value.trim() || 'default' } };
   try {
     await api(state.editing ? `/api/streams/${encodeURIComponent(id)}` : '/api/streams', { method: state.editing ? 'PUT' : 'POST', body: JSON.stringify(value) });
     $('#stream-dialog').close(); state.config = null; await refresh(); toast(`${value.name} saved`);

@@ -80,6 +80,7 @@ export function normalizeStream(stream = {}) {
     inputs: inputs.map((input) => typeof input === 'string' ? { url: input } : { ...input, url: String(input.url || '') }).filter((input) => input.url),
     outputs: outputs.map((output) => typeof output === 'string' ? { url: output } : { ...output, url: String(output.url || '') }).filter((output) => output.url),
     hls: stream.hls !== false,
+    hlsCompatibility: Boolean(stream.hlsCompatibility),
     http: stream.http !== false,
     onDemand: Boolean(stream.onDemand),
     keepActiveSeconds: Math.max(0, Number(stream.keepActiveSeconds) || 0),
