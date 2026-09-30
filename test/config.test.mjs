@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { normalizeConfig, normalizeDVBAdapter, normalizeStream } from '../src/config.mjs';
-import { ffmpegInputArgs, parseMediaUrl, usesFFmpegBridge } from '../src/input.mjs';
+import { ffmpegInputArgs, isAdaptiveManifest, parseMediaUrl, usesFFmpegBridge } from '../src/input.mjs';
 
 test('normalizes stream inputs and delivery defaults', () => {
   const stream = normalizeStream({ id: 'news-1', inputs: ['udp://239.1.1.1:1234'] });
@@ -33,6 +33,9 @@ test('parses supported media URLs', () => {
 
 test('selects the FFmpeg bridge for adaptive and demuxed inputs', () => {
   assert.equal(usesFFmpegBridge('https://media.example.test/live/channel.m3u8'), true);
+  assert.equal(isAdaptiveManifest('https://media.example.test/live/channel.m3u8'), true);
+  assert.equal(isAdaptiveManifest('https://media.example.test/live/manifest.mpd'), true);
+  assert.equal(isAdaptiveManifest('https://media.example.test/live/channel.ts'), false);
   assert.equal(usesFFmpegBridge('https://media.example.test/live/manifest.mpd'), true);
   assert.equal(usesFFmpegBridge('https://media.example.test/live/channel.ts'), false);
   assert.equal(usesFFmpegBridge('rtsp://camera.example.test/live'), true);
@@ -43,7 +46,6 @@ test('selects the FFmpeg bridge for adaptive and demuxed inputs', () => {
 test('builds resilient FFmpeg arguments without transcoding', () => {
   const args = ffmpegInputArgs('https://media.example.test/live/channel.m3u8', { headers: { Authorization: 'Bearer example' }, timeoutMs: 9000 });
   assert.ok(args.includes('-reconnect'));
-  assert.ok(args.includes('-reconnect_at_eof'));
   assert.ok(args.includes('-reconnect_on_http_error'));
   assert.ok(args.includes('-headers'));
   assert.equal(args.at(-5), '-c');

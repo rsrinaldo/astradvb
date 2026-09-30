@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { MPEGTSAnalyzer, TransportStreamFramer } from './mpegts.mjs';
 import { HLSSegmenter } from './hls.mjs';
-import { runInput, UDPOutput, usesFFmpegBridge } from './input.mjs';
+import { isAdaptiveManifest, runInput, UDPOutput, usesFFmpegBridge } from './input.mjs';
 import { SoftcamBridge } from './softcam.mjs';
 import { EPGCollector, epgDocument } from './epg.mjs';
 
@@ -73,8 +73,9 @@ export class StreamWorker extends EventEmitter {
       this.activeInput = inputIndex; this.state = 'connecting'; this.lastDataAt = 0;
       this.logger.info(this.config.id, `Connecting input #${inputIndex + 1}`);
       const startupTimeoutMs = usesFFmpegBridge(input.url, input) ? Math.max(30000, this.settings.inputTimeoutMs * 3) : this.settings.inputTimeoutMs;
+      const runningTimeoutMs = isAdaptiveManifest(input.url) ? Math.max(30000, this.settings.inputTimeoutMs * 3) : this.settings.inputTimeoutMs;
       const watchdog = setInterval(() => {
-        const timeout = this.lastDataAt ? this.settings.inputTimeoutMs : startupTimeoutMs;
+        const timeout = this.lastDataAt ? runningTimeoutMs : startupTimeoutMs;
         if (Date.now() - (this.lastDataAt || attemptStartedAt) > timeout) attempt.abort();
       }, 500);
       try {

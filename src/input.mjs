@@ -22,9 +22,14 @@ export function usesFFmpegBridge(urlValue, input = {}) {
   if (input.bridge === 'native') return false;
   if (FFMPEG_PROTOCOLS.has(protocol)) return true;
   const path = url.pathname.toLowerCase();
-  if (protocol === 'http' || protocol === 'https') return HTTP_MANIFEST_EXTENSIONS.some((extension) => path.endsWith(extension));
+  if (protocol === 'http' || protocol === 'https') return isAdaptiveManifest(urlValue);
   if (protocol === 'file') return !RAW_TS_EXTENSIONS.some((extension) => path.endsWith(extension));
   return false;
+}
+
+export function isAdaptiveManifest(urlValue) {
+  const { url, protocol } = parseMediaUrl(urlValue);
+  return (protocol === 'http' || protocol === 'https') && HTTP_MANIFEST_EXTENSIONS.some((extension) => url.pathname.toLowerCase().endsWith(extension));
 }
 
 export function ffmpegInputArgs(urlValue, input = {}) {
@@ -32,7 +37,7 @@ export function ffmpegInputArgs(urlValue, input = {}) {
   const args = ['-nostdin', '-hide_banner', '-loglevel', 'error'];
   if (protocol === 'http' || protocol === 'https') {
     args.push('-rw_timeout', String(Math.max(1000, Number(input.timeoutMs) || 15000) * 1000));
-    args.push('-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_on_network_error', '1');
+    args.push('-reconnect', '1', '-reconnect_on_network_error', '1');
     args.push('-reconnect_on_http_error', '4xx,5xx', '-reconnect_streamed', '1', '-reconnect_delay_max', '10');
   }
   if (protocol === 'rtsp') args.push('-rtsp_transport', input.transport || 'tcp');
