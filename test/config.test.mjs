@@ -43,6 +43,8 @@ test('selects the FFmpeg bridge for adaptive and demuxed inputs', () => {
 test('builds resilient FFmpeg arguments without transcoding', () => {
   const args = ffmpegInputArgs('https://media.example.test/live/channel.m3u8', { headers: { Authorization: 'Bearer example' }, timeoutMs: 9000 });
   assert.ok(args.includes('-reconnect'));
+  assert.ok(args.includes('-reconnect_at_eof'));
+  assert.ok(args.includes('-reconnect_on_http_error'));
   assert.ok(args.includes('-headers'));
   assert.equal(args.at(-5), '-c');
   assert.equal(args.at(-4), 'copy');

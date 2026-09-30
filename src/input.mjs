@@ -32,7 +32,8 @@ export function ffmpegInputArgs(urlValue, input = {}) {
   const args = ['-nostdin', '-hide_banner', '-loglevel', 'error'];
   if (protocol === 'http' || protocol === 'https') {
     args.push('-rw_timeout', String(Math.max(1000, Number(input.timeoutMs) || 15000) * 1000));
-    args.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
+    args.push('-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_on_network_error', '1');
+    args.push('-reconnect_on_http_error', '4xx,5xx', '-reconnect_streamed', '1', '-reconnect_delay_max', '10');
   }
   if (protocol === 'rtsp') args.push('-rtsp_transport', input.transport || 'tcp');
   if (input.headers && typeof input.headers === 'object') {
