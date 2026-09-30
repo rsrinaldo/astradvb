@@ -129,7 +129,7 @@ dvb://adapter0-frontend0
 
 The engine handles UDP, RTP, TCP, continuous HTTP MPEG-TS, and MPEG-TS files directly. It automatically starts and supervises its FFmpeg bridge for HLS, DASH, SRT, RTSP, RTMP/RTMPS, RIST, and non-TS media files. Enter the original URL in the dashboard; no separate FFmpeg command is required.
 
-For multicast reception on a specific interface, configure the input object through the API with an `interface` address. The default configuration uses `0.0.0.0`, allowing the kernel routing table to choose the interface.
+Each multicast socket binds to its own destination group, preventing channels that share a UDP port from being mixed. For reception on a specific interface, append `?interface=LOCAL-IP` to the URL (for example, `udp://239.10.0.1:1234?interface=10.0.20.65`) or set the input object's `interface` address through the API. Without one, the kernel routing table chooses the interface.
 
 For a stream ID of `news-hd`, the playback endpoints are:
 

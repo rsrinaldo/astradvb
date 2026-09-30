@@ -65,7 +65,7 @@ async function body(request, limit = 1024 * 1024) {
 function status() {
   const streams = manager.list();
   return {
-    version: '0.7.4',
+    version: '0.7.5',
     uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
     engine: 'online',
     authentication: 'disabled',

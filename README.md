@@ -4,7 +4,7 @@ A clean-room Linux broadcast control and MPEG-TS relay service. It does not cont
 
 ## Implemented
 
-- UDP multicast/unicast and RTP MPEG-TS inputs
+- UDP multicast/unicast and RTP MPEG-TS inputs with per-group socket isolation
 - Continuous HTTP/HTTPS MPEG-TS inputs
 - Automatic HLS and MPEG-DASH ingest through the managed FFmpeg bridge
 - TCP, SRT, RTSP, RTMP/RTMPS, and RIST inputs

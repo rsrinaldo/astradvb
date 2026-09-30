@@ -32,6 +32,13 @@ export function isAdaptiveManifest(urlValue) {
   return (protocol === 'http' || protocol === 'https') && HTTP_MANIFEST_EXTENSIONS.some((extension) => url.pathname.toLowerCase().endsWith(extension));
 }
 
+export function udpBindAddress(urlValue) {
+  const { url, protocol } = parseMediaUrl(urlValue);
+  if (protocol !== 'udp' && protocol !== 'rtp') throw new Error(`Not a UDP/RTP input: ${protocol}`);
+  if (isMulticast(url.hostname)) return url.hostname;
+  return url.hostname.includes(':') ? '::' : '0.0.0.0';
+}
+
 export function ffmpegInputArgs(urlValue, input = {}) {
   const { protocol } = parseMediaUrl(urlValue);
   const args = ['-nostdin', '-hide_banner', '-loglevel', 'error'];
@@ -98,10 +105,10 @@ async function runUDP(url, input, { signal, onData, onReady, stripRTP }) {
     } else onData(message);
   });
   socket.on('error', close);
-  socket.bind(port, '0.0.0.0');
+  socket.bind(port, udpBindAddress(input.url));
   await once(socket, 'listening');
   const address = socket.address();
-  if (isMulticast(url.hostname)) socket.addMembership(url.hostname, input.interface || '0.0.0.0');
+  if (isMulticast(url.hostname)) socket.addMembership(url.hostname, input.interface || url.searchParams.get('interface') || '0.0.0.0');
   onReady?.({ address });
   await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
 }
@@ -149,7 +156,9 @@ async function runFFmpeg(url, input, { signal, onData, onReady }) {
 }
 
 function isMulticast(host) {
-  const first = Number(host.split('.')[0]);
+  const normalized = host.replace(/^\[|\]$/g, '');
+  if (/^ff/i.test(normalized)) return true;
+  const first = Number(normalized.split('.')[0]);
   return first >= 224 && first <= 239;
 }
 

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { normalizeConfig, normalizeDVBAdapter, normalizeStream } from '../src/config.mjs';
-import { ffmpegInputArgs, isAdaptiveManifest, parseMediaUrl, usesFFmpegBridge } from '../src/input.mjs';
+import { ffmpegInputArgs, isAdaptiveManifest, parseMediaUrl, udpBindAddress, usesFFmpegBridge } from '../src/input.mjs';
 
 test('normalizes stream inputs and delivery defaults', () => {
   const stream = normalizeStream({ id: 'news-1', inputs: ['udp://239.1.1.1:1234'] });
@@ -29,6 +29,12 @@ test('parses supported media URLs', () => {
   assert.equal(parseMediaUrl('tcp://192.0.2.20:9000').protocol, 'tcp');
   assert.equal(parseMediaUrl('dvb://sat-a').protocol, 'dvb');
   assert.throws(() => parseMediaUrl('ftp://example.test/a.ts'), /Unsupported input protocol/);
+});
+
+test('isolates multicast sockets by destination group', () => {
+  assert.equal(udpBindAddress('udp://239.10.0.1:1234'), '239.10.0.1');
+  assert.equal(udpBindAddress('rtp://239.10.0.2:1234'), '239.10.0.2');
+  assert.equal(udpBindAddress('udp://192.0.2.10:1234'), '0.0.0.0');
 });
 
 test('selects the FFmpeg bridge for adaptive and demuxed inputs', () => {

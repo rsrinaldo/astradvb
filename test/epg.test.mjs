@@ -6,8 +6,10 @@ function eitPacket() {
   const name = Buffer.from('Morning News'); const description = Buffer.from('Headlines');
   const descriptor = Buffer.concat([Buffer.from([0x4d, 3 + 1 + name.length + 1 + description.length]), Buffer.from('eng'), Buffer.from([name.length]), name, Buffer.from([description.length]), description]);
   const event = Buffer.alloc(12 + descriptor.length);
-  const todayMjd = Math.floor((Date.now() - Date.UTC(1858, 10, 17)) / 86400000);
-  event.writeUInt16BE(42, 0); event.writeUInt16BE(todayMjd, 2); event.set([0x12, 0x30, 0x00], 4); event.set([0x01, 0x00, 0x00], 7);
+  const start = new Date(Date.now() + 3600000);
+  const todayMjd = Math.floor((start.getTime() - Date.UTC(1858, 10, 17)) / 86400000);
+  const bcd = (value) => ((Math.floor(value / 10) << 4) | (value % 10));
+  event.writeUInt16BE(42, 0); event.writeUInt16BE(todayMjd, 2); event.set([bcd(start.getUTCHours()), bcd(start.getUTCMinutes()), 0x00], 4); event.set([0x01, 0x00, 0x00], 7);
   event[10] = 0xf0 | ((descriptor.length >> 8) & 0x0f); event[11] = descriptor.length & 0xff; descriptor.copy(event, 12);
   const section = Buffer.alloc(14 + event.length + 4);
   const sectionLength = section.length - 3; section[0] = 0x4e; section[1] = 0xb0 | ((sectionLength >> 8) & 0x0f); section[2] = sectionLength & 0xff;
