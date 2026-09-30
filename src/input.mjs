@@ -32,7 +32,7 @@ export function ffmpegInputArgs(urlValue, input = {}) {
   const args = ['-nostdin', '-hide_banner', '-loglevel', 'error'];
   if (protocol === 'http' || protocol === 'https') {
     args.push('-rw_timeout', String(Math.max(1000, Number(input.timeoutMs) || 15000) * 1000));
-    args.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_at_eof', '1', '-reconnect_delay_max', '5');
+    args.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
   }
   if (protocol === 'rtsp') args.push('-rtsp_transport', input.transport || 'tcp');
   if (input.headers && typeof input.headers === 'object') {
@@ -129,11 +129,14 @@ async function runFFmpeg(url, input, { signal, onData, onReady }) {
   const args = ffmpegInputArgs(url, input);
   const child = spawn(binary, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = '';
+  let ready = false;
   const terminate = () => child.kill('SIGTERM');
   signal.addEventListener('abort', terminate, { once: true });
-  child.stdout.on('data', onData);
+  child.stdout.on('data', (chunk) => {
+    if (!ready) { ready = true; onReady?.({ bridge: binary }); }
+    onData(chunk);
+  });
   child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-4096); });
-  child.once('spawn', () => onReady?.({ bridge: binary }));
   const [code] = await once(child, 'exit');
   signal.removeEventListener('abort', terminate);
   if (!signal.aborted && code !== 0) throw new Error(`FFmpeg bridge exited ${code}: ${stderr.replaceAll(url, '[input-url]').trim()}`);

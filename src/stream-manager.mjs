@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { MPEGTSAnalyzer, TransportStreamFramer } from './mpegts.mjs';
 import { HLSSegmenter } from './hls.mjs';
-import { runInput, UDPOutput } from './input.mjs';
+import { runInput, UDPOutput, usesFFmpegBridge } from './input.mjs';
 import { SoftcamBridge } from './softcam.mjs';
 import { EPGCollector, epgDocument } from './epg.mjs';
 
@@ -72,7 +72,11 @@ export class StreamWorker extends EventEmitter {
       const abortAttempt = () => attempt.abort(); signal.addEventListener('abort', abortAttempt, { once: true });
       this.activeInput = inputIndex; this.state = 'connecting'; this.lastDataAt = 0;
       this.logger.info(this.config.id, `Connecting input #${inputIndex + 1}`);
-      const watchdog = setInterval(() => { if (Date.now() - (this.lastDataAt || attemptStartedAt) > this.settings.inputTimeoutMs) attempt.abort(); }, 500);
+      const startupTimeoutMs = usesFFmpegBridge(input.url, input) ? Math.max(30000, this.settings.inputTimeoutMs * 3) : this.settings.inputTimeoutMs;
+      const watchdog = setInterval(() => {
+        const timeout = this.lastDataAt ? this.settings.inputTimeoutMs : startupTimeoutMs;
+        if (Date.now() - (this.lastDataAt || attemptStartedAt) > timeout) attempt.abort();
+      }, 500);
       try {
         await runInput(input, { signal: attempt.signal, adapters: this.adapters, onReady: () => { this.state = 'running'; this.logger.info(this.config.id, `Active input #${inputIndex + 1}`); }, onData: (chunk) => this.push(chunk) });
         if (!signal.aborted) throw new Error('Input ended');
