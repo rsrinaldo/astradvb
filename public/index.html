@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark" />
   <title>Astra Linux Control</title>
   <link rel="icon" href="/favicon.svg" />
-  <link rel="stylesheet" href="/styles.css?v=0.7.5" />
-  <link rel="stylesheet" href="/enhancements.css?v=0.7.5" />
+  <link rel="stylesheet" href="/styles.css?v=0.7.6" />
+  <link rel="stylesheet" href="/enhancements.css?v=0.7.6" />
 </head>
 <body>
   <aside class="sidebar">
@@ -62,6 +62,6 @@
   <dialog id="cas-profile-dialog"><form method="dialog" class="dialog-card" id="cas-profile-form"><header><div><p class="eyebrow">CONDITIONAL ACCESS</p><h2 id="cas-profile-title">New Newcamd profile</h2></div><button class="icon-button" type="button" data-close-dialog="cas-profile-dialog">×</button></header><div class="tab-panel active"><div class="form-grid"><label>Profile name<input name="name" required /></label><label>Profile ID<input name="id" pattern="[A-Za-z0-9_.-]{1,64}" required /></label><label class="wide">Newcamd line<input name="line" type="password" autocomplete="new-password" placeholder="C: host port username password 0102030405060708091011121314" /></label><label>CAID (optional)<input name="caid" placeholder="0x0604" /></label><label>Service ID for MPTS<input name="serviceId" type="number" min="0" value="0" /></label></div><div class="switch-row"><div><strong>Forward EMM</strong><small>Enable only when your provider explicitly requires it</small></div><input name="emm" type="checkbox" /></div><p class="notice">Leave the Newcamd line blank while editing to keep the saved encrypted credential.</p></div><footer><button class="danger hidden" type="button" id="delete-cas-profile">Delete</button><span class="spacer"></span><button class="secondary" type="button" data-close-dialog="cas-profile-dialog">Cancel</button><button class="primary" type="submit">Save profile</button></footer></form></dialog>
   <dialog id="export-dialog"><form method="dialog" class="dialog-card" id="export-form"><header><div><p class="eyebrow">PLAYLIST EXPORT</p><h2>Export all HTTP streams</h2></div><button class="icon-button" type="button" data-close-dialog="export-dialog">×</button></header><div class="tab-panel active"><label>Format<select name="format"><option value="m3u">M3U playlist</option><option value="xspf">XSPF playlist</option><option value="txt">Plain play URLs</option><option value="json">JSON</option></select></label><div class="switch-row"><div><strong>Include disabled streams</strong><small>Disabled entries will not play until enabled</small></div><input name="includeDisabled" type="checkbox" /></div></div><footer><span class="spacer"></span><button class="secondary" type="button" data-close-dialog="export-dialog">Cancel</button><button class="primary" type="submit">Download</button></footer></form></dialog>
   <div id="toast" role="status"></div>
-  <script type="module" src="/app.js?v=0.7.5"></script>
+  <script type="module" src="/app.js?v=0.7.6"></script>
 </body>
 </html>

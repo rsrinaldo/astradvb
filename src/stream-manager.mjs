@@ -74,6 +74,7 @@ export class StreamWorker extends EventEmitter {
       const attempt = new AbortController();
       const attemptStartedAt = Date.now();
       const abortAttempt = () => attempt.abort(); signal.addEventListener('abort', abortAttempt, { once: true });
+      this.framer.reset();
       this.activeInput = inputIndex; this.state = 'connecting'; this.lastDataAt = 0;
       this.logger.info(this.config.id, `Connecting input #${inputIndex + 1}`);
       const startupTimeoutMs = usesFFmpegBridge(input.url, input) ? Math.max(30000, this.settings.inputTimeoutMs * 3) : this.settings.inputTimeoutMs;
@@ -87,7 +88,10 @@ export class StreamWorker extends EventEmitter {
         if (!signal.aborted) throw new Error('Input ended');
       } catch (error) {
         if (!signal.aborted) this.logger.warn(this.config.id, `Input #${inputIndex + 1} failed: ${error.message}`);
-      } finally { clearInterval(watchdog); signal.removeEventListener('abort', abortAttempt); }
+      } finally {
+        clearInterval(watchdog); signal.removeEventListener('abort', abortAttempt);
+        if (!signal.aborted) this.hls.markDiscontinuity();
+      }
       if (!signal.aborted) { cursor += 1; this.state = 'failover'; await wait(this.settings.failoverDelayMs, signal); }
     }
     this.state = 'stopped';
