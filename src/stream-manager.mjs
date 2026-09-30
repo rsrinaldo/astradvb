@@ -58,7 +58,11 @@ export class StreamWorker extends EventEmitter {
   }
   snapshot() {
     const metrics = this.analyzer.snapshot();
-    const stale = !this.lastDataAt || Date.now() - this.lastDataAt > this.settings.inputTimeoutMs;
+    const activeInput = this.config.inputs[this.activeInput];
+    const staleTimeoutMs = activeInput && isAdaptiveManifest(activeInput.url)
+      ? Math.max(30000, this.settings.inputTimeoutMs * 3)
+      : this.settings.inputTimeoutMs;
+    const stale = !this.lastDataAt || Date.now() - this.lastDataAt > staleTimeoutMs;
     return { id: this.config.id, name: this.config.name, enabled: this.config.enabled, state: stale && this.state === 'running' ? 'warning' : this.state, activeInput: this.activeInput, clients: this.clients.size, cas: this.cam ? { profile: this.config.cam.profile, status: this.cam.status } : null, ...metrics };
   }
   async #loop(signal) {
