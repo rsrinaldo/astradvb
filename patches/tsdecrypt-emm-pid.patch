@@ -1,0 +1,13 @@
+diff --git a/tables.c b/tables.c
+--- a/tables.c
++++ b/tables.c
+@@ -498,6 +498,9 @@ void process_emm(struct ts *ts, uint16_t pid, uint8_t *ts_packet) {
+ 	if (!ts->process_emm)
+ 		return;
+ 
++	if (!ts->emm_pid || ts->emm_pid != pid)
++		return;
++
+ process_psi:
+ 	ts->tmp_emm = ts_privsec_push_packet(ts->tmp_emm, ts_packet);
+ 	if (!ts->tmp_emm->initialized) {

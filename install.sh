@@ -23,7 +23,7 @@ if ((${#required_packages[@]})); then
 fi
 
 install -d -o root -g root -m 0755 /opt/astra-linux /etc/astra-linux
-if ! command -v tsdecrypt >/dev/null 2>&1; then
+if ! command -v tsdecrypt >/dev/null 2>&1 || ! command -v oscam >/dev/null 2>&1 || [[ ! -f /usr/local/share/licenses/tsdecrypt/astra-emm-pid.patch ]]; then
   ./install-cas.sh
 fi
 if ! id -u astra >/dev/null 2>&1; then
@@ -38,7 +38,7 @@ if [[ ! -f /var/lib/astra-linux/config.json ]]; then
 fi
 if [[ ! -f /etc/astra-linux/environment ]]; then
   secret="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
-  printf 'ASTRA_SECRET_KEY=%s\nASTRA_TSDECRYPT=/usr/local/bin/tsdecrypt\n' "$secret" > /etc/astra-linux/environment
+  printf 'ASTRA_SECRET_KEY=%s\nASTRA_TSDECRYPT=/usr/local/bin/tsdecrypt\nASTRA_OSCAM=/usr/local/bin/oscam\n' "$secret" > /etc/astra-linux/environment
   chmod 0600 /etc/astra-linux/environment
 fi
 sed -i '/^ASTRA_ADMIN_TOKEN=/d' /etc/astra-linux/environment

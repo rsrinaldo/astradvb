@@ -62,7 +62,7 @@ sudo ./install.sh
 The installer:
 
 - installs FFmpeg and Linux DVB tools when missing
-- builds the pinned tsdecrypt Newcamd bridge when missing
+- builds pinned tsdecrypt and OSCam components when missing
 - creates an unprivileged `astra` system account with DVB `video` group access
 - installs the application under `/opt/astra-linux`
 - stores persistent configuration at `/var/lib/astra-linux/config.json`
@@ -176,11 +176,12 @@ After the device appears:
 
 1. Open the dashboard and choose **+ Adapter**.
 2. Select the detected frontend.
-3. Choose DVB-S/S2, DVB-T/T2, DVB-C, or ATSC.
+3. Choose DVB-S/S2/S2X, DVB-T/T2, DVB-C, or ATSC.
 4. Enter frequency and the delivery-system parameters.
 5. For satellite, set symbol rate, polarization, LNB, DiSEqC, or Unicable values as needed.
-6. Save the adapter and choose **Create stream**.
-7. Save and enable the stream using the generated `dvb://ADAPTER-ID` input.
+6. For DVB-S2X, set APSK modulation, roll-off, pilots, MIS/ISI stream ID, and PLS Gold scrambling index when required by the transponder.
+7. Save the adapter and choose **Scan channels**.
+8. Select discovered services and create HTTP/HLS streams, or choose **Create full transponder stream** for an unfiltered MPTS input.
 
 Check device access and live service logs if tuning fails:
 
@@ -192,21 +193,22 @@ sudo journalctl -u astra-linux -n 200 --no-pager
 
 ## 9. Configure an authorized Newcamd profile
 
-The native installer includes the tsdecrypt bridge, so no separate bridge process is needed.
+OSCam is an integral part of the native and Docker installations. The installer builds and installs it automatically alongside tsdecrypt; Astra starts and stops the proxy itself, including after reboot. No separate manual OSCam installation or service configuration is needed. One upstream Newcamd TCP connection per profile carries the individual channel ECM exchanges. No extra encrypted-input or decrypted-output delay is imposed, because delaying packets independently of key updates can cause corruption at key changes.
+
+The installer also applies the bundled tsdecrypt EMM PID correction and rebuilds older unpatched installations during an upgrade. Keep the `patches` directory with `install-cas.sh` when packaging the installer.
 
 1. Go to **Settings** → **Newcamd profiles** → **+ Profile**.
 2. Enter a profile name and ID.
 3. Enter the provider line in this form:
 
    ```text
-   C: host port username password 0102030405060708091011121314
+   N: host port username password 0102030405060708091011121314
    ```
 
-4. Set CAID if the PMT is ambiguous.
+4. Set the required four-digit CAID, for example `0B00`.
 5. For a multi-program transport stream, set the service ID.
-6. Enable EMM only when the provider explicitly requires and authorizes it.
-7. Save the profile.
-8. Edit a stream, open **Advanced**, enable **Newcamd descrambling**, select the saved profile, and save.
+6. Save the profile. EMM forwarding is disabled and has no configuration option.
+7. Edit a stream, open **Advanced**, enable **Newcamd descrambling**, select the saved profile, and save.
 
 The credential is encrypted at rest with AES-256-GCM using the secret in `/etc/astra-linux/environment`. Back up that environment file with the configuration; without the same secret, saved credentials cannot be recovered.
 
@@ -256,6 +258,7 @@ node --version
 ffmpeg -version | head -n 1
 dvbv5-zap --version
 tsdecrypt --version
+oscam --help | head -n 1
 ```
 
 Check port 8000:

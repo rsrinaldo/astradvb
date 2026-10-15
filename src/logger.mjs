@@ -1,9 +1,9 @@
 import { EventEmitter } from 'node:events';
 
 export class RingLogger extends EventEmitter {
-  constructor(limit = 1000) { super(); this.limit = limit; this.entries = []; }
+  constructor(limit = 1000, sourceName = (source) => source) { super(); this.limit = limit; this.entries = []; this.sourceName = sourceName; }
   write(level, source, message, extra = {}) {
-    const entry = { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, time: new Date().toISOString(), level, source, message, ...extra };
+    const entry = { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, time: new Date().toISOString(), level, source, sourceName: this.sourceName(source), message, ...extra };
     this.entries.push(entry);
     while (this.entries.length > this.limit) this.entries.shift();
     this.emit('entry', entry);

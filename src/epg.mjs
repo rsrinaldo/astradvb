@@ -1,12 +1,9 @@
+import { decodeDVBText as text } from './dvb-text.mjs';
+
 const EIT_PID = 0x12;
 const MJD_EPOCH = Date.UTC(1858, 10, 17);
 
 function bcd(value) { return ((value >> 4) & 0x0f) * 10 + (value & 0x0f); }
-function text(buffer) {
-  if (!buffer?.length) return '';
-  const start = buffer[0] < 0x20 ? 1 : 0;
-  return buffer.subarray(start).toString('latin1').replace(/[\x00-\x1f\x7f]/g, '').trim();
-}
 function xml(value) { return String(value ?? '').replace(/[<>&'\"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' })[c]); }
 
 function dvbTime(buffer) {
@@ -61,15 +58,26 @@ export class EPGCollector {
       const descriptorLength = ((section[offset + 10] & 0x0f) << 8) | section[offset + 11];
       const end = Math.min(section.length - 4, offset + 12 + descriptorLength);
       let title = `Event ${eventId}`; let description = ''; let cursor = offset + 12;
+      const shortEvents = []; const extendedEvents = [];
       while (cursor + 2 <= end) {
         const tag = section[cursor]; const size = section[cursor + 1]; const body = section.subarray(cursor + 2, Math.min(end, cursor + 2 + size));
         if (tag === 0x4d && body.length >= 5) {
-          const nameLength = body[3]; title = text(body.subarray(4, 4 + nameLength)) || title;
+          const language = body.subarray(0, 3).toString('ascii');
+          const nameLength = body[3]; const name = text(body.subarray(4, 4 + nameLength), { language });
           const textOffset = 4 + nameLength; const textLength = body[textOffset] || 0;
-          description = text(body.subarray(textOffset + 1, textOffset + 1 + textLength));
+          shortEvents.push({ language, title: name, description: text(body.subarray(textOffset + 1, textOffset + 1 + textLength), { language }) });
+        } else if (tag === 0x4e && body.length >= 6) {
+          const textOffset = 5 + body[4];
+          const language = body.subarray(1, 4).toString('ascii');
+          if (textOffset < body.length) extendedEvents.push({ number: body[0] >> 4, language, text: text(body.subarray(textOffset + 1, textOffset + 1 + body[textOffset]), { language }) });
         }
         cursor += 2 + size;
       }
+      const preferred = shortEvents.find((item) => ['alb', 'sqi'].includes(item.language)) || shortEvents[0];
+      if (preferred) { title = preferred.title || title; description = preferred.description; }
+      const language = preferred?.language || extendedEvents[0]?.language;
+      const extended = extendedEvents.filter((item) => item.language === language).sort((a, b) => a.number - b.number).map((item) => item.text).join('');
+      if (extended) description = [description, extended].filter(Boolean).join('\n');
       if (start) {
         const stop = new Date(start.getTime() + durationSeconds * 1000);
         this.events.set(`${serviceId}:${eventId}:${start.toISOString()}`, { serviceId, eventId, start: start.toISOString(), stop: stop.toISOString(), title, description });

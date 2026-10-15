@@ -47,3 +47,14 @@ test('marks the first segment after an input restart as discontinuous', () => {
   hls.push(Buffer.from('after'), 2100); hls.flush(3000);
   assert.match(hls.playlist('/hls/test'), /#EXT-X-DISCONTINUITY/);
 });
+
+test('does not treat an audio random-access flag as a video segment boundary', () => {
+  const hls = new HLSSegmenter({ segmentSeconds: 6 });
+  const pmt = packet(100, { payloadStart: true }); pmt[4] = 0;
+  Buffer.from([0x02, 0xb0, 0x17, 0, 1, 0xc1, 0, 0, 0xe1, 0, 0xf0, 0, 0x1b, 0xe1, 0, 0xf0, 0, 0x03, 0xe1, 1, 0xf0, 0, 0, 0, 0, 0]).copy(pmt, 5);
+  hls.push(Buffer.concat([pat(), pmt, packet(256)]), 0);
+  hls.push(packet(257, { payloadStart: true, randomAccess: true }), 2500);
+  assert.equal(hls.segments.length, 0);
+  hls.push(packet(256, { payloadStart: true, randomAccess: true }), 3000);
+  assert.equal(hls.segments.length, 1);
+});

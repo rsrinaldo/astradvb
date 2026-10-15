@@ -22,10 +22,10 @@ test('rejects unsafe stream identifiers', () => {
 });
 
 test('normalizes server and failover settings', () => {
-  const config = normalizeConfig({ server: { port: '9000' }, settings: { inputTimeoutMs: 10 }, casProfiles: [{ id: 'premium', name: 'Premium gateway' }] });
+  const config = normalizeConfig({ server: { port: '9000' }, settings: { inputTimeoutMs: 10 }, casProfiles: [{ id: 'premium', name: 'Premium gateway', emm: true }] });
   assert.equal(config.server.port, 9000);
   assert.equal(config.settings.inputTimeoutMs, 1000);
-  assert.deepEqual(config.casProfiles, [{ id: 'premium', name: 'Premium gateway', lineEncrypted: '', caid: '', serviceId: 0, emm: false }]);
+  assert.deepEqual(config.casProfiles, [{ id: 'premium', name: 'Premium gateway', lineEncrypted: '', caid: '', serviceId: 0 }]);
 });
 
 test('parses supported media URLs', () => {
@@ -65,9 +65,13 @@ test('builds resilient FFmpeg arguments without transcoding', () => {
 });
 
 test('normalizes DVB tuning and device settings', () => {
-  const adapter = normalizeDVBAdapter({ adapter: 2, frontend: 1, deliverySystem: 'DVBS2', frequencyMHz: '10762', symbolRateKsym: '30000', diseqc: 1 });
+  const adapter = normalizeDVBAdapter({ adapter: 2, frontend: 1, deliverySystem: 'DVBS2X', frequencyMHz: '10762', symbolRateKsym: '30000', diseqc: 1, streamId: 9, scramblingSequenceIndex: 262142, rolloff: '10' });
   assert.equal(adapter.id, 'adapter2-frontend1');
   assert.equal(adapter.frequencyMHz, 10762);
   assert.equal(adapter.symbolRateKsym, 30000);
-  assert.equal(adapter.lnb, 'UNIVERSAL');
+  assert.equal(adapter.lnb, 'EXTENDED');
+  assert.equal(adapter.deliverySystem, 'DVBS2X');
+  assert.equal(adapter.streamId, 9);
+  assert.equal(adapter.scramblingSequenceIndex, 262142);
+  assert.equal(adapter.rolloff, '10');
 });

@@ -5,24 +5,27 @@ import { fileURLToPath } from 'node:url';
 import { ConfigStore, normalizeStream } from './config.mjs';
 import { RingLogger } from './logger.mjs';
 import { StreamManager } from './stream-manager.mjs';
-import { formatPlaylist, playlistEntries } from './playlist.mjs';
+import { formatPlaylist, playlistEntries, streamAliases } from './playlist.mjs';
 import { xmltv } from './epg.mjs';
 import { encryptSecret } from './secrets.mjs';
+import { RelaySessions } from './sessions.mjs';
 import { parseNewcamdLine } from './softcam.mjs';
-import { discoverDVBDevices, mergeDVBAdapters, probeDVBFrontend } from './dvb.mjs';
+import { discoverDVBDevices, inspectDVBFrontend, mergeDVBAdapters, probeDVBFrontend, scanDVBAdapter } from './dvb.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const store = new ConfigStore();
 await store.load();
-const logger = new RingLogger(store.value.settings.logLimit);
+const logger = new RingLogger(store.value.settings.logLimit, (source) => store.value.streams.find((stream) => stream.id === source)?.name || store.value.adapters.find((adapter) => adapter.id === source)?.name || source);
 const manager = new StreamManager(store, logger);
 await manager.start();
 const startedAt = Date.now();
-const sessions = new Map();
+const sessions = new RelaySessions();
 const sseClients = new Set();
 let adapterCache = { expires: 0, value: [] };
+const adapterScans = new Set();
 
 logger.on('entry', (entry) => broadcast('log', entry));
+sessions.on('change', () => broadcast('sessions', { sessions: sessions.list() }));
 
 function json(response, status, value) {
   const body = JSON.stringify(value);
@@ -47,12 +50,17 @@ async function adapterStatus(force = false) {
   const detected = await discoverDVBDevices();
   const merged = mergeDVBAdapters(store.value.adapters, detected);
   const value = await Promise.all(merged.map(async (adapter) => {
+    if (adapterScans.has(adapter.id)) return { ...adapter, lock: false, status: 'scanning' };
     if (!adapter.configured || !adapter.detected || !adapter.enabled) return { ...adapter, lock: false, status: adapter.detected ? 'unconfigured' : 'missing' };
     try { return { ...adapter, ...(await probeDVBFrontend(adapter)) }; }
     catch (error) { return { ...adapter, lock: false, status: 'error', error: error.message }; }
   }));
   adapterCache = { expires: Date.now() + 4000, value };
   return value;
+}
+
+async function findAdapter(id) {
+  return mergeDVBAdapters(store.value.adapters, await discoverDVBDevices()).find((adapter) => adapter.id === id);
 }
 
 async function body(request, limit = 1024 * 1024) {
@@ -65,14 +73,23 @@ async function body(request, limit = 1024 * 1024) {
 function status() {
   const streams = manager.list();
   return {
-    version: '0.7.8',
+    version: '0.8.19',
     uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
     engine: 'online',
     authentication: 'disabled',
-    streams: { total: streams.length, running: streams.filter((stream) => stream.state === 'running').length, warning: streams.filter((stream) => stream.state === 'warning' || stream.state === 'error').length },
+    streams: { total: streams.length, running: streams.filter((stream) => stream.state === 'running').length, scrambled: streams.filter((stream) => stream.state === 'scrambled').length, warning: streams.filter((stream) => stream.state === 'warning' || stream.state === 'error' || stream.state === 'failover').length },
     sessions: sessions.size,
+    casProxy: manager.casProxy.metrics,
     memory: process.memoryUsage(),
   };
+}
+
+function resolveWorker(key) {
+  const direct = manager.get(key);
+  if (direct) return direct;
+  const aliases = streamAliases(store.value.streams);
+  const stream = store.value.streams.find((item) => aliases.get(item.id) === key);
+  return stream ? manager.get(stream.id) : null;
 }
 
 function broadcast(event, data) {
@@ -83,10 +100,8 @@ function broadcast(event, data) {
 function openRelay(request, response, worker) {
   if (!worker || !worker.config.http) return error(response, 404, 'HTTP relay is disabled');
   response.writeHead(200, { 'content-type': 'video/mp2t', 'cache-control': 'no-store', connection: 'keep-alive', 'x-content-type-options': 'nosniff' });
-  const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  sessions.set(id, { id, streamId: worker.config.id, ip: request.socket.remoteAddress, userAgent: request.headers['user-agent'] || '', connectedAt: new Date().toISOString() });
+  sessions.track(request, response, worker.config.id);
   worker.subscribe(response);
-  response.on('close', () => sessions.delete(id));
 }
 
 async function serveStatic(response, pathname, head = false) {
@@ -112,7 +127,7 @@ const server = http.createServer(async (request, response) => {
     if (request.method === 'GET' && path === '/api/status') return json(response, 200, status());
     if (request.method === 'GET' && path === '/api/streams') return json(response, 200, { streams: manager.list() });
     if (request.method === 'GET' && path === '/api/adapters') return json(response, 200, { adapters: await adapterStatus(url.searchParams.get('refresh') === '1') });
-    if (request.method === 'GET' && path === '/api/sessions') return json(response, 200, { sessions: [...sessions.values()] });
+    if (request.method === 'GET' && path === '/api/sessions') return json(response, 200, { sessions: sessions.list() });
     if (request.method === 'GET' && path === '/api/logs') return json(response, 200, { logs: logger.list(url.searchParams.get('limit')) });
     if (request.method === 'GET' && ['/playlist.m3u', '/playlist.txt', '/playlist.xspf', '/api/playlist'].includes(path)) {
       const format = path === '/api/playlist' ? 'json' : path.split('.').pop();
@@ -136,19 +151,39 @@ const server = http.createServer(async (request, response) => {
     }
 
     const play = path.match(/^\/play\/([a-zA-Z0-9_-]+)$/);
-    if (request.method === 'GET' && play) return openRelay(request, response, manager.get(play[1]));
+    if (request.method === 'GET' && play) return openRelay(request, response, resolveWorker(play[1]));
     const playlist = path.match(/^\/hls\/([a-zA-Z0-9_-]+)\/index\.m3u8$/);
     if (request.method === 'GET' && playlist) {
-      const worker = manager.get(playlist[1]); if (!worker?.config.hls) return error(response, 404, 'HLS is disabled');
+      const worker = resolveWorker(playlist[1]); if (!worker?.config.hls) return error(response, 404, 'HLS is disabled');
       const text = worker.hls.playlist(`/hls/${playlist[1]}`); response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-store' }); response.end(text); return;
     }
     const segment = path.match(/^\/hls\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9-]+)\.ts$/);
     if (request.method === 'GET' && segment) {
-      const data = manager.get(segment[1])?.hls.get(segment[2]); if (!data) return error(response, 404, 'Segment not found');
+      const data = resolveWorker(segment[1])?.hls.get(segment[2]); if (!data) return error(response, 404, 'Segment not found');
       response.writeHead(200, { 'content-type': 'video/mp2t', 'content-length': data.length, 'cache-control': 'public, max-age=30' }); response.end(data); return;
     }
 
     const streamRoute = path.match(/^\/api\/streams\/([a-zA-Z0-9_-]+)$/);
+    const adapterCapabilityRoute = path.match(/^\/api\/adapters\/([a-zA-Z0-9_.-]+)\/capabilities$/);
+    if (request.method === 'GET' && adapterCapabilityRoute) {
+      const adapter = await findAdapter(adapterCapabilityRoute[1]);
+      if (!adapter) return error(response, 404, 'DVB adapter not found');
+      return json(response, 200, await inspectDVBFrontend(adapter));
+    }
+    const adapterScanRoute = path.match(/^\/api\/adapters\/([a-zA-Z0-9_.-]+)\/scan$/);
+    if (request.method === 'POST' && adapterScanRoute) {
+      const id = adapterScanRoute[1];
+      const adapter = await findAdapter(id);
+      if (!adapter?.configured) return error(response, 404, 'Save the DVB adapter configuration before scanning');
+      if (adapterScans.has(id)) return error(response, 409, 'A scan is already running on this adapter');
+      adapterScans.add(id);
+      try {
+        const options = await body(request);
+        const result = await scanDVBAdapter(adapter, { networkScan: Boolean(options.networkScan), timeoutMultiply: options.timeoutMultiply, timeoutMs: options.timeoutMs });
+        logger.info(id, `DVB scan found ${result.services.length} services`);
+        return json(response, 200, result);
+      } finally { adapterScans.delete(id); }
+    }
     if (request.method === 'PUT' && streamRoute) {
       const value = normalizeStream({ ...(await body(request)), id: streamRoute[1] });
       const saved = await manager.upsert(value); broadcast('config', { resource: 'stream', id: saved.id }); return json(response, 200, saved);
@@ -158,14 +193,19 @@ const server = http.createServer(async (request, response) => {
       if (manager.get(value.id)) return error(response, 409, 'Stream already exists');
       const saved = await manager.upsert(value); broadcast('config', { resource: 'stream', id: saved.id }); return json(response, 201, saved);
     }
+    if (request.method === 'POST' && path === '/api/streams/delete') {
+      const ids = (await body(request)).ids;
+      if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(id))) return error(response, 400, 'A valid stream ID list is required');
+      const removed = await manager.removeMany(ids); broadcast('config', { resource: 'streams', removed }); return json(response, 200, { removed });
+    }
     if (request.method === 'DELETE' && streamRoute) {
       const removed = await manager.remove(streamRoute[1]); return removed ? json(response, 200, { removed: true }) : error(response, 404, 'Stream not found');
     }
     if (request.method === 'PUT' && path === '/api/settings') {
-      const next = await store.save({ ...store.value, settings: { ...store.value.settings, ...(await body(request)) } }); manager.reconcile(next); return json(response, 200, next.settings);
+      const next = await store.save({ ...store.value, settings: { ...store.value.settings, ...(await body(request)) } }); await manager.reconcile(next); return json(response, 200, next.settings);
     }
     if (request.method === 'PUT' && path === '/api/adapters') {
-      const next = await store.save({ ...store.value, adapters: (await body(request)).adapters || [] }); adapterCache.expires = 0; manager.reconcile(next); return json(response, 200, { adapters: await adapterStatus(true) });
+      const next = await store.save({ ...store.value, adapters: (await body(request)).adapters || [] }); adapterCache.expires = 0; await manager.reconcile(next); return json(response, 200, { adapters: await adapterStatus(true) });
     }
     if (request.method === 'PUT' && path === '/api/cas-profiles') {
       const incoming = (await body(request)).profiles || []; const existing = new Map(store.value.casProfiles.map((profile) => [profile.id, profile]));
@@ -175,7 +215,7 @@ const server = http.createServer(async (request, response) => {
         if (!lineEncrypted) throw new Error(`Credentials required for CAS profile ${profile.id}`);
         return { ...profile, lineEncrypted };
       });
-      const next = await store.save({ ...store.value, casProfiles: profiles }); manager.reconcile(next);
+      const next = await store.save({ ...store.value, casProfiles: profiles }); await manager.reconcile(next);
       return json(response, 200, { profiles: next.casProfiles.map(({ lineEncrypted, ...profile }) => ({ ...profile, configured: Boolean(lineEncrypted) })) });
     }
     error(response, 404, 'Not found');

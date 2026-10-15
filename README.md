@@ -9,7 +9,9 @@ A clean-room Linux broadcast control and MPEG-TS relay service. It does not cont
 - Automatic HLS and MPEG-DASH ingest through the managed FFmpeg bridge
 - TCP, SRT, RTSP, RTMP/RTMPS, and RIST inputs
 - MPEG-TS files natively and other supported media files through FFmpeg
-- Automatic Linux DVB frontend discovery and DVB-S/S2, DVB-T/T2, DVB-C, and ATSC tuning
+- Automatic Linux DVB frontend discovery and DVB-S/S2/S2X, DVB-T/T2, DVB-C, and ATSC tuning
+- Frontend capability inspection and transponder/NIT service scanning with one-click stream creation
+- DVB-S2X APSK/low-rolloff tuning plus multistream/ISI and PLS scrambling-sequence controls
 - LNB, polarization, DiSEqC, Unicable, modulation, FEC, lock, signal, and quality controls
 - Ordered multi-input failover with configurable timeouts
 - MPEG-TS sync, PID, bitrate, PES, scrambling, and continuity-counter analysis
@@ -21,7 +23,7 @@ A clean-room Linux broadcast control and MPEG-TS relay service. It does not cont
 - Stream CRUD, live adapter control, settings, status, sessions, logs, and SSE APIs
 - Browser-based control panel served by the engine
 - M3U, XSPF, plain-URL, and JSON playlist exports selectable between HTTP MPEG-TS and HLS delivery
-- Native per-stream Newcamd descrambling through a bundled tsdecrypt bridge
+- Native Newcamd descrambling with one shared upstream connection per profile and per-stream tsdecrypt workers
 - DVB EIT collection with XMLTV and JSON EPG publishing
 - Open control API with network-level access control
 - systemd hardening, Docker Compose, health-oriented CLI, and automated tests
@@ -115,6 +117,14 @@ Only ingest and redistribute streams you are authorized to use.
 
 ## Newcamd CAS
 
-The native installer builds a pinned revision of GPL-2.0 `tsdecrypt` and preserves its license under `/usr/local/share/licenses/tsdecrypt`. Create reusable Newcamd profiles in Settings using the provider format `C: host port username password 0102030405060708091011121314`, then select a profile under Stream → Advanced. Credentials are encrypted with AES-256-GCM using `ASTRA_SECRET_KEY` and are never returned by the configuration API.
+The native installer builds pinned revisions of GPL-2.0 `tsdecrypt` and GPL-3.0 OSCam, preserving their licenses under `/usr/local/share/licenses`. OSCam is an integral dependency: the installer installs it automatically and Astra starts and stops it. OSCam maintains one upstream Newcamd TCP connection per profile and multiplexes the ECM exchanges from all per-stream tsdecrypt workers over it. No extra pre-decryption or post-decryption delay is applied. tsdecrypt retains only the current even/odd key pair, so a long encrypted input buffer can corrupt packets across key changes. Create reusable Newcamd profiles in Settings using `N: host port username password 0102030405060708091011121314`, then select a profile under Stream → Advanced. Credentials are encrypted with AES-256-GCM using `ASTRA_SECRET_KEY` and are never returned by the configuration API.
 
-The input must carry ECM PIDs. Select a CAID when the PMT is ambiguous and set a service ID for MPTS inputs. Forward EMM only when the provider requires and authorizes it.
+EMM forwarding is not supported: tsdecrypt never enables it, and OSCam account updates are disabled. Legacy EMM profile settings are discarded. The installer retains the bundled defensive PID correction when building tsdecrypt. `/api/status` publishes aggregate CAS reply/timeout counts; per-stream CAS diagnostics publish pause and error counts without exposing keys or credentials.
+
+The input must carry ECM PIDs and every shared profile requires its four-digit CAID. Set a service ID for MPTS inputs. A single provider connection still carries one ECM/CW exchange per active encrypted service; control words cannot generally be shared between different services.
+
+Stream cards show continuous delivery uptime, starting with the first output packet and resetting on input reconnect or timeout. Logs display channel names while preserving stable internal source IDs in the API. EPG exports use UTF-8 with DVB encoding selectors, ISO-6937 accents, and legacy Albanian Latin-1 broadcasts supported.
+
+Channel creation, deletion, and edits reconcile only affected workers. Unchanged streams keep their clients, HLS windows, tuner subscriptions, and uptime. Valid configured CAS profiles keep stable shared listeners across channel changes; changing CAS connection settings can still restart dependent descramblers. Tuner changes restart only streams using that tuner. HTTP relay sessions include uptime and are removed on close, finish, abort, or socket error, with immediate browser notifications. Stalled readers are disconnected before their queued output exceeds an approximately 8 MiB bound. An abrupt network loss without a TCP close cannot be detected instantly; TCP keepalive and bounded write queues handle those cases. HLS segment downloads are not counted as persistent HTTP relay sessions.
+
+Embedded DVB metadata is normalized for each selected service: the SDT publishes the configured channel name, unrelated multiplex SDT/EIT entries are removed, and short/extended EPG descriptions use the DVB UTF-8 selector. Section lengths, CRCs, and metadata continuity counters are regenerated; video, audio, and PCR packets are unchanged. A single-program PAT can supply the service ID when none is configured; an unselected multi-program input is not renamed wholesale. The HLS compatibility remux also receives the configured channel name and relayed EPG with its output service identifiers. Malformed metadata is discarded; unusually large events whose UTF-8 expansion exceeds DVB limits retain their original valid section rather than losing text. This does not alter bitmap DVB subtitles or text burned into video.

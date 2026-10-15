@@ -38,6 +38,24 @@ function isTransportChunk(chunk) {
   return chunk?.length >= PACKET_SIZE && chunk.length % PACKET_SIZE === 0 && chunk[0] === 0x47;
 }
 
+function pmtVideoPids(packet) {
+  if (!payloadStart(packet)) return null;
+  let offset = payloadOffset(packet);
+  if (offset < 0) return null;
+  offset += 1 + packet[offset];
+  if (offset + 12 > PACKET_SIZE || packet[offset] !== 0x02) return null;
+  const length = 3 + (((packet[offset + 1] & 0x0f) << 8) | packet[offset + 2]);
+  if (offset + length > PACKET_SIZE) return null;
+  const end = offset + length - 4;
+  const video = [];
+  let cursor = offset + 12 + (((packet[offset + 10] & 0x0f) << 8) | packet[offset + 11]);
+  while (cursor + 5 <= end) {
+    if ([0x01, 0x02, 0x10, 0x1b, 0x24, 0x42].includes(packet[cursor])) video.push(((packet[cursor + 1] & 0x1f) << 8) | packet[cursor + 2]);
+    cursor += 5 + (((packet[cursor + 3] & 0x0f) << 8) | packet[cursor + 4]);
+  }
+  return video;
+}
+
 export class HLSSegmenter {
   constructor({ segmentSeconds = 6, windowSegments = 5 } = {}) {
     this.segmentMs = segmentSeconds * 1000;
@@ -48,6 +66,7 @@ export class HLSSegmenter {
     this.sequence = 0;
     this.psi = new Map();
     this.pmtPids = new Set();
+    this.videoPids = new Set();
     this.nextDiscontinuity = false;
   }
 
@@ -66,8 +85,9 @@ export class HLSSegmenter {
       const elapsed = now - this.startedAt;
       const firstTarget = this.segments.length ? this.segmentMs : Math.min(2000, this.segmentMs);
       const packetPid = pid(packet);
-      const pesBoundary = payloadStart(packet) && packetPid > 0x1f && !this.pmtPids.has(packetPid);
-      const shouldCut = this.current.length && elapsed >= firstTarget && (randomAccess(packet) || (elapsed >= this.segmentMs * 2 && pesBoundary));
+      const videoBoundary = !this.videoPids.size || this.videoPids.has(packetPid);
+      const pesBoundary = videoBoundary && payloadStart(packet) && packetPid > 0x1f && !this.pmtPids.has(packetPid);
+      const shouldCut = this.current.length && elapsed >= firstTarget && ((videoBoundary && randomAccess(packet)) || (elapsed >= this.segmentMs * 2 && pesBoundary));
       if (shouldCut) {
         if (offset > rangeStart) this.current.push(chunk.subarray(rangeStart, offset));
         this.flush(now);
@@ -99,6 +119,7 @@ export class HLSSegmenter {
     this.nextDiscontinuity = true;
     this.psi.clear();
     this.pmtPids.clear();
+    this.videoPids.clear();
   }
 
   playlist(basePath) {
@@ -122,6 +143,8 @@ export class HLSSegmenter {
       return;
     }
     if (!this.pmtPids.has(packetPid)) return;
+    const videos = pmtVideoPids(packet);
+    if (videos) this.videoPids = new Set(videos);
     const packets = payloadStart(packet) || !this.psi.has(packetPid) ? [] : this.psi.get(packetPid);
     if (packets.length < 8) packets.push(Buffer.from(packet));
     this.psi.set(packetPid, packets);

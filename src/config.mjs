@@ -34,7 +34,7 @@ export function normalizeDVBAdapter(adapter = {}) {
   const frontend = Math.max(0, Number(adapter.frontend) || 0);
   const id = String(adapter.id || `adapter${deviceNumber}-frontend${frontend}`).replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 64);
   if (!id) return null;
-  const deliverySystem = ['DVBS', 'DVBS2', 'DVBT', 'DVBT2', 'DVBC', 'DVBC_ANNEX_A', 'ATSC'].includes(adapter.deliverySystem) ? adapter.deliverySystem : 'DVBS2';
+  const deliverySystem = ['DVBS', 'DVBS2', 'DVBS2X', 'DVBT', 'DVBT2', 'DVBC', 'DVBC_ANNEX_A', 'ATSC'].includes(adapter.deliverySystem) ? adapter.deliverySystem : 'DVBS2';
   return {
     id,
     name: String(adapter.name || `DVB adapter ${deviceNumber} frontend ${frontend}`).slice(0, 128),
@@ -49,7 +49,12 @@ export function normalizeDVBAdapter(adapter = {}) {
     polarization: ['HORIZONTAL', 'VERTICAL', 'LEFT', 'RIGHT'].includes(adapter.polarization) ? adapter.polarization : 'HORIZONTAL',
     modulation: String(adapter.modulation || '').replace(/[^a-zA-Z0-9/_-]/g, '').slice(0, 24),
     fec: String(adapter.fec || 'AUTO').replace(/[^a-zA-Z0-9/_-]/g, '').slice(0, 16),
-    lnb: String(adapter.lnb || 'UNIVERSAL').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32),
+    inversion: ['AUTO', 'ON', 'OFF'].includes(adapter.inversion) ? adapter.inversion : 'AUTO',
+    pilot: ['AUTO', 'ON', 'OFF'].includes(adapter.pilot) ? adapter.pilot : 'AUTO',
+    rolloff: ['AUTO', '35', '25', '20', '15', '10', '5'].includes(String(adapter.rolloff)) ? String(adapter.rolloff) : 'AUTO',
+    streamId: Math.max(-1, Math.min(255, Number.isFinite(Number(adapter.streamId)) ? Math.trunc(Number(adapter.streamId)) : -1)),
+    scramblingSequenceIndex: Math.max(0, Math.min(262142, Math.trunc(Number(adapter.scramblingSequenceIndex) || 0))),
+    lnb: String(adapter.lnb || 'EXTENDED').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32),
     diseqc: Math.max(-1, Math.min(15, Number.isFinite(Number(adapter.diseqc)) ? Number(adapter.diseqc) : -1)),
     unicableKHz: Math.max(0, Number(adapter.unicableKHz) || 0),
   };
@@ -64,7 +69,6 @@ function normalizeCASProfile(profile) {
     lineEncrypted: String(profile?.lineEncrypted || ''),
     caid: String(profile?.caid || '').replace(/[^a-fA-F0-9x]/g, '').slice(0, 6),
     serviceId: Math.max(0, Number(profile?.serviceId) || 0),
-    emm: Boolean(profile?.emm),
   };
 }
 

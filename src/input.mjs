@@ -56,7 +56,7 @@ export function ffmpegInputArgs(urlValue, input = {}) {
   return args;
 }
 
-export async function runInput(input, { signal, onData, onReady, adapters = [] }) {
+export async function runInput(input, { signal, onData, onReady, adapters = [], dvbPool = null }) {
   const { url, protocol } = parseMediaUrl(input.url);
   if (protocol === 'udp' || protocol === 'rtp') return runUDP(url, input, { signal, onData, onReady, stripRTP: protocol === 'rtp' });
   if (protocol === 'tcp') return runTCP(url, input, { signal, onData, onReady });
@@ -65,7 +65,10 @@ export async function runInput(input, { signal, onData, onReady, adapters = [] }
   if (protocol === 'file') return runFile(url, input, { signal, onData, onReady });
   if (protocol === 'dvb') {
     const id = decodeURIComponent(url.hostname || url.pathname.replace(/^\//, ''));
-    return runDVBInput(adapters.find((adapter) => adapter.id === id), { signal, onData, onReady });
+    const serviceId = Math.max(0, Math.trunc(Number(url.searchParams.get('service')) || 0));
+    const adapter = adapters.find((item) => item.id === id);
+    if (dvbPool) return dvbPool.run(adapter, serviceId, { signal, onData, onReady });
+    return runDVBInput(adapter, { signal, onData, onReady, serviceId });
   }
   throw new Error(`Unsupported input protocol: ${protocol}`);
 }
