@@ -263,14 +263,48 @@ git pull --ff-only
 sudo ./install.sh
 ```
 
-Verify the version and service after the upgrade:
+Verify the version in the signed-in dashboard and the service after the upgrade (`/api/status` requires a management session):
 
 ```bash
-curl -fsS http://127.0.0.1:8000/api/status
+curl -fsS http://127.0.0.1:8000/healthz
 sudo systemctl status astra-linux --no-pager
 ```
 
 ## 11. Logs and troubleshooting
+
+### Optional socket-scoped BBR for HTTP media
+
+Version 0.8.43 retains idle HTTP connections for 60 seconds and adds bounded server-flush telemetry. It does not add a media buffer or modify CAS. The installer builds the optional TCP helper if `/usr/include/node/node_api.h` or `/usr/local/include/node/node_api.h` exists; otherwise normal streaming continues using system TCP policy. If needed, install headers compatible with your Node package and rerun the staged installer for one planned service restart. Do not overwrite a loaded helper in place.
+
+The default remains `system`. To test BBR, first record the current kernel settings and load the distribution's existing module:
+
+```bash
+sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_allowed_congestion_control
+sudo modprobe tcp_bbr
+sysctl net.ipv4.tcp_available_congestion_control
+```
+
+Add `bbr` to the **existing** `net.ipv4.tcp_allowed_congestion_control` list, preserving its other entries. For a system whose recorded allowed list is `reno cubic`:
+
+```bash
+sudo sysctl -w 'net.ipv4.tcp_allowed_congestion_control=reno cubic bbr'
+```
+
+Do **not** set the global `net.ipv4.tcp_congestion_control` to BBR. Leave management, SSH and provider connections on their existing default. After successful comparison, boot persistence may be configured with a dedicated `/etc/modules-load.d/astra-media-tcp.conf` containing `tcp_bbr` and `/etc/sysctl.d/90-astra-media-tcp.conf` containing the tested allowed-algorithm list only. Preserve any existing files first. The application and installer never create these kernel opt-in files automatically.
+
+Select the media-only policy atomically (no service restart):
+
+```bash
+sudo install -o astra -g astra -m 0600 /dev/null /var/lib/astra-linux/media-delivery.json.new
+printf '%s\n' '{"version":1,"congestionControl":"bbr"}' | sudo tee /var/lib/astra-linux/media-delivery.json.new >/dev/null
+sudo mv /var/lib/astra-linux/media-delivery.json.new /var/lib/astra-linux/media-delivery.json
+```
+
+Use `cubic` for the comparison phase and `system` for rollback. Wait at least five seconds for policy application, then verify actual media sockets with `sudo ss -tin 'sport = :8000'`; do not infer successful BBR from the configuration label alone. Compare the same existing HLS clients over several minutes, excluding transitions, and confirm continuity, decoder, provider and worker counters do not regress. Retain BBR only if measured delivery improves without harmful backlog/retransmission or CPU regressions.
+
+For rollback, atomically select `system` using the same procedure, verify sockets restored, restore the recorded allowed list, and remove/restore only the dedicated persistence files you created. Unload `tcp_bbr` only if it was previously unloaded and no sockets still use it; never force module removal. Application rollback uses the previous directory retained by the installer. Keep configuration, auth, encryption keys, native CAS binaries/manifests and daily EPG together with their matching backups.
+
+`serverFlushMs` is OS handoff, not client receipt; a low value alone does not prove fast remote playback. The unchanged HLS URLs and Flussonic configuration need no edits.
 
 Follow logs live:
 

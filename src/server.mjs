@@ -17,6 +17,9 @@ import { DVBProbeBroker } from './dvb-probe-broker.mjs';
 import { annotateDVBServices, existingDVBStreams } from './dvb-services.mjs';
 import { SystemResources } from './system-resources.mjs';
 import { DiagnosticSnapshot, mediaDiagnostics } from './diagnostics.mjs';
+import { HTTPDelivery } from './http-delivery.mjs';
+import { createMediaTCPAdapter } from './media-tcp.mjs';
+import { startMediaPolicy } from './media-policy.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const packageInfo = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
@@ -26,10 +29,15 @@ const auth = new ManagementAuth(store.path);
 await auth.load();
 let accessPolicy = new AccessPolicy(store.value.access);
 const logger = new RingLogger(store.value.settings.logLimit, (source) => store.value.streams.find((stream) => stream.id === source)?.name || store.value.adapters.find((adapter) => adapter.id === source)?.name || source);
+const tcpAdapter = createMediaTCPAdapter({ onWarning: warning => logger.warn('http', warning.message) });
+const httpDelivery = new HTTPDelivery({ tcpAdapter, onWarning: warning => logger.warn(warning.streamId || 'http', warning.message) });
+const mediaPolicy = await startMediaPolicy({ path: process.env.ASTRA_MEDIA_DELIVERY_FILE || join(dirname(store.path), 'media-delivery.json'), onWarning: warning => logger.warn('http', warning.message), onChange: policy => { tcpAdapter.configureAll(policy.congestionControl); httpDelivery.configure(policy); } });
+const deliverySnapshot = () => ({ ...httpDelivery.snapshot(), policy: mediaPolicy.snapshot(), sockets: tcpAdapter.snapshot() });
 const probeBroker = new DVBProbeBroker(logger);
 await probeBroker.start();
 const manager = new StreamManager(store, logger);
 manager.signalMonitor = probeBroker;
+manager.httpDelivery = { snapshot: deliverySnapshot };
 await manager.start();
 const epgPublisher = new DailyEPGPublisher({ path: join(dirname(store.path), 'epg-published.json'), snapshot: () => manager.epgSnapshot(), warmupMs: store.value.streams.some(stream => stream.enabled) ? 300000 : 0, onError: error => logger.warn('epg', `Daily EPG publication unavailable: ${error.message}; retaining the previous guide and retrying`) });
 await epgPublisher.load();
@@ -52,7 +60,16 @@ function json(response, status, value) {
   response.end(body);
 }
 
-function error(response, status, message) { json(response, status, { error: message }); }
+function error(response, status, message) {
+  if (response.req && !mediaSocket(response.req, false)) return;
+  json(response, status, { error: message });
+}
+
+function mediaSocket(request, allowed) {
+  const result = httpDelivery.applyMediaSocket(request, { allowed, scope: 'streaming' });
+  if (result.restoreFailed) { request.socket.destroy(); return false; }
+  return true;
+}
 
 function requestBase(request) {
   if (store.value.server.publicBaseUrl) return store.value.server.publicBaseUrl;
@@ -107,6 +124,7 @@ function status() {
     memory: process.memoryUsage(),
     resources: resources.value,
     processing: manager.packetPool.status(),
+    httpDelivery: deliverySnapshot(),
     epg: { ...manager.epgStatus(), publication: epgPublisher.status },
   };
 }
@@ -130,6 +148,7 @@ function broadcast(event, data) {
 
 function openRelay(request, response, worker) {
   if (!worker || !worker.config.http) return error(response, 404, 'HTTP relay is disabled');
+  if (!mediaSocket(request, true)) return;
   response.writeHead(200, { 'content-type': 'video/mp2t', 'cache-control': 'no-store', connection: 'keep-alive', 'x-content-type-options': 'nosniff' });
   sessions.track(request, response, worker.config.id);
   worker.subscribe(response);
@@ -151,7 +170,13 @@ const server = http.createServer(async (request, response) => {
   const path = url.pathname;
   try {
     const scope = mediaScope(request.method, path);
-    if (scope && !accessPolicy.allows(scope, request.socket.remoteAddress)) return error(response, 403, `${scope === 'epg' ? 'EPG' : 'Streaming'} access is not allowed from your IP address`);
+    const allowed = !scope || accessPolicy.allows(scope, request.socket.remoteAddress);
+    const mediaCandidate = request.method === 'GET' && /^\/(?:play\/[a-zA-Z0-9_-]+|hls\/[a-zA-Z0-9_-]+\/(?:index\.m3u8|[a-zA-Z0-9-]+\.ts))$/.test(path);
+    // Restore before any non-media or denied response on a reused connection.
+    if (scope !== 'streaming' || !mediaCandidate || !allowed) {
+      if (httpDelivery.applyMediaSocket(request, { allowed: false, scope }).restoreFailed) { request.socket.destroy(); return; }
+    }
+    if (!allowed) return error(response, 403, `${scope === 'epg' ? 'EPG' : 'Streaming'} access is not allowed from your IP address`);
     const session = auth.authenticate(request);
     const mutation = !['GET', 'HEAD', 'OPTIONS'].includes(request.method);
     if (mutation && !auth.sameOrigin(request)) return error(response, 403, 'Cross-origin management requests are not allowed');
@@ -164,7 +189,10 @@ const server = http.createServer(async (request, response) => {
     }
     if (['GET', 'HEAD'].includes(request.method) && path === '/login' && session) { response.writeHead(303, { location: '/', 'cache-control': 'no-store' }); response.end(); return; }
     const staticAsset = ['/login', '/login.js', '/auth.css', '/app.js', '/styles.css', '/enhancements.css', '/favicon.svg'].includes(path);
-    if (url.searchParams.get('include_disabled') === '1' && !session) return error(response, 401, 'Sign in to export disabled channels');
+    if (url.searchParams.get('include_disabled') === '1' && !session) {
+      if (httpDelivery.applyMediaSocket(request, { allowed: false, scope }).restoreFailed) { request.socket.destroy(); return; }
+      return error(response, 401, 'Sign in to export disabled channels');
+    }
     if (!staticAsset && !publicMediaRequest(request.method, path) && !session) {
       if (['GET', 'HEAD'].includes(request.method) && path === '/') { response.writeHead(303, { location: '/login', 'cache-control': 'no-store' }); response.end(); return; }
       return error(response, 401, 'Sign in to manage this server');
@@ -234,14 +262,18 @@ const server = http.createServer(async (request, response) => {
     const playlist = path.match(/^\/hls\/([a-zA-Z0-9_-]+)\/index\.m3u8$/);
     if (request.method === 'GET' && playlist) {
       const worker = resolveWorker(playlist[1]); if (!worker?.config.hls) return error(response, 404, 'HLS is disabled');
+      if (!mediaSocket(request, true)) return;
       const text = worker.hls.playlist(`/hls/${playlist[1]}`); response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-store' }); response.end(text); return;
     }
     const segment = path.match(/^\/hls\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9-]+)\.ts$/);
     if (request.method === 'GET' && segment) {
       const worker = resolveWorker(segment[1]);
-      const data = worker?.config.hls && worker.hls.get(segment[2]); if (!data) return error(response, 404, 'Segment not found');
+      const media = worker?.config.hls && worker.hls.getSegment(segment[2]); if (!media) return error(response, 404, 'Segment not found');
+      if (!mediaSocket(request, true)) return;
+      const { data } = media;
       const segmentSeconds = Math.max(worker.hls.segmentMs / 1000, ...worker.hls.segments.map(item => item.duration));
       sessions.trackHLS(request, response, worker.config.id, { segmentSeconds });
+      httpDelivery.trackSegment(request, response, { streamId: worker.config.id, bytes: data.length, mediaSeconds: media.duration });
       response.writeHead(200, { 'content-type': 'video/mp2t', 'content-length': data.length, 'cache-control': 'private, no-store' }); response.end(data); return;
     }
 
@@ -322,6 +354,7 @@ const server = http.createServer(async (request, response) => {
     logger.error('http', caught.message); error(response, caught.statusCode || (caught instanceof SyntaxError ? 400 : 500), caught.message);
   }
 });
+httpDelivery.configureServer(server);
 
 const heartbeat = setInterval(async () => { sessions.prune(); await resources.sample(); broadcast('status', status()); }, 2000);
 const epgMaintenance = setInterval(() => manager.maintainEPG(), 60000); epgMaintenance.unref();
@@ -331,7 +364,7 @@ void diagnostics.tick();
 server.listen(store.value.server.port, store.value.server.host, () => logger.info('system', `Listening on ${store.value.server.host}:${store.value.server.port}`));
 
 function shutdown() {
-  clearInterval(heartbeat); clearInterval(epgMaintenance); clearInterval(epgPublication); void diagnostics.stop(); void probeBroker.stop(); epgPublisher.stop(); manager.stop(); for (const client of sseClients) client.end();
+  clearInterval(heartbeat); clearInterval(epgMaintenance); clearInterval(epgPublication); void mediaPolicy.close(); httpDelivery.close(); tcpAdapter.close(); void diagnostics.stop(); void probeBroker.stop(); epgPublisher.stop(); manager.stop(); for (const client of sseClients) client.end();
   server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 5000).unref();
 }
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);

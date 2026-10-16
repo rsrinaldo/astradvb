@@ -9,6 +9,8 @@
 /**/oscam.server
 /**/oscam.user
 /bin/*.so
+/bin/*.node
+/**/media-delivery.json
 /test/native-dvb-buffer
 /test/native-dvb-buffer-abi
 /node_modules/

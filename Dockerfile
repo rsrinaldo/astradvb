@@ -37,6 +37,7 @@ COPY src ./src
 COPY public ./public
 COPY bin ./bin
 RUN cc -shared -fPIC -O2 -Wall -Wextra bin/dvb-buffer.c -o bin/dvb-buffer.so -ldl \
+  && bash bin/build-media-tcp.sh \
   && node --input-type=module -e 'import { protectedNativeBuild } from "./src/softcam.mjs"; if (!protectedNativeBuild()) process.exit(1);'
 COPY config.example.json /etc/astra/config.example.json
 RUN mkdir -p /var/lib/astra && chown astra:astra /var/lib/astra

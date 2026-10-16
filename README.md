@@ -89,6 +89,18 @@ When available, the selected programme's PCR clock determines segment timing ins
 
 The window-segment setting is a preferred count, not a limit that can violate the HLS live-window minimum. Once the window advances it retains at least three target durations (27 seconds with defaults), extending the count when necessary. Removed playlist URIs remain fetchable for their segment duration plus the longest observed playlist duration, then expire automatically. This grace cache is bounded to 128 MiB and 1,024 retired segments per stream; under exceptional memory pressure or faster-than-real-time input, oldest retired media can expire sooner. The current TS segment has a 64 MiB safety ceiling. This uses additional origin RAM, not extra network traffic or provider key requests. Playback still requires adequate end-to-end bandwidth; HLS compliance alone cannot eliminate network stalls.
 
+## HTTP delivery (v0.8.43)
+
+Idle HTTP keep-alive is 60 seconds by default, allowing cooperating HLS clients to reuse connections between segments. Header and request-receipt timeouts remain finite; active MPEG-TS responses are not given a new response timeout. `ASTRA_HTTP_KEEPALIVE_MS` permits 5000–120000 ms. This changes connection reuse, not the tuner, CAS, HLS window, encoded packets or playback buffer. A client that closes connections itself cannot be forced to reuse them. See [Node HTTP timeout documentation](https://nodejs.org/docs/latest-v22.x/api/http.html#serverkeepalivetimeout).
+
+An optional Linux Node-API helper can select `cubic` or `bbr` on authorized, plaintext streaming GET sockets only. Management, EPG and rejected requests restore the socket's original algorithm; a failed restoration closes that HTTP connection. Outbound CAS/SSH connections and the global TCP default are never changed. Missing headers/helper or an unavailable algorithm falls back to the existing socket policy with a bounded warning. The native installer and Docker build the helper when Node-API headers are present; for a manual checkout run `bash bin/build-media-tcp.sh`. No extra Node capabilities or root TCP broker are needed. The guarded Node socket-descriptor access is private API; test the helper when upgrading Node. TLS termination/proxies require separate tuning at their own network boundary.
+
+Default policy is `system`. An operator may atomically create mode-0600 `media-delivery.json` beside `config.json` (owned/readable by the service user), containing exactly `{"version":1,"congestionControl":"bbr"}`. Alternatives are `cubic` and `system`. The file is checked every five seconds without restarting tuners, CAS or the service. Invalid files retain the last accepted policy; deletion returns to `ASTRA_MEDIA_TCP_CONGESTION` or `system`. `ASTRA_MEDIA_DELIVERY_FILE` may override the private file path. Hot changes retune already-tuned media sockets and apply on the next streaming GET; an existing untuned continuous MPEG-TS connection needs a reconnect. This is an operator file, not a public mutation endpoint.
+
+BBR must already be available and allowed by the kernel; the application does not load modules or change sysctls. See the Ubuntu guide for optional kernel preparation and rollback. Test CUBIC → BBR → CUBIC against the same real clients and comparable segment sizes before retaining BBR. It is not a substitute for adequate bandwidth and cannot repair source loss or missing keys. [Linux TCP selection documentation](https://docs.kernel.org/networking/ip-sysctl.html#tcp-allowed-congestion-control).
+
+Authenticated `/api/status` and private local diagnostics include bounded HTTP delivery observations. Segment `serverFlushMs` ends at Node's response `finish` event: handoff to the operating system, **not client receipt, ACK completion or a download-speed measurement**. Aborted responses are counted separately. Socket TCP_INFO observations are anonymous aggregate samples with socket-lifetime counters, not per-segment packet-loss percentages. Use same-socket counter deltas and passive network evidence for transport diagnosis; never equate retransmitted bytes with an exact packet-loss rate.
+
 ## DVB rescanning
 
 A normal current-transponder scan reads PAT/PMT/SDT from the shared full-multiplex tuner input. It reuses an active frontend rather than opening it a second time, without stopping channels, resetting their uptime, or disconnecting viewers. It supports the same DVB-S2/S2X tuning path as normal ingestion. Incomplete service information is marked as partial instead of inventing PIDs.
@@ -145,7 +157,7 @@ The native installer adds `dvb-tools` and grants the service user access to the 
 
 From v0.8.42, recurring read-only tuner signal probes run through a small persistent monitoring process started before media capture. Dashboard refreshes use bounded IPC instead of repeatedly forking the large streaming process. A failed probe reports unknown signal status and does not retune or restart channels; monitor recovery is bounded and backed off.
 
-Configuration operations are open to every client that can reach the service:
+Configuration operations require administrator sign-in and mutation requests require CSRF verification:
 
 - `GET /api/config`
 - `POST /api/streams`

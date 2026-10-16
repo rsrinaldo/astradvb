@@ -80,7 +80,13 @@ test('real HLS routes count canonical segment clients, keep bytes unchanged and 
   const secondManifest = await (await fetch(`${base}/hls/2/index.m3u8`)).text();
   await (await fetch(`${base}${secondManifest.split('\n').find(line => line.startsWith('/hls/'))}`, { headers: { 'user-agent': 'Flussonic' } })).arrayBuffer();
   assert.equal((await list()).length, 3);
-  assert.equal((await (await fetch(`${base}/api/status`, { headers: { cookie } })).json()).sessions, 3);
+  const status = await (await fetch(`${base}/api/status`, { headers: { cookie } })).json();
+  assert.equal(status.sessions, 3);
+  assert.equal(status.httpDelivery.measurement, 'server-flush-not-client-receipt');
+  assert.equal(status.httpDelivery.configuration.keepAliveTimeout, 60000);
+  assert.equal(status.httpDelivery.policy.congestionControl, 'system');
+  assert.ok(status.httpDelivery.totals.completedSegments >= 4);
+  assert.equal(status.httpDelivery.streams.find(item => item.streamId === '1').last.mediaSeconds, 6);
   const workerReady = once(child, 'message'); child.send('worker-media'); await workerReady;
   const sharedManifest = await (await fetch(`${base}/hls/second-channel/index.m3u8`)).text();
   const sharedPath = sharedManifest.split('\n').filter(line => line.startsWith('/hls/')).at(-1);

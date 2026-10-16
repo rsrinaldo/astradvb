@@ -16,6 +16,7 @@ export function mediaDiagnostics(manager, version) {
     version, sampledAt: new Date().toISOString(), pid: process.pid,
     processing: manager.packetPool.status(),
     signalMonitor: manager.signalMonitor?.snapshot() || null,
+    httpDelivery: manager.httpDelivery?.snapshot() || null,
     casProxy: { ...manager.casProxy.metrics, providerGuards: manager.casProxy.guardMetrics() },
     streams: [...manager.workers.values()].map(worker => ({
       id: worker.config.id, name: worker.config.name, enabled: worker.config.enabled,

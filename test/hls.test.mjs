@@ -135,10 +135,14 @@ test('removed playlist segments remain downloadable for their full grace period 
   for (let time = 2000; time <= 10000; time += 2000) { hls.push(Buffer.from(`next-${time}`), time); hls.flush(time + 2000); }
   assert.equal(hls.segments.some(item => item.id === first.id), false);
   assert.equal(hls.get(first.id, 12000).toString(), 'first');
+  assert.deepEqual(hls.getSegment(first.id, 12000), { data: first.data, duration: 2 });
+  const active = hls.segments.at(-1);
+  assert.deepEqual(hls.getSegment(active.id, 12000), { data: active.data, duration: active.duration });
   const expiration = hls.retired.get(first.id).expiresAt;
   assert.ok(expiration >= 12000 + (2 + 10) * 1000);
   assert.ok(hls.get(first.id, expiration - 1));
   assert.equal(hls.get(first.id, expiration), null);
+  assert.equal(hls.getSegment(first.id, expiration), null);
   assert.equal(hls.retired.has(first.id), false);
 });
 

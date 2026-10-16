@@ -11,7 +11,7 @@ const install = readFileSync(new URL('../install.sh', import.meta.url), 'utf8');
 const docker = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
 
 test('installers and Docker RUN commands parse without executing installation or a container build', () => {
-  for (const name of ['install.sh', 'install-cas.sh']) {
+  for (const name of ['install.sh', 'install-cas.sh', 'bin/build-media-tcp.sh']) {
     const result = spawnSync('bash', ['-n', `${root}${name}`], { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
   }
@@ -21,6 +21,16 @@ test('installers and Docker RUN commands parse without executing installation or
     const result = spawnSync('sh', ['-n'], { input: instruction.slice(4), encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
   }
+});
+
+test('socket-scoped helper builds before activation without global TCP changes or elevated Node capabilities', () => {
+  const builder = readFileSync(new URL('../bin/build-media-tcp.sh', import.meta.url), 'utf8');
+  assert.match(install, /bash "\$stage_dir\/bin\/build-media-tcp\.sh"/);
+  assert.ok(install.indexOf('bash "$stage_dir/bin/build-media-tcp.sh"') < install.indexOf('# All preparation completed.'));
+  assert.match(docker, /bash bin\/build-media-tcp\.sh/);
+  assert.match(builder, /-DNAPI_VERSION=8/);
+  assert.match(builder, /Node-API headers missing; using system TCP policy/);
+  for (const source of [install, docker, builder]) assert.doesNotMatch(source, /setcap|sysctl|modprobe|CAP_NET_ADMIN/);
 });
 
 test('system and container installations require a verified policy-3 executable and include every native patch', () => {

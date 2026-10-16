@@ -135,6 +135,7 @@ install -d -o astra -g astra -m 0750 /var/lib/astra-linux
 stage_dir="$(mktemp -d /opt/astra-linux-stage-XXXXXX)"
 cp -R "$installer_dir/src" "$installer_dir/public" "$installer_dir/bin" "$installer_dir/package.json" "$stage_dir/"
 cc -shared -fPIC -O2 -Wall -Wextra "$stage_dir/bin/dvb-buffer.c" -o "$stage_dir/bin/dvb-buffer.so" -ldl
+bash "$stage_dir/bin/build-media-tcp.sh"
 for module in "$stage_dir"/src/*.mjs; do "$node_binary" --check "$module"; done
 chown -R root:root "$stage_dir"
 chmod -R u=rwX,go=rX "$stage_dir"

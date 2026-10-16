@@ -182,7 +182,7 @@ export class HLSSegmenter {
       const removed = this.segments.shift();
       this.playlistSeconds -= removed.duration;
       if (removed.discontinuity) this.discontinuitySequence++;
-      this.retired.set(removed.id, { data: removed.data, expiresAt: now + (removed.duration + this.longestPlaylistSeconds) * 1000 });
+      this.retired.set(removed.id, { data: removed.data, duration: removed.duration, expiresAt: now + (removed.duration + this.longestPlaylistSeconds) * 1000 });
       this.retiredBytes += removed.data.length;
     }
     this.#prune(now);
@@ -215,8 +215,15 @@ export class HLSSegmenter {
   }
 
   get(id, now = performance.now()) {
+    return this.getSegment(id, now)?.data || null;
+  }
+
+  // Metadata only: serving telemetry must use this URI's actual media duration,
+  // including retired segments, without changing bytes or retention limits.
+  getSegment(id, now = performance.now()) {
     this.#prune(now);
-    return this.segments.find((segment) => segment.id === id)?.data || this.retired.get(id)?.data || null;
+    const segment = this.segments.find((segment) => segment.id === id) || this.retired.get(id);
+    return segment ? { data: segment.data, duration: segment.duration } : null;
   }
 
   #append(chunk) { this.current.push(chunk); this.currentInputBytes += chunk.length; }
