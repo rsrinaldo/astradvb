@@ -17,7 +17,7 @@ A clean-room Linux broadcast control and MPEG-TS relay service. It does not cont
 - MPEG-TS sync, PID, bitrate, PES, scrambling, and continuity-counter analysis
 - UDP and RTP outputs
 - HTTP MPEG-TS relay and logical HLS session tracking, with protocol labels and uptime
-- Rolling in-memory HLS with random-access segment boundaries, repeated program tables, and discontinuity signaling
+- Rolling in-memory HLS with broadcast-clock timing, preferred video random-access boundaries, fixed target duration, delayed-download retention, and discontinuity sequencing
 - Optional per-stream HLS compatibility remux with repeated H.264 headers, AAC audio, and DVB data-track removal
 - Persistent atomic JSON configuration
 - Stream CRUD, live adapter control, settings, status, sessions, logs, and SSE APIs
@@ -68,6 +68,14 @@ HTTP does **not** encrypt login credentials. Use HTTPS or a trusted VPN/SSH tunn
 API clients sign in using `POST /api/auth/login` with JSON `{ "username": "admin", "password": "..." }`, retain the returned cookie, and send the returned `csrfToken` in `X-CSRF-Token` for management mutations. `GET /api/auth/session` returns the current account/CSRF token. `POST /api/auth/password` accepts `currentPassword` and `newPassword`; `POST /api/auth/logout` ends the session. Export `ASTRA_COOKIE_JAR` for the read-only `bin/astractl` client. Never store credentials or cookie jars in Git.
 
 For emergency recovery, stop the service, run `sudo -u astra env ASTRA_CONFIG=/var/lib/astra-linux/config.json node /opt/astra-linux/bin/reset-admin.mjs`, then start it again. Read the newly generated initial password with `sudo cat /var/lib/astra-linux/initial-admin-password`. This invalidates previous logins and requires another password change. Back up `admin-auth.json` alongside your protected configuration; never publish it.
+
+## HLS packaging
+
+Starting with v0.8.39, each HLS worker keeps `EXT-X-TARGETDURATION` fixed for its lifetime, including input restarts. The ceiling is 1.5 times the requested segment interval, rounded up (the default six-second interval advertises nine seconds). Video random-access/PES boundaries are preferred; bounded PES/packet fallback is used when keyframe flags are absent or too far apart. No independent-segment claim is made for arbitrary sources, and stream copying cannot repair a damaged source or impose an encoder GOP. Normal six-second keyframe-aligned segments remain approximately six seconds; this does not add a nine-second tuner or descrambling buffer.
+
+When available, the selected programme's PCR clock determines segment timing instead of packet arrival time. PCR wrap is handled without a discontinuity; clock resets, clock loss and large gaps are signaled explicitly. Inputs without usable PCR fall back to monotonic arrival timing. PAT/PMT are repeated at segment starts, media packets are not transcoded or rewritten, and `EXT-X-DISCONTINUITY-SEQUENCE` remains consistent as restart boundaries leave the live window.
+
+The window-segment setting is a preferred count, not a limit that can violate the HLS live-window minimum. Once the window advances it retains at least three target durations (27 seconds with defaults), extending the count when necessary. Removed playlist URIs remain fetchable for their segment duration plus the longest observed playlist duration, then expire automatically. This grace cache is bounded to 128 MiB and 1,024 retired segments per stream; under exceptional memory pressure or faster-than-real-time input, oldest retired media can expire sooner. The current TS segment has a 64 MiB safety ceiling. This uses additional origin RAM, not extra network traffic or provider key requests. Playback still requires adequate end-to-end bandwidth; HLS compliance alone cannot eliminate network stalls.
 
 ## DVB rescanning
 

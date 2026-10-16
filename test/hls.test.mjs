@@ -19,15 +19,180 @@ function pat(pmtPid = 100) {
 
 test('creates a bounded HLS playlist and serves segments', () => {
   const hls = new HLSSegmenter({ segmentSeconds: 2, windowSegments: 3 });
-  for (let index = 0; index < 5; index += 1) {
-    hls.push(Buffer.from(`segment-${index}`), index * 2100);
-    hls.flush(index * 2100 + 2000);
+  for (let index = 0; index < 30; index += 1) {
+    hls.push(Buffer.from(`segment-${index}`), index * 2000);
+    hls.flush(index * 2000 + 2000);
   }
-  assert.equal(hls.segments.length, 3);
+  assert.equal(hls.segments.length, 5); // At least 3 * the fixed 3-second target.
+  assert.equal(hls.segments.reduce((sum, item) => sum + item.duration, 0), 10);
   const playlist = hls.playlist('/hls/test');
   assert.match(playlist, /#EXTM3U/);
   assert.match(playlist, /\/hls\/test\//);
   assert.ok(hls.get(hls.segments[0].id));
+});
+
+function pmt(videoPid = 256, pcrPid = videoPid) {
+  const value = packet(100, { payloadStart: true }); value[4] = 0;
+  Buffer.from([0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe0 | (pcrPid >> 8), pcrPid & 255, 0xf0, 0, 0x1b, 0xe0 | (videoPid >> 8), videoPid & 255, 0xf0, 0, 0, 0, 0, 0]).copy(value, 5);
+  return value;
+}
+
+function clockPacket(milliseconds, { pid = 256, keyframe = false, discontinuity = false } = {}) {
+  const value = packet(pid, { payloadStart: keyframe });
+  value[3] = 0x30; value[4] = 7; value[5] = 0x10 | (keyframe ? 0x40 : 0) | (discontinuity ? 0x80 : 0);
+  const ticks = ((Math.round(milliseconds * 27000) % (2 ** 33 * 300)) + 2 ** 33 * 300) % (2 ** 33 * 300);
+  const base = Math.floor(ticks / 300); const extension = ticks % 300;
+  value[6] = Math.floor(base / 2 ** 25); value[7] = Math.floor(base / 2 ** 17) & 255;
+  value[8] = Math.floor(base / 2 ** 9) & 255; value[9] = Math.floor(base / 2) & 255;
+  value[10] = ((base % 2) << 7) | 0x7e | (extension >> 8); value[11] = extension & 255;
+  return value;
+}
+
+test('keeps TARGETDURATION fixed when longer segments age out and across restarts', () => {
+  const hls = new HLSSegmenter();
+  const targets = new Set([hls.playlist('/hls/test').match(/TARGETDURATION:(\d+)/)[1]]);
+  hls.push(Buffer.concat([pat(), pmt(), packet(256)]), 0);
+  hls.push(packet(256, { payloadStart: true, randomAccess: true }), 2500);
+  for (let now = 2500; now < 120000; now += 500) {
+    hls.push(packet(256, { payloadStart: true, randomAccess: now % 6500 === 0 }), now);
+    targets.add(hls.playlist('/hls/test', now).match(/TARGETDURATION:(\d+)/)[1]);
+    assert.ok(hls.segments.every(item => Math.round(item.duration) <= hls.targetDuration));
+  }
+  hls.markDiscontinuity(120000);
+  hls.push(Buffer.concat([pat(), pmt(), packet(256)]), 121000);
+  hls.push(packet(256, { payloadStart: true, randomAccess: true }), 128000);
+  targets.add(hls.playlist('/hls/test', 128000).match(/TARGETDURATION:(\d+)/)[1]);
+  assert.deepEqual([...targets], ['9']);
+});
+
+test('bounded fallback cuts streams without random-access flags without dropping input packets', () => {
+  const hls = new HLSSegmenter();
+  const expected = [];
+  for (let now = 0; now <= 60000; now += 100) {
+    const data = packet(256, { payloadStart: now % 200 === 0 }); data.writeUInt32BE(now, 20);
+    expected.push(data); hls.push(data, now);
+  }
+  hls.flush(60000);
+  assert.ok(hls.segments.every(item => Math.round(item.duration) <= hls.targetDuration));
+  const stored = [...hls.retired.values(), ...hls.segments].map(item => item.data);
+  assert.deepEqual(Buffer.concat(stored), Buffer.concat(expected));
+});
+
+test('PCR duration is independent of arrival jitter and handles multiple cuts in a single burst', () => {
+  const burst = new HLSSegmenter(); const paced = new HLSSegmenter();
+  const packets = [pat(), pmt()];
+  for (let time = 0; time <= 30000; time += 40) packets.push(clockPacket(time, { keyframe: time % 2000 === 0 }));
+  burst.push(Buffer.concat(packets), 1000);
+  for (let index = 0; index < packets.length; index++) paced.push(packets[index], 1000 + index * 42 + (index % 5) * 3);
+  assert.deepEqual(burst.segments.map(item => item.duration), [2, 6, 6, 6, 6]);
+  assert.deepEqual(paced.segments.map(item => item.duration), burst.segments.map(item => item.duration));
+  assert.deepEqual(Buffer.concat(burst.segments.map(item => item.data)), Buffer.concat(paced.segments.map(item => item.data)));
+});
+
+test('PCR wrap is continuous and a backwards reset is explicitly discontinuous', () => {
+  const hls = new HLSSegmenter(); const wrapMs = 2 ** 33 / 90;
+  hls.push(Buffer.concat([pat(), pmt()]), 0);
+  for (let time = 0; time <= 10000; time += 40) hls.push(clockPacket(wrapMs - 1000 + time, { keyframe: time % 2000 === 0 }), time);
+  assert.deepEqual(hls.segments.map(item => item.duration), [2, 6]);
+  assert.equal(hls.segments.some(item => item.discontinuity), false);
+  hls.push(clockPacket(100, { discontinuity: true }), 10040);
+  for (let time = 120; time < 8200; time += 40) hls.push(clockPacket(time, { keyframe: time % 2000 === 0 }), 10100 + time);
+  assert.ok(hls.segments.some(item => item.discontinuity));
+  assert.ok(hls.segments.every(item => Math.round(item.duration) <= hls.targetDuration));
+});
+
+test('uses the PMT PCR PID rather than unrelated clocks and recovers from a lost clock', () => {
+  const hls = new HLSSegmenter();
+  hls.push(Buffer.concat([pat(), pmt(256, 300), clockPacket(0, { pid: 300 })]), 0);
+  hls.push(clockPacket(200000, { pid: 301 }), 1000);
+  hls.push(clockPacket(2000, { pid: 300 }), 2000);
+  hls.push(packet(256, { payloadStart: true, randomAccess: true }), 2000);
+  assert.equal(hls.segments[0].duration, 2);
+  hls.push(packet(256), 10000);
+  for (let now = 11000; now <= 20000; now += 1000) hls.push(packet(256, { payloadStart: true, randomAccess: now % 2000 === 0 }), now);
+  assert.ok(hls.segments.some(item => item.discontinuity));
+  assert.ok(hls.segments.every(item => Math.round(item.duration) <= hls.targetDuration));
+});
+
+test('input pauses do not create overlong EXTINF values, and resumed bytes are retained', () => {
+  const hls = new HLSSegmenter();
+  hls.push(packet(256), 0); hls.push(packet(256), 1000);
+  const resumed = packet(256, { payloadStart: true, randomAccess: true }); resumed[30] = 0xab;
+  hls.push(resumed, 120000); hls.push(packet(256, { payloadStart: true, randomAccess: true }), 127000);
+  assert.equal(hls.segments[0].duration, 1);
+  assert.equal(hls.segments[1].discontinuity, true);
+  assert.equal(hls.segments[1].data[30], 0xab);
+  assert.ok(hls.segments.every(item => Math.round(item.duration) <= hls.targetDuration));
+});
+
+test('removed playlist segments remain downloadable for their full grace period and then expire', () => {
+  const hls = new HLSSegmenter({ segmentSeconds: 2, windowSegments: 3 });
+  hls.push(Buffer.from('first'), 0); hls.flush(2000);
+  const first = hls.segments[0];
+  for (let time = 2000; time <= 10000; time += 2000) { hls.push(Buffer.from(`next-${time}`), time); hls.flush(time + 2000); }
+  assert.equal(hls.segments.some(item => item.id === first.id), false);
+  assert.equal(hls.get(first.id, 12000).toString(), 'first');
+  const expiration = hls.retired.get(first.id).expiresAt;
+  assert.ok(expiration >= 12000 + (2 + 10) * 1000);
+  assert.ok(hls.get(first.id, expiration - 1));
+  assert.equal(hls.get(first.id, expiration), null);
+  assert.equal(hls.retired.has(first.id), false);
+});
+
+test('playlist duration never falls below three target durations when advancing the window', () => {
+  const hls = new HLSSegmenter({ segmentSeconds: 6, windowSegments: 3 });
+  let removed = false;
+  for (let now = 0; now <= 300000; now += 1000) {
+    hls.push(packet(256, { payloadStart: true, randomAccess: now % 2000 === 0 }), now);
+    if (hls.segments[0]?.sequence > 0) removed = true;
+    if (removed) assert.ok(hls.playlistSeconds >= 3 * hls.targetDuration);
+  }
+  assert.equal(removed, true); assert.ok(hls.segments.length <= 6);
+  assert.ok(hls.retired.size < 12);
+});
+
+test('discontinuity sequence advances when its tagged segment leaves the window', () => {
+  const hls = new HLSSegmenter({ segmentSeconds: 2, windowSegments: 3 });
+  hls.push(Buffer.from('before'), 0); hls.markDiscontinuity(2000);
+  for (let now = 2000; now < 32000; now += 2000) {
+    hls.push(Buffer.from(`after-${now}`), now); hls.flush(now + 2000);
+  }
+  assert.equal(hls.discontinuitySequence, 1);
+  const manifest = hls.playlist('/hls/test', 32000);
+  assert.match(manifest, /#EXT-X-DISCONTINUITY-SEQUENCE:1\n/);
+  assert.doesNotMatch(manifest, /#EXT-X-DISCONTINUITY\n/);
+});
+
+test('invalid settings are bounded and table seeding alone does not publish an empty-media segment', () => {
+  const hls = new HLSSegmenter({ segmentSeconds: Infinity, windowSegments: Infinity });
+  assert.equal(hls.segmentMs, 60000); assert.equal(hls.window, 60);
+  const seeded = new HLSSegmenter();
+  seeded.push(Buffer.concat([pat(), pmt(), packet(256)]), 0);
+  seeded.push(packet(256, { payloadStart: true, randomAccess: true }), 2000);
+  seeded.markDiscontinuity(2100); const before = seeded.sequence;
+  seeded.flush(2200); seeded.markDiscontinuity(2300);
+  assert.equal(seeded.sequence, before);
+});
+
+test('a regained PCR clock never rewinds the fallback timeline', () => {
+  const hls = new HLSSegmenter();
+  hls.push(Buffer.concat([pat(), pmt(), clockPacket(0)]), 0);
+  hls.push(clockPacket(1000), 1000);
+  hls.push(packet(256), 9000); hls.push(packet(256), 10000);
+  const before = hls.lastMediaTime;
+  hls.push(clockPacket(11000), 11000);
+  assert.ok(hls.lastMediaTime >= before);
+  hls.push(clockPacket(12000, { keyframe: true }), 12000);
+  assert.ok(hls.segments.every(item => Math.round(item.duration) <= 9));
+});
+
+test('retired media has a memory ceiling even for faster-than-real-time file inputs', () => {
+  const hls = new HLSSegmenter({ segmentSeconds: 2, retainedBytes: 512 });
+  for (let time = 0; time < 100000; time += 2000) { hls.push(Buffer.alloc(256, time % 256), time); hls.flush(time + 2000); }
+  assert.equal(hls.retired.size, 2); assert.equal(hls.retiredBytes, 512);
+  assert.ok(hls.segments.every(item => hls.get(item.id, 100000)));
+  hls.playlist('/hls/test', 200000);
+  assert.equal(hls.retired.size, 0); assert.equal(hls.retiredBytes, 0);
 });
 
 test('cuts transport streams on random access and seeds program tables', () => {

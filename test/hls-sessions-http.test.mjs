@@ -19,6 +19,14 @@ test('real HLS routes count canonical segment clients, keep bytes unchanged and 
     for (const worker of manager.workers.values()) {
       worker.hls.push(Buffer.from('test-media-bytes'), 1000); worker.hls.flush(7000);
     }
+    process.on('message', command => {
+      if (command !== 'rotate') return;
+      const worker = manager.workers.get('1');
+      for (let now = 7000; now <= 31000; now += 6000) {
+        worker.hls.push(Buffer.from('new-media-bytes'), now); worker.hls.flush(now + 6000);
+      }
+      process.send('rotated');
+    });
     if (!server.listening) await new Promise(resolve => server.once('listening', resolve));
     process.send('ready');
   `;
@@ -39,6 +47,7 @@ test('real HLS routes count canonical segment clients, keep bytes unchanged and 
   const list = async () => (await (await fetch(`${base}/api/sessions`, { headers: { cookie } })).json()).sessions;
   assert.equal((await fetch(`${base}/api/sessions`)).status, 401);
   const manifest = await (await fetch(`${base}/hls/test-channel/index.m3u8`, { headers: { 'user-agent': 'Flussonic' } })).text();
+  assert.match(manifest, /#EXT-X-TARGETDURATION:9\n/);
   const segmentPath = manifest.split('\n').find(line => line.startsWith('/hls/'));
   assert.ok(segmentPath); assert.equal((await list()).length, 0);
   const head = await fetch(`${base}${segmentPath}`, { method: 'HEAD' }); await head.arrayBuffer();
@@ -52,6 +61,13 @@ test('real HLS routes count canonical segment clients, keep bytes unchanged and 
     const response = await fetch(`${base}${segmentPath.replace('/test-channel/', '/1/')}`, { headers: { 'user-agent': 'Flussonic' } });
     assert.equal(await response.text(), 'test-media-bytes');
   }));
+  assert.equal((await list()).length, 1);
+  const rotated = once(child, 'message'); child.send('rotate'); await rotated;
+  const advancedManifest = await (await fetch(`${base}/hls/test-channel/index.m3u8`)).text();
+  assert.match(advancedManifest, /#EXT-X-TARGETDURATION:9\n/);
+  assert.equal(advancedManifest.includes(segmentPath), false);
+  const late = await fetch(`${base}${segmentPath}`, { headers: { 'user-agent': 'Flussonic' } });
+  assert.equal(late.status, 200); assert.equal(await late.text(), 'test-media-bytes');
   assert.equal((await list()).length, 1);
   await (await fetch(`${base}${segmentPath}`, { headers: { 'user-agent': 'VLC' } })).arrayBuffer();
   const secondManifest = await (await fetch(`${base}/hls/2/index.m3u8`)).text();
