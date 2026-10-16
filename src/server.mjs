@@ -6,7 +6,7 @@ import { ConfigStore, normalizeStream } from './config.mjs';
 import { RingLogger } from './logger.mjs';
 import { StreamManager } from './stream-manager.mjs';
 import { formatPlaylist, playlistEntries, streamAliases } from './playlist.mjs';
-import { xmltv } from './epg.mjs';
+import { DailyEPGPublisher } from './epg-publisher.mjs';
 import { encryptSecret } from './secrets.mjs';
 import { RelaySessions } from './sessions.mjs';
 import { ManagementAuth, publicMediaRequest } from './auth.mjs';
@@ -26,6 +26,8 @@ let accessPolicy = new AccessPolicy(store.value.access);
 const logger = new RingLogger(store.value.settings.logLimit, (source) => store.value.streams.find((stream) => stream.id === source)?.name || store.value.adapters.find((adapter) => adapter.id === source)?.name || source);
 const manager = new StreamManager(store, logger);
 await manager.start();
+const epgPublisher = new DailyEPGPublisher({ path: join(dirname(store.path), 'epg-published.json'), snapshot: () => manager.epgSnapshot(), warmupMs: store.value.streams.some(stream => stream.enabled) ? 300000 : 0, onError: error => logger.warn('epg', `Daily EPG publication unavailable: ${error.message}; retaining the previous guide and retrying`) });
+await epgPublisher.load();
 const resources = new SystemResources();
 await resources.sample();
 const startedAt = Date.now();
@@ -99,7 +101,7 @@ function status() {
     casProxy: { ...manager.casProxy.metrics, providerGuards: manager.casProxy.guardMetrics?.() || [] },
     memory: process.memoryUsage(),
     resources: resources.value,
-    epg: manager.epgStatus(),
+    epg: { ...manager.epgStatus(), publication: epgPublisher.status },
   };
 }
 
@@ -189,13 +191,17 @@ const server = http.createServer(async (request, response) => {
       response.end(playlist.body); return;
     }
     if (request.method === 'GET' && (path === '/epg.xml' || path === '/api/epg')) {
-      const document = manager.epgSnapshot();
+      const publication = epgPublisher.current;
+      if (!publication) { response.setHeader('retry-after', '60'); return error(response, 503, 'Collecting the initial EPG guide. Please retry in a few minutes.'); }
+      const document = publication.document;
       response.setHeader('cache-control', 'no-store, max-age=0');
-      response.setHeader('x-epg-refresh-seconds', '60');
-      if (document.updatedAt) response.setHeader('last-modified', new Date(document.updatedAt).toUTCString());
+      response.setHeader('x-epg-refresh-seconds', String(document.recommendedRefreshSeconds));
+      response.setHeader('last-modified', new Date(document.publishedAt).toUTCString());
+      response.setHeader('x-epg-published-at', document.publishedAt);
+      response.setHeader('x-epg-next-refresh-at', document.nextRefreshAt);
       if (document.lastReceivedAt) response.setHeader('x-epg-last-received-at', document.lastReceivedAt);
-      if (path === '/api/epg') return json(response, 200, document);
-      const value = xmltv(document); response.writeHead(200, { 'content-type': 'application/xml; charset=utf-8', 'content-length': Buffer.byteLength(value), 'x-content-type-options': 'nosniff' }); response.end(value); return;
+      const value = path === '/api/epg' ? publication.json : publication.xml;
+      response.writeHead(200, { 'content-type': path === '/api/epg' ? 'application/json; charset=utf-8' : 'application/xml; charset=utf-8', 'content-length': value.length, 'x-content-type-options': 'nosniff' }); response.end(value); return;
     }
     if (request.method === 'GET' && path === '/api/config') {
       return json(response, 200, publicConfig());
@@ -312,12 +318,13 @@ const server = http.createServer(async (request, response) => {
 
 const heartbeat = setInterval(async () => { sessions.prune(); await resources.sample(); broadcast('status', status()); }, 2000);
 const epgMaintenance = setInterval(() => manager.maintainEPG(), 60000); epgMaintenance.unref();
+const epgPublication = setInterval(() => { void epgPublisher.tick(); }, 60000); epgPublication.unref();
 server.listen(store.value.server.port, store.value.server.host, () => logger.info('system', `Listening on ${store.value.server.host}:${store.value.server.port}`));
 
 function shutdown() {
-  clearInterval(heartbeat); clearInterval(epgMaintenance); manager.stop(); for (const client of sseClients) client.end();
+  clearInterval(heartbeat); clearInterval(epgMaintenance); clearInterval(epgPublication); epgPublisher.stop(); manager.stop(); for (const client of sseClients) client.end();
   server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 5000).unref();
 }
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
 
-export { server, manager, store };
+export { server, manager, store, epgPublisher };

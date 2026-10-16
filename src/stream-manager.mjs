@@ -4,7 +4,7 @@ import { HLSSegmenter } from './hls.mjs';
 import { HLSCompatibilityBridge } from './hls-compat.mjs';
 import { isAdaptiveManifest, runInput, UDPOutput, usesFFmpegBridge } from './input.mjs';
 import { SoftcamBridge } from './softcam.mjs';
-import { EPGCollector, epgDocument } from './epg.mjs';
+import { EPGCollector, EPG_REFRESH_SECONDS, epgDocument } from './epg.mjs';
 import { DVBInputPool } from './dvb-shared.mjs';
 import { CASProxyManager } from './cas-proxy.mjs';
 import { StreamMetadata } from './si-metadata.mjs';
@@ -242,7 +242,7 @@ export class StreamManager {
       lastReceivedAt = Math.max(lastReceivedAt, worker.epg.lastReceivedAt || 0); updatedAt = Math.max(updatedAt, worker.epg.updatedAt || 0);
       events += worker.epg.events.size; if (worker.epg.events.size) channelsWithEPG++;
     }
-    return { lastReceivedAt: lastReceivedAt ? new Date(lastReceivedAt).toISOString() : null, updatedAt: updatedAt ? new Date(updatedAt).toISOString() : null, events, channelsWithEPG, recommendedRefreshSeconds: 60 };
+    return { lastReceivedAt: lastReceivedAt ? new Date(lastReceivedAt).toISOString() : null, updatedAt: updatedAt ? new Date(updatedAt).toISOString() : null, events, channelsWithEPG, recommendedRefreshSeconds: EPG_REFRESH_SECONDS };
   }
   async upsert(stream) {
     const current = this.store.value;

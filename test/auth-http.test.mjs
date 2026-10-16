@@ -25,8 +25,9 @@ test('protects live management routes, keeps playback exports public, and change
   assert.equal((await fetch(base + '/', { redirect: 'manual' })).status, 303);
   for (const path of ['/healthz', '/playlist.m3u?delivery=hls', '/api/playlist', '/epg.xml', '/api/epg', '/login']) assert.equal((await fetch(base + path)).status, 200, path);
   for (const path of ['/epg.xml', '/api/epg']) {
-    const response = await fetch(base + path); assert.match(response.headers.get('cache-control'), /no-store/); assert.equal(response.headers.get('x-epg-refresh-seconds'), '60');
-    if (path === '/api/epg') { const guide = await response.json(); assert.equal(guide.recommendedRefreshSeconds, 60); assert.ok(Object.hasOwn(guide, 'lastReceivedAt')); assert.ok(Object.hasOwn(guide, 'updatedAt')); }
+    const response = await fetch(base + path); assert.match(response.headers.get('cache-control'), /no-store/); assert.equal(response.headers.get('x-epg-refresh-seconds'), '86400');
+    if (path === '/api/epg') { const guide = await response.json(); assert.equal(guide.recommendedRefreshSeconds, 86400); assert.ok(Object.hasOwn(guide, 'lastReceivedAt')); assert.ok(Object.hasOwn(guide, 'updatedAt')); }
+    assert.ok(response.headers.get('x-epg-published-at')); assert.ok(response.headers.get('x-epg-next-refresh-at'));
   }
   assert.equal((await fetch(base + '/hls/absent/index.m3u8')).status, 404);
   const password = (await readFile(join(directory, 'initial-admin-password'), 'utf8')).trim();
@@ -48,6 +49,8 @@ test('protects live management routes, keeps playback exports public, and change
   assert.ok(status.resources.memory.usagePercent >= 0 && status.resources.memory.usagePercent <= 100);
   assert.ok(Number.isFinite(Date.parse(status.resources.sampledAt)));
   assert.ok(status.memory.rss > 0); // Keep existing process diagnostics backward-compatible.
+  assert.equal(status.epg.recommendedRefreshSeconds, 86400);
+  assert.equal(status.epg.publication.intervalSeconds, 86400); assert.equal(status.epg.publication.status, 'published');
   const mutation = await fetch(base + '/api/settings', { method: 'PUT', headers: { cookie: newCookie, origin: base, 'x-csrf-token': newAccount.csrfToken, 'content-type': 'application/json' }, body: '{}' }); assert.equal(mutation.status, 200);
   const page = await (await fetch(base + '/', { headers: { cookie: newCookie } })).text(); assert.match(page, /id="password-form"/); assert.match(page, /id="logout"/);
   assert.match(page, /id="access-form"/);

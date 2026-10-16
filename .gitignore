@@ -2,6 +2,7 @@
 /data/
 /.env*
 /config.json
+/**/epg-published.json
 /**/admin-auth.json
 /**/initial-admin-password
 /**/oscam.conf

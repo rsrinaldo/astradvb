@@ -87,7 +87,7 @@ test('live EPG exports identify actual source freshness separately from export t
   const document = epgDocument([{ config: { id: 'news', name: 'News', enabled: true, service: { serviceId: 100 } }, epg: collector }]);
   assert.equal(document.updatedAt, new Date(now).toISOString());
   assert.equal(document.lastReceivedAt, new Date(now).toISOString());
-  assert.equal(document.recommendedRefreshSeconds, 60); assert.equal(document.programmes.length, 1);
+  assert.equal(document.recommendedRefreshSeconds, 86400); assert.equal(document.programmes.length, 1);
 });
 
 test('new broadcast descriptions replace the old event immediately at the same export URL', () => {

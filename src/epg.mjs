@@ -3,6 +3,7 @@ import { SISectionAssembler } from './si-metadata.mjs';
 
 const EIT_PID = 0x12;
 const MJD_EPOCH = Date.UTC(1858, 10, 17);
+export const EPG_REFRESH_SECONDS = 24 * 60 * 60;
 
 function bcd(value) { return ((value >> 4) & 0x0f) * 10 + (value & 0x0f); }
 function xml(value) { return String(value ?? '').replace(/[<>&'\"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' })[c]); }
@@ -101,7 +102,7 @@ export function epgDocument(workers) {
     for (const event of worker.epg.snapshot(serviceId)) programmes.push({ channel: stream.id, ...event });
     updatedAt = Math.max(updatedAt, worker.epg.updatedAt || 0); lastReceivedAt = Math.max(lastReceivedAt, worker.epg.lastReceivedAt || 0);
   }
-  return { generatedAt: new Date().toISOString(), updatedAt: updatedAt ? new Date(updatedAt).toISOString() : null, lastReceivedAt: lastReceivedAt ? new Date(lastReceivedAt).toISOString() : null, recommendedRefreshSeconds: 60, channels, programmes };
+  return { generatedAt: new Date().toISOString(), updatedAt: updatedAt ? new Date(updatedAt).toISOString() : null, lastReceivedAt: lastReceivedAt ? new Date(lastReceivedAt).toISOString() : null, recommendedRefreshSeconds: EPG_REFRESH_SECONDS, channels, programmes };
 }
 
 function xmltvDate(value) { return new Date(value).toISOString().replace(/[-:]/g, '').replace('.000Z', ' +0000').replace('T', ''); }

@@ -39,7 +39,8 @@ function render() {
   $('#engine-detail').textContent = `Uptime ${duration(status.uptimeSeconds)} · v${status.version || '?'}`;
   for (const [id, path] of [['playlist-url', '/playlist.m3u'], ['epg-xml-url', '/epg.xml'], ['epg-json-url', '/api/epg']]) { const link = $(`#${id}`); link.href = path; link.textContent = `${location.origin}${path}`; }
   const epg = status.epg;
-  $('#epg-freshness').textContent = epg?.lastReceivedAt ? `Live EPG · ${number(epg.channelsWithEPG)}/${number(status.streams?.total)} channels with programmes · last broadcast data ${new Date(epg.lastReceivedAt).toLocaleTimeString()} · exports are live; refresh your receiving system every 60 seconds` : 'Waiting for broadcast EPG · exports are live; refresh your receiving system every 60 seconds';
+  const publication = epg?.publication;
+  $('#epg-freshness').textContent = publication?.publishedAt ? `Daily EPG · ${number(publication.channelsWithEPG)}/${number(publication.channels)} channels with programmes · published ${new Date(publication.publishedAt).toLocaleString()} · ${publication.status === 'retrying' ? 'keeping the previous guide; retrying' : 'next publication'} ${new Date(publication.nextRefreshAt).toLocaleString()} · refresh your receiving system once daily (24 hours)` : 'Collecting the initial EPG guide (up to 5 minutes) · XML/JSON will then publish once daily (24 hours)';
   const bitrate = state.streams.reduce((sum, stream) => sum + (stream.bitrateKbps || 0), 0);
   const running = state.streams.filter((stream) => stream.state === 'running').length;
   const scrambled = state.streams.filter((stream) => stream.state === 'scrambled').length;
