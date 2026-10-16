@@ -22,10 +22,11 @@ A clean-room Linux broadcast control and MPEG-TS relay service. It does not cont
 - Persistent atomic JSON configuration
 - Stream CRUD, live adapter control, settings, status, sessions, logs, and SSE APIs
 - Browser-based control panel served by the engine
+- Live server CPU and RAM usage on the dashboard, refreshed every two seconds (Linux RAM excludes reclaimable cache via MemAvailable)
 - M3U, XSPF, plain-URL, and JSON playlist exports selectable between HTTP MPEG-TS and HLS delivery
 - Native Newcamd descrambling with one shared upstream connection per profile and per-stream tsdecrypt workers
-- DVB EIT collection with XMLTV and JSON EPG publishing
-- Open control API with network-level access control
+- Continuous DVB EIT collection ahead of CAS, with live XMLTV/JSON publishing and bounded automatic retention
+- Password-protected management UI/API with public playback and EPG exports
 - systemd hardening, Docker Compose, health-oriented CLI, and automated tests
 
 Paste source URLs directly into the stream editor. The engine automatically selects native transport handling or its managed FFmpeg bridge; no external bridge process is required. The service also detects frontends exposed as `/dev/dvb/adapterN/frontendN`. A tuner must be visible there before Linux can control physical hardware.
@@ -34,28 +35,61 @@ Paste source URLs directly into the stream editor. The engine automatically sele
 
 Node.js 20 or newer is required.
 
+Run these commands from the directory containing this README (`astradvb` when cloned from GitHub).
+
 ```bash
-cd linux
+mkdir -p data
 cp config.example.json data/config.json
 export ASTRA_CONFIG="$PWD/data/config.json"
 node src/server.mjs
 ```
 
-Open `http://server-address:8000/`. No login or administrator token is used. All example streams are disabled.
+Open `http://server-address:8000/` and sign in as `admin`. Read the unique initial password from `data/initial-admin-password`, then change it in **Settings → Administrator account**. All example streams are disabled.
 
 ## Docker
 
 ```bash
-cd linux
 export ASTRA_SECRET_KEY="$(openssl rand -hex 32)"
 docker compose up -d --build
 ```
 
-Host networking is intentional for multicast. The application has no authentication, so limit port 8000 with a firewall, private VLAN, or VPN.
+Host networking is intentional for multicast. Management requires login; playback remains public. Retrieve the initial password from the mounted `data/initial-admin-password` file and restrict management transport with HTTPS, a private VLAN, or VPN.
 
 ## Native installation
 
-Review `install.sh`, then run it from the `linux` directory as root. It creates an unprivileged `astra` service user, a protected configuration file, an encryption key for CAS credentials, and a hardened systemd unit. It does not create or require an administrator token.
+Review `install.sh`, then run it from the directory containing this README as root. It creates an unprivileged `astra` service user, protected configuration and authentication files, an encryption key for CAS credentials, and a hardened systemd unit. Read the initial password with `sudo cat /var/lib/astra-linux/initial-admin-password` and sign in as `admin`.
+
+## Administrator login
+
+The management dashboard, configuration, status, logs, tuner controls, relay sessions, and management event stream require a session cookie. `GET` playback, HLS, playlists, XMLTV/JSON EPG, and `/healthz` remain public. Passwords use salted scrypt hashes (N=32768, r=8, p=3); neither hashes nor passwords are returned by configuration APIs. Login attempts are rate-limited. Cookies are HttpOnly/SameSite=Strict, expire after 8 hours idle or 24 hours absolute, and are invalidated when the service restarts. Changing the password requires the current password and signs out older sessions without restarting any streams. The initial password file is removed after a successful change.
+
+HTTP does **not** encrypt login credentials. Use HTTPS or a trusted VPN/SSH tunnel. Behind a trusted TLS reverse proxy, set `ASTRA_PUBLIC_HTTPS=1` and `ASTRA_PUBLIC_ORIGIN=https://your-management-host` in `/etc/astra-linux/environment`, and restrict direct access to the upstream port. These explicit settings enable Secure cookies and same-origin verification; untrusted forwarded headers are not used.
+
+API clients sign in using `POST /api/auth/login` with JSON `{ "username": "admin", "password": "..." }`, retain the returned cookie, and send the returned `csrfToken` in `X-CSRF-Token` for management mutations. `GET /api/auth/session` returns the current account/CSRF token. `POST /api/auth/password` accepts `currentPassword` and `newPassword`; `POST /api/auth/logout` ends the session. Export `ASTRA_COOKIE_JAR` for the read-only `bin/astractl` client. Never store credentials or cookie jars in Git.
+
+For emergency recovery, stop the service, run `sudo -u astra env ASTRA_CONFIG=/var/lib/astra-linux/config.json node /opt/astra-linux/bin/reset-admin.mjs`, then start it again. Read the newly generated initial password with `sudo cat /var/lib/astra-linux/initial-admin-password`. This invalidates previous logins and requires another password change. Back up `admin-auth.json` alongside your protected configuration; never publish it.
+
+## DVB rescanning
+
+A normal current-transponder scan reads PAT/PMT/SDT from the shared full-multiplex tuner input. It reuses an active frontend rather than opening it a second time, without stopping channels, resetting their uptime, or disconnecting viewers. It supports the same DVB-S2/S2X tuning path as normal ingestion. Incomplete service information is marked as partial instead of inventing PIDs.
+
+**Scan NIT transponders** is different: it may retune across frequencies. It is permitted only on an idle frontend; a busy tuner returns a clear conflict response. New input subscriptions wait while an idle tuner is reserved for a network scan. Use a spare tuner for network scans while other channels are live.
+
+Scan results mark existing services as **Already added** (including renamed or disabled channels), disable their checkboxes, and exclude them from Select all. Identity uses the physical frontend and service ID, not just the display name. Scan imports are also checked by the API to prevent recreating a service under a different stream ID. Normal manual duplicate streams remain possible when intentionally configured.
+
+## Streaming and EPG IP allowlists
+
+EPG URLs (`/epg.xml` and `/api/epg`) are generated from the current collected guide on every request, with no-store cache headers. Configure the receiving system to fetch every 60 seconds; the server cannot force another system's polling/cache behavior. JSON includes actual `updatedAt` and `lastReceivedAt` source timestamps separately from request `generatedAt`, and the dashboard shows coverage/freshness. Clear EIT continues to be collected during CAS outages. Invalid/corrupt EIT is discarded; expired entries are pruned every minute independently of exports, retaining six hours of history and up to fourteen days ahead, bounded to 4,096 events per channel. Missing broadcast EIT cannot be manufactured into a guide.
+
+CAS child-process crashes and closed input pipes recover with bounded exponential backoff and the existing shared decoder-admission queue. Shared OSCam recovery retains the local endpoints/credentials and guard; dependent decoders wait and resume through the same paced queue. Negative key replies or an output pause alone do not restart processes. Provider rate limits, one upstream connection per profile, no EMM forwarding, the 16 MiB DVR capture ring, and zero native packet delay remain unchanged. Recovery improves availability but cannot guarantee valid keys or an uninterrupted source.
+
+In **Settings → Streaming and EPG access**, set independent allowlists for streaming and EPG downloads. Entries can be IPv4/IPv6 addresses or CIDR ranges, one per line (for example `203.0.113.10`, `192.168.1.0/24`, or `2001:db8::/64`). Empty lists allow any IP; non-empty lists deny all addresses that do not match. Invalid entries reject the entire update. The form shows the source IP seen by the server.
+
+The streaming list covers HTTP MPEG-TS, HLS manifests/segments, and all playlist exports. The EPG list covers `/epg.xml` and `/api/epg`. Management login, health checks, input reception, and configured UDP/RTP outputs are unaffected. EPG embedded inside an allowed video stream remains part of that stream. Rules also apply to authenticated administrators downloading media/EPG; management API access is separate, so a playback rule cannot lock you out of Settings.
+
+Updates persist across restarts and apply without restarting any workers. Newly blocked active HTTP relays are disconnected immediately; HLS is checked on every manifest and segment request. Already downloaded or buffered content cannot be revoked. HLS segments use private/no-store responses to prevent shared HTTP caches from bypassing these checks.
+
+Only the actual connection source address is used. `X-Forwarded-For`, `X-Real-IP`, and similar client-controlled headers are ignored. Behind NAT, clients share their public IP. Behind a reverse proxy, this server sees the proxy IP; enforce original-client restrictions at that trusted proxy/firewall instead of treating these rules as end-client filtering. The authenticated `GET/PUT /api/access` API reads/updates `{ "streamingAllowedIPs": [], "epgAllowedIPs": [] }`; PUT requires the normal CSRF token.
 
 For a complete Ubuntu walkthrough, including Node.js, firewall, multicast, DVB, Newcamd, upgrades, backups, and troubleshooting, read [`INSTALL-UBUNTU.md`](INSTALL-UBUNTU.md).
 
@@ -82,6 +116,8 @@ Read operations:
 Append `?include_disabled=1` to a playlist URL to include disabled HTTP streams.
 
 ## Linux DVB adapters
+
+The installer builds a small capture-buffer helper used only by the `dvbv5-zap` input child. It requests a 16 MiB DVR ring buffer before capture begins, without changing frontend tuning or demux filters. `ASTRA_DVB_DVR_BUFFER_BYTES` permits an optional 1–64 MiB override. This absorbs short consumer stalls; it does not repair packets already lost or compensate for sustained processing overload. The helper reports initialization success/failure on the feeder's stderr. Scanner and signal-probe processes do not load it.
 
 The native installer adds `dvb-tools` and grants the service user access to the `video` group. When a supported PCIe or USB tuner and driver create `/dev/dvb` nodes, the dashboard discovers it automatically. Click the detected adapter, configure its delivery system and tuning parameters, save it, then use the displayed `dvb://<adapter-id>` URL as a stream input. The engine runs `dvbv5-zap`, reads the full transport stream, and publishes the stream through the normal HTTP, HLS, UDP, and RTP outputs.
 
@@ -117,7 +153,15 @@ Only ingest and redistribute streams you are authorized to use.
 
 ## Newcamd CAS
 
-The native installer builds pinned revisions of GPL-2.0 `tsdecrypt` and GPL-3.0 OSCam, preserving their licenses under `/usr/local/share/licenses`. OSCam is an integral dependency: the installer installs it automatically and Astra starts and stops it. OSCam maintains one upstream Newcamd TCP connection per profile and multiplexes the ECM exchanges from all per-stream tsdecrypt workers over it. No extra pre-decryption or post-decryption delay is applied. tsdecrypt retains only the current even/odd key pair, so a long encrypted input buffer can corrupt packets across key changes. Create reusable Newcamd profiles in Settings using `N: host port username password 0102030405060708091011121314`, then select a profile under Stream → Advanced. Credentials are encrypted with AES-256-GCM using `ASTRA_SECRET_KEY` and are never returned by the configuration API.
+### Provider protection (v0.8.26)
+
+The protected decoder rejects ECM work older than 2 seconds and backs off per channel after failed exchanges (1, 2, 4, 8, 16, then 30 seconds, plus a small service-specific offset). Successful keys reset that channel's backoff; it does not block other channels. Decoder admission is queued per profile: by default starts are at least 500 ms apart and at most five are admitted in any five-second window. `ASTRA_CAS_START_SPACING_MS` (250–10000, default 500) and `ASTRA_CAS_START_WINDOW_MS` (5000–60000, default 5000) configure these intervals. Removed streams cancel their pending admission; existing running streams are unaffected by new additions. Ninety starts take at least 87 seconds at the defaults. This controls initial starts, not all subsequent ECM traffic or provider latency. Installing an older unpatched decoder fails closed for CAS.
+
+Each OSCam upstream reader now connects through a loopback-only transport guard. It paces **all encrypted Newcamd client frames**, including handshakes and keepalives, to `ASTRA_CAS_REQUESTS_PER_SECOND` (default 20 per profile, not a provider-approved allowance). It permits only one upstream session per profile. Queued frames expire after `ASTRA_CAS_REQUEST_MAX_AGE_MS` (default 1500, maximum 2000); expiry or overflow closes the session rather than dropping individual encrypted frames and breaking message IDs. Starting with v0.8.28, there is no profile-wide cooldown: negative key replies do not disconnect the shared session or hold new decoder starts, and transport resets allow an immediate reconnect attempt. `ASTRA_CAS_COOLDOWN_MS` is obsolete and ignored. OSCam's own reconnection behavior still applies. Existing OSCam caches are retained; the transport guard does not decrypt or claim semantic ECM deduplication.
+
+Set `ASTRA_CAS_PROVIDER_PAUSED=1` in `/etc/astra-linux/environment` to block all upstream CAS traffic while preserving tuner input and clear channels. After the provider confirms account limits and readiness, configure the agreed rate, remove the pause (or set it to 0), and restart `astra-linux`. A rate cap may reduce available channels if their necessary key exchanges exceed that budget. Never increase it merely to clear warnings. `/api/status` includes sanitized provider-guard counters and circuit state; keys and credentials are not exposed.
+
+The native installer builds pinned revisions of GPL-2.0 `tsdecrypt` and GPL-3.0 OSCam, preserving their licenses under `/usr/local/share/licenses`. OSCam is an integral dependency: the installer installs it automatically and Astra starts and stops it. OSCam maintains one upstream Newcamd TCP connection per profile and multiplexes ECM exchanges from all per-stream tsdecrypt workers. The intentional loopback reader guard requires `block_same_ip = 0` in OSCam; the downstream listener remains restricted to `127.0.0.1`. Starting with v0.8.31, decryption uses no extra native packet delay by default. The two-second delay introduced in v0.8.23 could decrypt waiting packets with a later key because the native decoder retains only the current even/odd pair, not packet-associated key epochs. `ASTRA_CAS_INPUT_BUFFER_MS=0` also disables that delay explicitly on existing installations. A bounded 0–2000 ms override remains for diagnostics, but enabling a delay is not a general late-key recovery solution. No additional post-decryption delay is added, and actual late or unavailable keys can still interrupt output. Create reusable Newcamd profiles in Settings using `N: host port username password 0102030405060708091011121314`, then select a profile under Stream → Advanced. Credentials are encrypted with AES-256-GCM using `ASTRA_SECRET_KEY` and are never returned by the configuration API.
 
 EMM forwarding is not supported: tsdecrypt never enables it, and OSCam account updates are disabled. Legacy EMM profile settings are discarded. The installer retains the bundled defensive PID correction when building tsdecrypt. `/api/status` publishes aggregate CAS reply/timeout counts; per-stream CAS diagnostics publish pause and error counts without exposing keys or credentials.
 

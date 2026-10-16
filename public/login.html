@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Sign in · Astra Linux Control</title>
+  <link rel="icon" href="/favicon.svg" />
+  <link rel="stylesheet" href="/auth.css?v=0.8.20" />
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <div class="login-brand"><span>◉</span><div><strong>ASTRA</strong><small>LINUX CONTROL</small></div></div>
+    <h1>Sign in</h1>
+    <p class="login-description">Administrator access to streams, tuners, and server settings.</p>
+    <form id="login-form">
+      <label>Username<input name="username" autocomplete="username" value="admin" required maxlength="128" /></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password" required maxlength="512" /></label>
+      <p id="login-error" role="alert" hidden></p>
+      <button type="submit">Sign in</button>
+    </form>
+    <p id="transport-warning" class="transport-warning" hidden>This connection uses HTTP. Use HTTPS or a trusted VPN/SSH tunnel to protect your password.</p>
+    <p class="login-help">First login? Retrieve the unique initial password from the server’s protected <code>initial-admin-password</code> file. Playback links remain public.</p>
+  </main>
+  <script type="module" src="/login.js?v=0.8.20"></script>
+</body>
+</html>

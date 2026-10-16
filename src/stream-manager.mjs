@@ -10,8 +10,10 @@ import { CASProxyManager } from './cas-proxy.mjs';
 import { StreamMetadata } from './si-metadata.mjs';
 
 const wait = (ms, signal) => new Promise((resolve) => {
-  const timer = setTimeout(resolve, ms);
-  signal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+  const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
+  const timer = setTimeout(done, ms);
+  signal?.addEventListener('abort', done, { once: true });
+  if (signal?.aborted) done();
 });
 
 const CAS_PROBE_PACKETS = 500;
@@ -31,7 +33,7 @@ export class StreamWorker extends EventEmitter {
   constructor(config, settings, logger, casProfiles = [], adapters = [], dvbPool = null, casConnections = new Map()) {
     super(); this.config = config; this.settings = settings; this.logger = logger;
     this.runningSince = null;
-    this.analyzer = new MPEGTSAnalyzer(); this.inputAnalyzer = new MPEGTSAnalyzer(); this.epg = new EPGCollector();
+    this.analyzer = new MPEGTSAnalyzer(); this.inputAnalyzer = new MPEGTSAnalyzer(); this.epg = new EPGCollector({ serviceId: config.service?.serviceId || config.service?.id || 0 });
     this.framer = new TransportStreamFramer(); this.outputFramer = new TransportStreamFramer(); this.cam = null; this.camProfile = null; this.camConnection = null; this.casMode = 'disabled'; this.casBuffer = []; this.casBufferBytes = 0; this.casProbePackets = 0; this.casProbeScrambled = 0; this.casProfiles = casProfiles; this.casConnections = casConnections; this.adapters = adapters; this.dvbPool = dvbPool;
     this.hls = new HLSSegmenter({ segmentSeconds: settings.hlsSegmentSeconds, windowSegments: settings.hlsWindowSegments });
     this.hlsFramer = new TransportStreamFramer(); this.hlsBridge = null;
@@ -83,13 +85,14 @@ export class StreamWorker extends EventEmitter {
     const aligned = this.framer.push(chunk);
     if (!aligned.length) return;
     this.inputDataAt = Date.now();
-    if (this.config.cam?.enabled) { this.#pushCAS(aligned); return; }
+    if (this.config.cam?.enabled) { this.epg.push(aligned); this.#pushCAS(aligned); return; }
     this.#deliver(aligned);
   }
   #pushCAS(aligned) {
-    this.inputAnalyzer.push(aligned); this.#rememberCAS(aligned);
+    this.inputAnalyzer.push(aligned);
     if (this.casMode === 'descrambling') { this.cam.write(aligned); return; }
     if (this.casMode === 'error') return;
+    this.#rememberCAS(aligned);
     const observed = scramblingStats(aligned);
     this.casProbePackets += observed.packets; this.casProbeScrambled += observed.scrambled;
     if (this.casProbePackets < CAS_PROBE_PACKETS) { if (this.casMode === 'bypass') this.#deliver(aligned); return; }
@@ -98,7 +101,7 @@ export class StreamWorker extends EventEmitter {
     if (encrypted) {
       try {
         this.casMode = 'descrambling'; this.outputFramer.reset(); this.hls.markDiscontinuity();
-        this.cam = new SoftcamBridge(this.config, this.camProfile, this.camConnection, (chunk) => this.#deliver(this.outputFramer.push(chunk)), this.logger); this.cam.start();
+        this.cam = new SoftcamBridge(this.config, this.camProfile, this.camConnection, (chunk) => this.#deliver(this.outputFramer.push(chunk)), this.logger, { onDiscontinuity: () => { this.outputFramer.reset(); this.hls.markDiscontinuity(); } }); this.cam.start();
         for (const chunk of this.casBuffer) this.cam.write(chunk);
         this.casBuffer = []; this.casBufferBytes = 0;
       } catch (error) { this.casMode = 'error'; this.state = 'error'; this.logger.error(this.config.id, `Descrambling stopped: ${error.message}`); }
@@ -123,7 +126,8 @@ export class StreamWorker extends EventEmitter {
     const input = this.config.inputs[this.activeInput];
     const timeout = input && isAdaptiveManifest(input.url) ? Math.max(30000, this.settings.inputTimeoutMs * 3) : this.settings.inputTimeoutMs;
     if (!this.runningSince || Date.now() - this.lastDataAt > timeout) this.runningSince = Date.now();
-    this.lastDataAt = Date.now(); this.analyzer.push(aligned); this.epg.push(aligned);
+    this.lastDataAt = Date.now(); this.analyzer.push(aligned);
+    if (!this.config.cam?.enabled) this.epg.push(aligned);
     if (this.config.hls) { if (this.hlsBridge) this.hlsBridge.write(aligned); else this.hls.push(aligned); }
     for (const output of this.outputs) output.send(aligned);
     for (const client of this.clients) {
@@ -146,8 +150,14 @@ export class StreamWorker extends EventEmitter {
     const activityAt = this.lastDataAt;
     const stale = !activityAt || Date.now() - activityAt > staleTimeoutMs;
     const scrambled = metrics.packets >= 100 && metrics.scrambledPackets / metrics.packets >= 0.05;
-    const state = this.state === 'running' && scrambled ? 'scrambled' : stale && this.state === 'running' ? 'warning' : this.state;
     const casStatus = this.config.cam?.enabled ? (this.casMode === 'bypass' ? 'not-needed' : this.cam?.status || this.casMode) : null;
+    // Old clear output must not hide a current decryption outage. If encrypted
+    // input is still arriving but CAS output has stopped, report Scrambled;
+    // reserve Warning for an actual input/output stall without that evidence.
+    const inputFlowing = this.inputDataAt > 0 && Date.now() - this.inputDataAt <= staleTimeoutMs;
+    const encryptedInput = inputMetrics.packets >= 100 && inputMetrics.scrambledPackets / inputMetrics.packets >= 0.05;
+    const waitingForKeys = Boolean(this.config.cam?.enabled && this.casMode === 'descrambling' && stale && inputFlowing && encryptedInput);
+    const state = this.state === 'running' && ((scrambled && (!stale || inputFlowing)) || waitingForKeys) ? 'scrambled' : stale && this.state === 'running' ? 'warning' : this.state;
     const continuity = this.config.cam?.enabled ? { input: inputMetrics.continuityErrors, output: outputMetrics.continuityErrors } : null;
     const startedAt = !stale && this.state === 'running' ? this.runningSince : null;
     return { id: this.config.id, name: this.config.name, enabled: this.config.enabled, state, startedAt: startedAt ? new Date(startedAt).toISOString() : null, uptimeSeconds: startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0, activeInput: this.activeInput, clients: this.clients.size, cas: casStatus ? { profile: this.config.cam.profile, status: casStatus, continuity, diagnostics: this.cam?.diagnostics } : null, ...metrics };
@@ -188,7 +198,10 @@ export class StreamWorker extends EventEmitter {
 }
 
 export class StreamManager {
-  constructor(configStore, logger, options = {}) { this.store = configStore; this.logger = logger; this.workers = new Map(); this.dvbPool = options.dvbPool || new DVBInputPool(logger); this.casProxy = options.casProxy || new CASProxyManager(logger); this.workerFactory = options.workerFactory || ((...args) => new StreamWorker(...args)); this.reconcileQueue = Promise.resolve(); }
+  constructor(configStore, logger, options = {}) {
+    this.store = configStore; this.logger = logger; this.workers = new Map(); this.dvbPool = options.dvbPool || new DVBInputPool(logger); this.casProxy = options.casProxy || new CASProxyManager(logger); this.workerFactory = options.workerFactory || ((...args) => new StreamWorker(...args)); this.reconcileQueue = Promise.resolve();
+    this.casProxy.on?.('availability', available => { for (const worker of this.workers.values()) worker.cam?.setBackendAvailable?.(available); });
+  }
   async start() { await this.reconcile(this.store.value); }
   stop() { for (const worker of this.workers.values()) worker.stop(); this.workers.clear(); this.dvbPool.stop(); void this.casProxy.stop(); }
   reconcile(config) {
@@ -221,6 +234,16 @@ export class StreamManager {
   list() { return [...this.workers.values()].map((worker) => worker.snapshot()); }
   get(id) { return this.workers.get(id); }
   epgSnapshot() { return epgDocument(this.workers.values()); }
+  maintainEPG() { for (const worker of this.workers.values()) worker.epg?.prune(); }
+  epgStatus() {
+    let lastReceivedAt = 0; let updatedAt = 0; let events = 0; let channelsWithEPG = 0;
+    for (const worker of this.workers.values()) {
+      if (!worker.config.enabled || !worker.epg) continue;
+      lastReceivedAt = Math.max(lastReceivedAt, worker.epg.lastReceivedAt || 0); updatedAt = Math.max(updatedAt, worker.epg.updatedAt || 0);
+      events += worker.epg.events.size; if (worker.epg.events.size) channelsWithEPG++;
+    }
+    return { lastReceivedAt: lastReceivedAt ? new Date(lastReceivedAt).toISOString() : null, updatedAt: updatedAt ? new Date(updatedAt).toISOString() : null, events, channelsWithEPG, recommendedRefreshSeconds: 60 };
+  }
   async upsert(stream) {
     const current = this.store.value;
     const index = current.streams.findIndex((item) => item.id === stream.id);

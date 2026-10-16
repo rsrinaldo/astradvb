@@ -1,8 +1,15 @@
 import { mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { once } from 'node:events';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+export function dvbInputEnvironment(env = process.env, helperPath = env.ASTRA_DVB_BUFFER_HELPER || fileURLToPath(new URL('../bin/dvb-buffer.so', import.meta.url))) {
+  if (!existsSync(helperPath)) throw new Error('DVB capture buffer helper is missing; run the updated install.sh');
+  return { ...env, LD_PRELOAD: [helperPath, env.LD_PRELOAD].filter(Boolean).join(':') };
+}
 
 const DELIVERY_NAMES = {
   DVBS: 'DVBS', DVBS2: 'DVBS2', DVBS2X: 'DVBS2', DVBT: 'DVBT', DVBT2: 'DVBT2',
@@ -164,16 +171,19 @@ export function parseDVBChannelFile(text, adapterId = '') {
   });
 }
 
-async function collectProcess(child, timeoutMs, label) {
+async function collectProcess(child, timeoutMs, label, signal) {
   let output = '';
   let timedOut = false;
   child.stdout?.on('data', (chunk) => { output = `${output}${chunk}`.slice(-131072); });
   child.stderr?.on('data', (chunk) => { output = `${output}${chunk}`.slice(-131072); });
   const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); }, timeoutMs);
-  const [code] = await once(child, 'exit');
-  clearTimeout(timer);
-  if (timedOut) throw new Error(`${label} timed out`);
-  return { code, output };
+  const abort = () => child.kill('SIGTERM'); signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort();
+  try {
+    const [code] = await once(child, 'exit');
+    if (signal?.aborted) throw new Error(`${label} cancelled`);
+    if (timedOut) throw new Error(`${label} timed out`);
+    return { code, output };
+  } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
 }
 
 export async function inspectDVBFrontend(adapter, timeoutMs = 4000) {
@@ -200,7 +210,7 @@ export async function scanDVBAdapter(adapter, options = {}) {
   const binary = process.env.ASTRA_DVB_SCAN || 'dvbv5-scan';
   const child = spawn(binary, buildDVBScanArgs(adapter, initialFile, outputFile, options), { stdio: ['ignore', 'pipe', 'pipe'] });
   try {
-    const { code, output } = await collectProcess(child, Math.max(15000, Math.min(300000, Number(options.timeoutMs) || 90000)), 'DVB channel scan');
+    const { code, output } = await collectProcess(child, Math.max(15000, Math.min(300000, Number(options.timeoutMs) || 90000)), 'DVB channel scan', options.signal);
     let text = '';
     try { text = await readFile(outputFile, 'utf8'); } catch {}
     const services = parseDVBChannelFile(text, adapter.id);
@@ -215,16 +225,26 @@ export async function scanDVBAdapter(adapter, options = {}) {
 export async function runDVBInput(adapter, { signal, onData, onReady, serviceId = 0 }) {
   if (!adapter) throw new Error('DVB adapter configuration not found');
   if (!adapter.enabled) throw new Error(`DVB adapter ${adapter.id} is disabled`);
+  const env = dvbInputEnvironment();
   const directory = await mkdtemp(join(tmpdir(), 'astra-dvb-'));
   const channelFile = join(directory, 'channel.conf');
   await writeFile(channelFile, buildDVBChannel(adapter, { serviceId }), { mode: 0o600 });
   const binary = process.env.ASTRA_DVB_ZAP || 'dvbv5-zap';
-  const child = spawn(binary, buildDVBZapArgs(adapter, channelFile), { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(binary, buildDVBZapArgs(adapter, channelFile), { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = '';
+  let statusLines = '';
   const terminate = () => child.kill('SIGTERM');
   signal.addEventListener('abort', terminate, { once: true });
   child.stdout.on('data', onData);
-  child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-8192); });
+  child.stderr.on('data', (chunk) => {
+    stderr = `${stderr}${chunk}`.slice(-8192);
+    statusLines = (statusLines + String(chunk)).slice(-8192);
+    const lines = statusLines.split(/\r?\n/); statusLines = lines.pop();
+    for (const line of lines) {
+      if (/^AstraDVB DVR buffer (configured: \d+ bytes|setup failed: [^\r\n]+)$/.test(line))
+        process.stderr.write(`[dvb-input ${adapter.id}] ${line}\n`);
+    }
+  });
   child.once('spawn', () => onReady?.({ adapter: adapter.id, serviceId, bridge: binary }));
   try {
     const [code] = await once(child, 'exit');
@@ -235,18 +255,31 @@ export async function runDVBInput(adapter, { signal, onData, onReady, serviceId 
   }
 }
 
-export async function probeDVBFrontend(adapter, timeoutMs = 1800) {
+export function parseDVBFrontendStatus(output) {
+  output = String(output).replace(/\x1b\[[0-9;]*m/g, '');
+  const flags = output.match(/^\s*(?:(?:Lock|Unlocked|No\s+lock)\s*)?\(0x([0-9a-f]+)\)/im);
+  let lock = null;
+  if (flags) lock = Boolean(Number.parseInt(flags[1], 16) & 0x10); // FE_HAS_LOCK
+  else if (/^\s*(?:Unlocked|No\s+lock)\b/im.test(output)) lock = false;
+  else if (/^\s*Lock\b(?!\s*(?:lost|not))/im.test(output) || /^\s*FE_HAS_LOCK\s*$/im.test(output)) lock = true;
+  const signalMatch = output.match(/Signal=\s*([+-]?[\d.]+)\s*(%|dBm)?/i);
+  const quality = output.match(/Quality=\s*([^\s]+)/i);
+  const cnr = output.match(/C\/N=\s*([+-]?[\d.]+)\s*(dB|%|dBµV)?/i);
+  return { lock, status: lock === null ? 'unknown' : lock ? 'locked' : 'unlocked', signal: signalMatch ? { value: Number(signalMatch[1]), unit: signalMatch[2] || '' } : null, quality: quality?.[1] || null, cnr: cnr ? { value: Number(cnr[1]), unit: cnr[2] || '' } : null };
+}
+
+export async function probeDVBFrontend(adapter, timeoutMs = 3000) {
   if (!adapter.detected) return { lock: false, status: 'missing' };
   const binary = process.env.ASTRA_DVB_FE_TOOL || 'dvb-fe-tool';
   const child = spawn(binary, ['-a', String(adapter.adapter), '-f', String(adapter.frontend), '-m', '-c', '1'], { stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
-  child.stdout.on('data', (chunk) => { output += chunk; });
-  child.stderr.on('data', (chunk) => { output += chunk; });
-  const timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
-  try { await once(child, 'exit'); } catch {} finally { clearTimeout(timer); }
-  const signalMatch = output.match(/Signal=\s*([+-]?[\d.]+)\s*(%|dBm)?/i);
-  const quality = output.match(/Quality=\s*([^\s]+)/i);
-  const cnr = output.match(/C\/N=\s*([+-]?[\d.]+)\s*(dB|%|dBµV)?/i);
-  const lock = /\bLock\b|FE_HAS_LOCK/i.test(output);
-  return { lock, status: lock ? 'locked' : 'unlocked', signal: signalMatch ? { value: Number(signalMatch[1]), unit: signalMatch[2] || '' } : null, quality: quality?.[1] || null, cnr: cnr ? { value: Number(cnr[1]), unit: cnr[2] || '' } : null };
+  child.stdout.on('data', (chunk) => { output = (output + chunk).slice(-16384); });
+  child.stderr.on('data', (chunk) => { output = (output + chunk).slice(-16384); });
+  let timedOut = false; let probeError;
+  const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); }, timeoutMs);
+  // 'exit' can precede the final stdout/stderr data; 'close' drains both pipes.
+  try { await once(child, 'close'); } catch (error) { probeError = error.code || 'Probe failed'; } finally { clearTimeout(timer); }
+  const result = parseDVBFrontendStatus(output);
+  if (result.lock === null) result.error = timedOut ? 'Signal probe timed out' : probeError || 'No usable frontend status was returned';
+  return result;
 }

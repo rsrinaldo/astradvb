@@ -11,6 +11,9 @@ if ! command -v node >/dev/null || [[ "$(node -p 'Number(process.versions.node.s
 fi
 
 required_packages=()
+if ! command -v cc >/dev/null 2>&1; then
+  required_packages+=(build-essential)
+fi
 if ! command -v ffmpeg >/dev/null 2>&1; then
   required_packages+=(ffmpeg)
 fi
@@ -23,7 +26,7 @@ if ((${#required_packages[@]})); then
 fi
 
 install -d -o root -g root -m 0755 /opt/astra-linux /etc/astra-linux
-if ! command -v tsdecrypt >/dev/null 2>&1 || ! command -v oscam >/dev/null 2>&1 || [[ ! -f /usr/local/share/licenses/tsdecrypt/astra-emm-pid.patch ]]; then
+if ! command -v tsdecrypt >/dev/null 2>&1 || ! command -v oscam >/dev/null 2>&1 || [[ ! -f /usr/local/share/licenses/tsdecrypt/astra-emm-pid.patch ]] || [[ ! -f /usr/local/share/licenses/tsdecrypt/astra-ecm-protection.patch ]]; then
   ./install-cas.sh
 fi
 if ! id -u astra >/dev/null 2>&1; then
@@ -31,7 +34,8 @@ if ! id -u astra >/dev/null 2>&1; then
 fi
 usermod -aG video astra
 install -d -o astra -g astra -m 0750 /var/lib/astra-linux
-cp -R src public package.json /opt/astra-linux/
+cp -R src public bin package.json /opt/astra-linux/
+cc -shared -fPIC -O2 -Wall -Wextra /opt/astra-linux/bin/dvb-buffer.c -o /opt/astra-linux/bin/dvb-buffer.so -ldl
 chown -R root:root /opt/astra-linux
 if [[ ! -f /var/lib/astra-linux/config.json ]]; then
   install -o astra -g astra -m 0600 config.example.json /var/lib/astra-linux/config.json
@@ -52,3 +56,5 @@ systemctl enable astra-linux.service
 systemctl restart astra-linux.service
 echo "Astra Linux is running on http://$(hostname -I | awk '{print $1}'):8000/"
 echo "Run 'systemctl status astra-linux --no-pager' to verify the service."
+echo "Management login: admin. Initial password (until changed): sudo cat /var/lib/astra-linux/initial-admin-password"
+echo "Change it in Settings > Administrator account. Use HTTPS or a trusted VPN/SSH tunnel."

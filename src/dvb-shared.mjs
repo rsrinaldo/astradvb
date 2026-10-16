@@ -1,16 +1,9 @@
-import { runDVBInput } from './dvb.mjs';
+import { runDVBInput, scanDVBAdapter } from './dvb.mjs';
 import { TransportStreamFramer } from './mpegts.mjs';
+import { DVBServiceCollector } from './dvb-services.mjs';
+import { mpegCRC32 } from './mpeg-crc.mjs';
 
 const PACKET_SIZE = 188;
-
-function mpegCRC32(data) {
-  let crc = 0xffffffff;
-  for (const byte of data) {
-    crc ^= byte << 24;
-    for (let bit = 0; bit < 8; bit += 1) crc = (crc & 0x80000000) ? ((crc << 1) ^ 0x04c11db7) >>> 0 : (crc << 1) >>> 0;
-  }
-  return crc >>> 0;
-}
 
 function payload(packet) {
   const control = (packet[3] >> 4) & 0x03;
@@ -61,9 +54,11 @@ export class MPEGTSServiceFilter {
     if (!this.serviceId || !chunk?.length) return chunk || Buffer.alloc(0);
     const output = [];
     for (let offset = 0; offset + PACKET_SIZE <= chunk.length; offset += PACKET_SIZE) {
+      if (chunk[offset] !== 0x47) continue;
+      const pid = ((chunk[offset + 1] & 0x1f) << 8) | chunk[offset + 2];
+      // Reject other services before creating a Buffer view for their packets.
+      if (pid !== 0 && pid !== 1 && pid !== this.pmtPid && !this.allowed.has(pid)) continue;
       const packet = chunk.subarray(offset, offset + PACKET_SIZE);
-      if (packet[0] !== 0x47) continue;
-      const pid = ((packet[1] & 0x1f) << 8) | packet[2];
       if (pid === 0) {
         for (const section of this.patSections.push(packet)) this.#pat(section);
         output.push(this.pat ? this.#patPacket() : packet);
@@ -114,7 +109,47 @@ export class MPEGTSServiceFilter {
 }
 
 export class DVBInputPool {
-  constructor(logger) { this.logger = logger; this.entries = new Map(); }
+  constructor(logger, options = {}) { this.logger = logger; this.entries = new Map(); this.reservations = new Map(); this.inputRunner = options.inputRunner || runDVBInput; this.networkScanner = options.networkScanner || scanDVBAdapter; }
+  frontendKey(adapter) { return `${adapter.adapter}:${adapter.frontend}`; }
+  activeEntry(adapter) { return [...this.entries.values()].find(entry => this.frontendKey(entry.adapter) === this.frontendKey(adapter)); }
+  async scan(adapter, options = {}) {
+    if (!adapter?.enabled) throw new Error('Save and enable the DVB tuner before scanning');
+    if (options.signal?.aborted) throw new Error('DVB scan cancelled');
+    if (options.networkScan) {
+      const key = this.frontendKey(adapter);
+      if (this.activeEntry(adapter) || this.reservations.has(key)) {
+        const error = new Error('Network scanning would retune a busy frontend. Turn off Scan NIT transponders for a non-interrupting rescan, or use an idle tuner.'); error.statusCode = 409; throw error;
+      }
+      let release; const promise = new Promise(resolve => { release = resolve; }); this.reservations.set(key, promise);
+      try { return { ...await this.networkScanner(adapter, options), source: 'network', complete: true }; }
+      finally { this.reservations.delete(key); release(); }
+    }
+    const collector = new DVBServiceCollector(adapter); const controller = new AbortController();
+    const startedAt = Date.now(); let lastChangeAt = startedAt;
+    const timeoutMs = Math.max(3000, Math.min(30000, Number(options.timeoutMs) || 12000));
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      const finish = (error) => {
+        if (finished) return; finished = true; clearInterval(timer); options.signal?.removeEventListener('abort', abort);
+        controller.abort();
+        if (error) reject(error);
+        else {
+          const services = collector.snapshot();
+          if (!services.length) reject(new Error('No services found in the current multiplex. Check tuner lock, tuning parameters, and signal cabling.'));
+          else resolve({ services, source: 'live', complete: collector.complete, output: collector.complete ? [] : ['Partial scan: some service names or PMTs were not received before the timeout.'] });
+        }
+      };
+      const abort = () => finish(new Error('DVB scan cancelled'));
+      const timer = setInterval(() => {
+        const now = Date.now();
+        if (now - startedAt >= timeoutMs || (collector.complete && now - startedAt >= (options.minScanMs ?? 3000) && now - lastChangeAt >= (options.settleMs ?? 1000))) finish();
+      }, 100);
+      options.signal?.addEventListener('abort', abort, { once: true });
+      if (options.signal?.aborted) { abort(); return; }
+      this.run(adapter, 0, { signal: controller.signal, onReady: () => {}, onData: chunk => { const previous = collector.revision; collector.push(chunk); if (collector.revision !== previous) lastChangeAt = Date.now(); } })
+        .then(() => { if (!finished) finish(new Error('DVB input stopped during the scan')); }).catch(finish);
+    });
+  }
   reconcile(adapters) {
     for (const [id, entry] of this.entries) {
       const adapter = adapters.find((item) => item.id === id);
@@ -125,7 +160,13 @@ export class DVBInputPool {
   }
   run(adapter, serviceId, { signal, onData, onReady }) {
     if (!adapter) return Promise.reject(new Error('DVB adapter configuration not found'));
-    let entry = this.entries.get(adapter.id);
+    const reservation = this.reservations.get(this.frontendKey(adapter));
+    if (reservation) return new Promise((resolve, reject) => {
+      const abort = () => resolve(); signal.addEventListener('abort', abort, { once: true });
+      reservation.then(() => { signal.removeEventListener('abort', abort); if (signal.aborted) resolve(); else this.run(adapter, serviceId, { signal, onData, onReady }).then(resolve, reject); });
+      if (signal.aborted) abort();
+    });
+    let entry = this.entries.get(adapter.id) || this.activeEntry(adapter);
     if (!entry) {
       entry = { adapter, controller: new AbortController(), subscribers: new Set(), ready: false, releaseTimer: null, framer: new TransportStreamFramer() };
       this.entries.set(adapter.id, entry); this.#start(entry);
@@ -138,14 +179,14 @@ export class DVBInputPool {
       subscriber.resolve = resolve; subscriber.reject = reject;
       const release = () => {
         signal.removeEventListener('abort', release); entry.subscribers.delete(subscriber); resolve();
-        if (!entry.subscribers.size && !entry.releaseTimer) entry.releaseTimer = setTimeout(() => { if (!entry.subscribers.size) { if (this.entries.get(adapter.id) === entry) this.entries.delete(adapter.id); entry.controller.abort(); } }, 1000);
+        if (!entry.subscribers.size && !entry.releaseTimer) entry.releaseTimer = setTimeout(() => { if (!entry.subscribers.size) { if (this.entries.get(entry.adapter.id) === entry) this.entries.delete(entry.adapter.id); entry.controller.abort(); } }, 1000);
       };
       signal.addEventListener('abort', release, { once: true }); if (signal.aborted) release();
     });
   }
-  stop() { for (const entry of this.entries.values()) entry.controller.abort(); this.entries.clear(); }
+  stop() { for (const entry of this.entries.values()) { clearTimeout(entry.releaseTimer); entry.controller.abort(); } this.entries.clear(); }
   #start(entry) {
-    void runDVBInput(entry.adapter, {
+    void this.inputRunner(entry.adapter, {
       signal: entry.controller.signal, serviceId: 0,
       onReady: () => { entry.ready = true; for (const subscriber of entry.subscribers) subscriber.onReady?.({ adapter: entry.adapter.id, shared: true }); },
       onData: (chunk) => {
@@ -156,6 +197,7 @@ export class DVBInputPool {
       .catch((error) => this.#finish(entry, entry.controller.signal.aborted ? null : error));
   }
   #finish(entry, error) {
+    clearTimeout(entry.releaseTimer);
     if (this.entries.get(entry.adapter.id) === entry) this.entries.delete(entry.adapter.id);
     for (const subscriber of entry.subscribers) error ? subscriber.reject?.(error) : subscriber.resolve?.();
     entry.subscribers.clear();

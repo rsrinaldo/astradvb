@@ -1,5 +1,6 @@
 FROM node:22-bookworm-slim
 COPY patches/tsdecrypt-emm-pid.patch /tmp/tsdecrypt-emm-pid.patch
+COPY patches/tsdecrypt-ecm-protection.patch /tmp/tsdecrypt-ecm-protection.patch
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates dvb-tools ffmpeg git libdvbcsa-dev libssl-dev pkg-config \
   && git clone https://github.com/gfto/tsdecrypt.git /usr/local/src/tsdecrypt \
   && git -C /usr/local/src/tsdecrypt checkout --detach f4876e84cf1866645f84b93f830af67193c85f69 \
@@ -7,10 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
   && git -C /usr/local/src/tsdecrypt config submodule.libtsfuncs.url https://github.com/gfto/libtsfuncs.git \
   && git -C /usr/local/src/tsdecrypt submodule update --init --recursive \
   && git -C /usr/local/src/tsdecrypt apply /tmp/tsdecrypt-emm-pid.patch \
+  && git -C /usr/local/src/tsdecrypt apply /tmp/tsdecrypt-ecm-protection.patch \
   && make -C /usr/local/src/tsdecrypt \
   && install -m 0755 /usr/local/src/tsdecrypt/tsdecrypt /usr/local/bin/tsdecrypt \
   && install -D -m 0644 /usr/local/src/tsdecrypt/COPYING /usr/local/share/licenses/tsdecrypt/COPYING \
   && install -m 0644 /tmp/tsdecrypt-emm-pid.patch /usr/local/share/licenses/tsdecrypt/astra-emm-pid.patch \
+  && install -m 0644 /tmp/tsdecrypt-ecm-protection.patch /usr/local/share/licenses/tsdecrypt/astra-ecm-protection.patch \
   && git clone https://git.streamboard.tv/common/oscam.git /usr/local/src/oscam \
   && git -C /usr/local/src/oscam checkout --detach 39e78a4688b30abaab62b5c9e13672b4e34bfca0 \
   && cd /usr/local/src/oscam \
@@ -24,6 +27,8 @@ WORKDIR /opt/astra
 COPY package.json ./
 COPY src ./src
 COPY public ./public
+COPY bin ./bin
+RUN cc -shared -fPIC -O2 -Wall -Wextra bin/dvb-buffer.c -o bin/dvb-buffer.so -ldl
 COPY config.example.json /etc/astra/config.example.json
 RUN mkdir -p /var/lib/astra && chown astra:astra /var/lib/astra
 USER astra

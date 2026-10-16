@@ -4,11 +4,12 @@ import { normalizeConfig, normalizeStream } from '../src/config.mjs';
 import { StreamManager } from '../src/stream-manager.mjs';
 import { RingLogger } from '../src/logger.mjs';
 import { DVBInputPool } from '../src/dvb-shared.mjs';
+import { EventEmitter } from 'node:events';
 
 function setup(config = {}) {
   const store = { value: normalizeConfig(config), async save(value) { this.value = normalizeConfig(value); return this.value; } };
   const pool = { reconcile() {}, stop() {} };
-  const proxy = { connections: new Map([['provider', { host: '127.0.0.1', port: 24000 }]]), async start(profiles) { this.profiles = profiles; return this.connections; }, async stop() {} };
+  const proxy = Object.assign(new EventEmitter(), { connections: new Map([['provider', { host: '127.0.0.1', port: 24000 }]]), async start(profiles) { this.profiles = profiles; return this.connections; }, async stop() {} });
   const manager = new StreamManager(store, new RingLogger(), { dvbPool: pool, casProxy: proxy, workerFactory: (stream) => ({ config: stream, starts: 0, stops: 0, start() { this.starts++; }, stop() { this.stops++; } }) });
   return { store, proxy, manager };
 }
@@ -46,4 +47,13 @@ test('DVB pool invalidates changed hardware configuration but retains unchanged 
   pool.entries.set('sat', { adapter, controller });
   pool.reconcile([{ ...adapter }]); assert.equal(controller.signal.aborted, false);
   pool.reconcile([{ ...adapter, frequencyMHz: 10804 }]); assert.equal(controller.signal.aborted, true); assert.equal(pool.entries.size, 0);
+});
+
+test('proxy recovery coordinates only native decoders without restarting inputs or clear channels', async () => {
+  const { manager, proxy } = setup({ streams: [channel('clear'), channel('encrypted', { cam: { enabled: true, profile: 'provider' } })] });
+  await manager.start(); const clear = manager.get('clear'); const encrypted = manager.get('encrypted'); const availability = [];
+  encrypted.cam = { setBackendAvailable: value => availability.push(value) };
+  proxy.emit('availability', false); proxy.emit('availability', true);
+  assert.deepEqual(availability, [false, true]);
+  assert.equal(clear.starts, 1); assert.equal(clear.stops, 0); assert.equal(encrypted.starts, 1); assert.equal(encrypted.stops, 0);
 });

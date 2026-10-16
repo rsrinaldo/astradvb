@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 base_url="${ASTRA_URL:-http://127.0.0.1:8000}"
+cookie_args=()
+if [[ -n ${ASTRA_COOKIE_JAR:-} ]]; then cookie_args=(--cookie "$ASTRA_COOKIE_JAR"); fi
 
 case "${1:-status}" in
-  status) curl -fsS "$base_url/api/status" ;;
-  streams) curl -fsS "$base_url/api/streams" ;;
-  sessions) curl -fsS "$base_url/api/sessions" ;;
-  logs) curl -fsS "$base_url/api/logs?limit=${2:-100}" ;;
-  config) curl -fsS "$base_url/api/config" ;;
+  status) curl -fsS "${cookie_args[@]}" "$base_url/api/status" ;;
+  streams) curl -fsS "${cookie_args[@]}" "$base_url/api/streams" ;;
+  sessions) curl -fsS "${cookie_args[@]}" "$base_url/api/sessions" ;;
+  logs) curl -fsS "${cookie_args[@]}" "$base_url/api/logs?limit=${2:-100}" ;;
+  config) curl -fsS "${cookie_args[@]}" "$base_url/api/config" ;;
   *) echo "Usage: astractl [status|streams|sessions|logs [limit]|config]" >&2; exit 2 ;;
 esac
 printf '\n'

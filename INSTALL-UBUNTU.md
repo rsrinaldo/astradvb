@@ -85,7 +85,13 @@ The health endpoint should return an `ok` response. Open the dashboard at:
 http://SERVER-IP:8000/
 ```
 
-There is no login or administrator token. The dashboard and configuration API are immediately available to every client that can reach port 8000.
+Management requires a login. The username is `admin`. Retrieve the unique initial password:
+
+```bash
+sudo cat /var/lib/astra-linux/initial-admin-password
+```
+
+Sign in, then open **Settings → Administrator account** and change the initial password. Use at least 12 characters. Changing it invalidates older management logins without restarting streams. Playback, playlists, and XMLTV/JSON EPG URLs remain public. Administrator credentials are stored as a salted scrypt hash in `/var/lib/astra-linux/admin-auth.json`, separate from the stream configuration; keep this file private and include it in protected backups. The plaintext initial-password file is removed after the password is changed.
 
 ## 5. Restrict management access
 
@@ -98,9 +104,22 @@ sudo ufw enable
 sudo ufw status verbose
 ```
 
-For management outside the trusted network, use a VPN or add authentication at an HTTPS reverse proxy. The application itself intentionally performs no authentication.
+For management outside the trusted network, use a VPN or an HTTPS reverse proxy. HTTP does not encrypt your login password. Behind a trusted TLS proxy, set `ASTRA_PUBLIC_HTTPS=1` and `ASTRA_PUBLIC_ORIGIN=https://your-management-host` in `/etc/astra-linux/environment` and restart the service; restrict direct access to port 8000. This enables Secure cookies without trusting client-supplied forwarding headers.
+
+If the password is lost, stop Astra, reset it, and start the service again:
+
+```bash
+sudo systemctl stop astra-linux
+sudo -u astra env ASTRA_CONFIG=/var/lib/astra-linux/config.json node /opt/astra-linux/bin/reset-admin.mjs
+sudo systemctl start astra-linux
+sudo cat /var/lib/astra-linux/initial-admin-password
+```
 
 ## 6. Create a stream
+
+For DVB rescans on a streaming tuner, leave **Scan NIT transponders** off. The normal scan reads the current multiplex through the shared tuner process without reopening the frontend or stopping viewers. NIT network scans require an idle tuner because they can retune it. Results mark existing services **Already added**, disable those checkboxes, and select only new services by default. Existing renamed/disabled streams are matched by frontend and service ID, not by their names.
+
+Optional client restrictions are under **Settings → Streaming and EPG access**. Add the permitted public IPs or CIDR networks to the streaming and/or EPG list. Leave a list empty to allow any IP. Changes apply immediately without restarting streams; newly blocked HTTP relay clients are disconnected. Streaming rules cover HTTP MPEG-TS, HLS, and playlist exports; EPG rules cover XMLTV/JSON downloads. Management still requires login and is not blocked by these media rules. The form shows the IP visible to this server. NAT and proxy clients may share one visible address; untrusted forwarding headers are ignored. If using a reverse proxy, apply original-client IP filtering there. These rules do not restrict configured UDP/RTP output destinations or remove EPG embedded in video.
 
 In the dashboard, choose **+ Stream**.
 
@@ -161,7 +180,13 @@ Choose **Export playlist** to download M3U, XSPF, plain URLs, or JSON. Append `?
 
 EPG is populated from DVB EIT tables present in the incoming transport streams. An upstream stream without EIT data cannot produce programme entries automatically.
 
+Both URLs export the latest collected data on every request and disable HTTP caching. Set the receiving system's refresh interval to **60 seconds**. JSON exposes `updatedAt` (last programme change) and `lastReceivedAt` (last valid broadcast EIT); `generatedAt` is only the export time. The dashboard also shows guide coverage and freshness. Clear EIT collection is independent of descrambling, and expired guide data is cleaned up every minute even when nobody downloads the guide. Source schedule changes appear as soon as the broadcaster transmits them; the server cannot control the broadcaster's EIT repetition interval or the receiving system's refresh policy.
+
+CAS process recovery is automatic and paced. Do not add a cron job that repeatedly restarts the entire engine during a provider outage: failed keys alone do not trigger process restarts. Keep the default 16 MiB DVR capture buffers and disabled native packet-delay buffer unless measurements justify a change; capture capacity is not intentional playback delay.
+
 ## 8. Configure a DVB tuner
+
+Starting with v0.8.32, `install.sh` also builds the process-scoped DVR capture-buffer helper. Run the installer when upgrading rather than only copying JavaScript files. The helper requests a 16 MiB capture ring before reading the DVR device, without changing tuning or demux filters; scanner and signal-probe processes are unaffected. An optional `ASTRA_DVB_DVR_BUFFER_BYTES` setting accepts 1–64 MiB. This protects against short reader stalls, not sustained overload. A missing helper stops DVB input with an installation error instead of silently falling back to the small capture buffer.
 
 First confirm that the Linux driver exposes the adapter:
 
@@ -193,7 +218,11 @@ sudo journalctl -u astra-linux -n 200 --no-pager
 
 ## 9. Configure an authorized Newcamd profile
 
-OSCam is an integral part of the native and Docker installations. The installer builds and installs it automatically alongside tsdecrypt; Astra starts and stops the proxy itself, including after reboot. No separate manual OSCam installation or service configuration is needed. One upstream Newcamd TCP connection per profile carries the individual channel ECM exchanges. No extra encrypted-input or decrypted-output delay is imposed, because delaying packets independently of key updates can cause corruption at key changes.
+Version 0.8.26 requires the ECM-protected tsdecrypt build. `install-cas.sh` builds it and the normal installer checks its marker. The proxy's loopback transport guard bounds upstream frame rate, stale queues, and retries. Consult the provider for an allowed rate before enabling a large channel lineup; the default 20 frames/s is not a guarantee of provider capacity. See README → Provider protection for environment controls. To pause upstream requests safely, set `ASTRA_CAS_PROVIDER_PAUSED=1` in `/etc/astra-linux/environment` and restart the service. This preserves saved channels and credentials and leaves clear channels available.
+
+OSCam is an integral part of the native and Docker installations. The installer builds and installs it automatically alongside tsdecrypt; Astra starts and stops the proxy itself, including after reboot. No separate manual OSCam installation or service configuration is needed. One upstream Newcamd TCP connection per profile carries the individual channel ECM exchanges. From v0.8.23, tsdecrypt processes ECM immediately and buffers packets internally for 2 seconds before decryption to tolerate short key-reply delays. This adds about 2 seconds of encrypted-channel latency. It cannot repair provider outages or guarantee recovery when key replies arrive later than the buffer. Long buffers are unsafe because the decoder retains only the current even/odd key pair.
+
+Starting with v0.8.31, the extra native packet delay is disabled by default. On an existing installation, set `ASTRA_CAS_INPUT_BUFFER_MS=0` in `/etc/astra-linux/environment`, then run `sudo systemctl restart astra-linux`. A 0–2000 ms override remains for diagnostics only: this decoder does not retain a matching key epoch for each delayed packet, so buffering across key changes can interrupt decryption. Do not delay the incoming ECM stream externally. Startup is paced at one decoder every 500 ms, with no more than five starts per five seconds (about 87 seconds for 90 decoders).
 
 The installer also applies the bundled tsdecrypt EMM PID correction and rebuilds older unpatched installations during an upgrade. Keep the `patches` directory with `install-cas.sh` when packaging the installer.
 
@@ -276,7 +305,7 @@ ip maddr
 
 Common causes:
 
-- **Dashboard opens but cannot save:** inspect the browser error and service logs; authentication is never required.
+- **Dashboard opens but cannot save:** sign in again if your session expired, change the initial password if prompted, and inspect browser errors and service logs. API mutations require a valid session cookie and `X-CSRF-Token`.
 - **HTTP URL returns 404:** enable HTTP MPEG-TS for that stream and check the stream ID.
 - **HTTP connection opens but no video arrives:** inspect input state, bitrate, continuity errors, and service logs.
 - **Multicast input is idle:** confirm the multicast group reaches the correct NIC and Linux has a route for it.

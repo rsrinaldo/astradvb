@@ -22,9 +22,10 @@ test('builds one upstream reader and one shared local Newcamd endpoint per profi
     emm: true,
   }], { firstPort: 24000, random: (size) => Buffer.alloc(size, 0xaa) });
   assert.match(generated.conf, /port = 24000\{a{28}\}@0B00:000000/);
+  assert.match(generated.conf, /^lb_mode = 0$/m);
   assert.match(generated.server, /device = cas\.example\.test,15000/);
   assert.match(generated.server, /connectoninit = 1/);
-  assert.match(generated.user, /max_connections = 64/);
+  assert.doesNotMatch(generated.user, /max_connections/);
   assert.match(generated.user, /au = 0/);
   assert.match(generated.server, /audisabled = 1/);
   assert.equal(generated.connections.get('provider').host, '127.0.0.1');
@@ -36,4 +37,16 @@ test('requires a four-digit CAID for the shared Newcamd listener', () => {
   assert.throws(() => buildOscamConfiguration([{
     id: 'bad', lineEncrypted: encryptSecret('host 15000 user pass 0102030405060708091011121314'), caid: '',
   }]), /four-digit hexadecimal CAID/);
+});
+
+test('permits the intentional loopback guard path without opening the downstream listener', () => {
+  process.env.ASTRA_SECRET_KEY = '44'.repeat(32);
+  const profiles = [{ id: 'provider', lineEncrypted: encryptSecret('host.example.test 15000 user pass 0102030405060708091011121314'), caid: '0B00' }];
+  const guarded = buildOscamConfiguration(profiles, { guardedPorts: new Map([['provider', 31000]]) });
+  assert.match(guarded.conf, /^block_same_ip = 0$/m);
+  assert.match(guarded.server, /^device = 127\.0\.0\.1,31000$/m);
+  assert.match(guarded.conf, /^serverip = 127\.0\.0\.1$/m);
+  assert.match(guarded.conf, /^allowed = 127\.0\.0\.1$/m);
+  assert.match(guarded.user, /^hostname = 127\.0\.0\.1$/m);
+  assert.doesNotMatch(buildOscamConfiguration(profiles).conf, /block_same_ip/);
 });

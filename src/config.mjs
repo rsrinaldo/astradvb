@@ -1,5 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { normalizeAccess } from './access.mjs';
 
 const defaults = {
   server: { host: '0.0.0.0', port: 8000, publicBaseUrl: '' },
@@ -13,6 +15,7 @@ export function normalizeConfig(value = {}) {
   const config = {
     server: { ...defaults.server, ...(value.server || {}) },
     settings: { ...defaults.settings, ...(value.settings || {}) },
+    access: normalizeAccess(value.access),
     adapters: Array.isArray(value.adapters) ? value.adapters.map(normalizeDVBAdapter).filter(Boolean) : [],
     casProfiles: Array.isArray(value.casProfiles) ? value.casProfiles.map(normalizeCASProfile).filter(Boolean) : [],
     streams: Array.isArray(value.streams) ? value.streams : [],
@@ -115,11 +118,12 @@ export class ConfigStore {
   }
 
   async save(value) {
-    this.value = normalizeConfig(value);
+    const next = normalizeConfig(value);
     await mkdir(dirname(this.path), { recursive: true });
-    const temp = `${this.path}.${process.pid}.tmp`;
-    await writeFile(temp, `${JSON.stringify(this.value, null, 2)}\n`, { mode: 0o600 });
+    const temp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
     await rename(temp, this.path);
+    this.value = next;
     return this.value;
   }
 }

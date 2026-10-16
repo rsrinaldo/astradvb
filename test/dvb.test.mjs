@@ -3,7 +3,42 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { buildDVBChannel, buildDVBScanArgs, buildDVBZapArgs, discoverDVBDevices, mergeDVBAdapters, parseDVBChannelFile } from '../src/dvb.mjs';
+import { buildDVBChannel, buildDVBScanArgs, buildDVBZapArgs, discoverDVBDevices, dvbInputEnvironment, mergeDVBAdapters, parseDVBChannelFile, parseDVBFrontendStatus, runDVBInput } from '../src/dvb.mjs';
+
+test('DVB input checks the capture helper before spawning or creating its tuning file', async () => {
+  const previous=process.env.ASTRA_DVB_BUFFER_HELPER;
+  process.env.ASTRA_DVB_BUFFER_HELPER='/missing-astra-dvb-buffer-helper.so';
+  try {
+    await assert.rejects(runDVBInput({enabled:true},{signal:new AbortController().signal,onData:()=>{}}),/capture buffer helper is missing/);
+  } finally { if(previous===undefined)delete process.env.ASTRA_DVB_BUFFER_HELPER;else process.env.ASTRA_DVB_BUFFER_HELPER=previous; }
+});
+
+test('injects capture buffering only into the input child while preserving existing preloads', async () => {
+  const dir=await mkdtemp(join(tmpdir(),'astra-dvb-env-'));
+  try {
+    const helper=join(dir,'dvb-buffer.so');await writeFile(helper,'test');
+    const original={KEEP:'yes',LD_PRELOAD:'/existing.so'};
+    const env=dvbInputEnvironment(original,helper);
+    assert.equal(env.LD_PRELOAD,helper+':/existing.so');assert.equal(env.KEEP,'yes');
+    assert.equal(original.LD_PRELOAD,'/existing.so');
+    assert.throws(()=>dvbInputEnvironment({},join(dir,'missing.so')),/helper is missing/);
+  } finally { await rm(dir,{recursive:true,force:true}); }
+});
+
+test('distinguishes explicit hardware no-lock from unavailable signal readings', () => {
+  const good = parseDVBFrontendStatus('\x1b[32mLock (0x1f) Signal= -20.36dBm C/N= 15.40dB\x1b[0m\nERROR FE_SET_VOLTAGE: Operation not permitted');
+  assert.equal(good.lock, true); assert.equal(good.status, 'locked');
+  assert.deepEqual(good.cnr, { value: 15.4, unit: 'dB' });
+  for (const output of ['', 'ERROR Device or resource busy', 'ERROR FE_READ_STATUS failed', 'Signal= -20dBm', 'Lock lost']) {
+    const result = parseDVBFrontendStatus(output);
+    assert.equal(result.lock, null, output); assert.equal(result.status, 'unknown', output);
+  }
+  for (const output of [' (0x00) Signal= 0%', ' (0x0f) Signal= 80%', 'Unlocked', 'No lock', 'Lock (0x0f)']) {
+    assert.equal(parseDVBFrontendStatus(output).lock, false, output);
+    assert.equal(parseDVBFrontendStatus(output).status, 'unlocked', output);
+  }
+  assert.equal(parseDVBFrontendStatus(' (0x10) Signal= 80%').lock, true);
+});
 
 test('discovers Linux DVB frontends and merges saved tuning profiles', async () => {
   const root = await mkdtemp(join(tmpdir(), 'astra-dvb-test-'));

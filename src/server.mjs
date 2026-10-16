@@ -9,23 +9,35 @@ import { formatPlaylist, playlistEntries, streamAliases } from './playlist.mjs';
 import { xmltv } from './epg.mjs';
 import { encryptSecret } from './secrets.mjs';
 import { RelaySessions } from './sessions.mjs';
+import { ManagementAuth, publicMediaRequest } from './auth.mjs';
+import { AccessPolicy, clientIP, mediaScope, normalizeAccess } from './access.mjs';
 import { parseNewcamdLine } from './softcam.mjs';
-import { discoverDVBDevices, inspectDVBFrontend, mergeDVBAdapters, probeDVBFrontend, scanDVBAdapter } from './dvb.mjs';
+import { discoverDVBDevices, inspectDVBFrontend, mergeDVBAdapters, probeDVBFrontend } from './dvb.mjs';
+import { annotateDVBServices, existingDVBStreams } from './dvb-services.mjs';
+import { SystemResources } from './system-resources.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const packageInfo = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
 const store = new ConfigStore();
 await store.load();
+const auth = new ManagementAuth(store.path);
+await auth.load();
+let accessPolicy = new AccessPolicy(store.value.access);
 const logger = new RingLogger(store.value.settings.logLimit, (source) => store.value.streams.find((stream) => stream.id === source)?.name || store.value.adapters.find((adapter) => adapter.id === source)?.name || source);
 const manager = new StreamManager(store, logger);
 await manager.start();
+const resources = new SystemResources();
+await resources.sample();
 const startedAt = Date.now();
 const sessions = new RelaySessions();
 const sseClients = new Set();
 let adapterCache = { expires: 0, value: [] };
+let adapterStatusPending = null;
 const adapterScans = new Set();
 
 logger.on('entry', (entry) => broadcast('log', entry));
 sessions.on('change', () => broadcast('sessions', { sessions: sessions.list() }));
+auth.on('revoked', () => { for (const response of sseClients) if (!auth.byId(response.authSessionId)) { sseClients.delete(response); response.end(); } });
 
 function json(response, status, value) {
   const body = JSON.stringify(value);
@@ -38,7 +50,7 @@ function error(response, status, message) { json(response, status, { error: mess
 function requestBase(request) {
   if (store.value.server.publicBaseUrl) return store.value.server.publicBaseUrl;
   const host = /^[a-zA-Z0-9.:[\]-]+$/.test(request.headers.host || '') ? request.headers.host : `127.0.0.1:${store.value.server.port}`;
-  return `http://${host}`;
+  return `${auth.secure(request) ? 'https' : 'http'}://${host}`;
 }
 
 function publicConfig() {
@@ -46,17 +58,22 @@ function publicConfig() {
 }
 
 async function adapterStatus(force = false) {
+  if (adapterStatusPending) return adapterStatusPending;
   if (!force && adapterCache.expires > Date.now()) return adapterCache.value;
+  adapterStatusPending = (async () => {
   const detected = await discoverDVBDevices();
   const merged = mergeDVBAdapters(store.value.adapters, detected);
   const value = await Promise.all(merged.map(async (adapter) => {
-    if (adapterScans.has(adapter.id)) return { ...adapter, lock: false, status: 'scanning' };
+    if (adapterScans.has(`${adapter.adapter}:${adapter.frontend}`)) return { ...adapter, lock: null, status: 'scanning' };
     if (!adapter.configured || !adapter.detected || !adapter.enabled) return { ...adapter, lock: false, status: adapter.detected ? 'unconfigured' : 'missing' };
     try { return { ...adapter, ...(await probeDVBFrontend(adapter)) }; }
-    catch (error) { return { ...adapter, lock: false, status: 'error', error: error.message }; }
+    catch (error) { return { ...adapter, lock: null, status: 'unknown', error: error.message }; }
   }));
   adapterCache = { expires: Date.now() + 4000, value };
   return value;
+  })();
+  try { return await adapterStatusPending; }
+  finally { adapterStatusPending = null; }
 }
 
 async function findAdapter(id) {
@@ -73,14 +90,16 @@ async function body(request, limit = 1024 * 1024) {
 function status() {
   const streams = manager.list();
   return {
-    version: '0.8.19',
+    version: packageInfo.version,
     uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
     engine: 'online',
-    authentication: 'disabled',
+    authentication: 'enabled',
     streams: { total: streams.length, running: streams.filter((stream) => stream.state === 'running').length, scrambled: streams.filter((stream) => stream.state === 'scrambled').length, warning: streams.filter((stream) => stream.state === 'warning' || stream.state === 'error' || stream.state === 'failover').length },
     sessions: sessions.size,
-    casProxy: manager.casProxy.metrics,
+    casProxy: { ...manager.casProxy.metrics, providerGuards: manager.casProxy.guardMetrics?.() || [] },
     memory: process.memoryUsage(),
+    resources: resources.value,
+    epg: manager.epgStatus(),
   };
 }
 
@@ -94,7 +113,10 @@ function resolveWorker(key) {
 
 function broadcast(event, data) {
   const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const response of sseClients) response.write(message);
+  for (const response of sseClients) {
+    if (!auth.byId(response.authSessionId)) { sseClients.delete(response); response.end(); continue; }
+    response.write(message);
+  }
 }
 
 function openRelay(request, response, worker) {
@@ -105,7 +127,7 @@ function openRelay(request, response, worker) {
 }
 
 async function serveStatic(response, pathname, head = false) {
-  const files = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/enhancements.css': ['enhancements.css', 'text/css; charset=utf-8'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
+  const files = { '/': ['index.html', 'text/html; charset=utf-8'], '/login': ['login.html', 'text/html; charset=utf-8'], '/login.js': ['login.js', 'text/javascript; charset=utf-8'], '/auth.css': ['auth.css', 'text/css; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/enhancements.css': ['enhancements.css', 'text/css; charset=utf-8'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
   const selected = files[pathname];
   if (!selected) return false;
   try {
@@ -119,6 +141,35 @@ const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
   const path = url.pathname;
   try {
+    const scope = mediaScope(request.method, path);
+    if (scope && !accessPolicy.allows(scope, request.socket.remoteAddress)) return error(response, 403, `${scope === 'epg' ? 'EPG' : 'Streaming'} access is not allowed from your IP address`);
+    const session = auth.authenticate(request);
+    const mutation = !['GET', 'HEAD', 'OPTIONS'].includes(request.method);
+    if (mutation && !auth.sameOrigin(request)) return error(response, 403, 'Cross-origin management requests are not allowed');
+    if (request.method === 'POST' && path === '/api/auth/login') {
+      if (!/^application\/json(?:;|$)/i.test(request.headers['content-type'] || '')) return error(response, 415, 'JSON request required');
+      const value = await body(request, 4096);
+      const result = await auth.login(value.username, value.password, request.socket.remoteAddress);
+      if (result.status !== 200) { if (result.status === 429) response.setHeader('retry-after', '900'); return error(response, result.status, result.status === 429 ? 'Too many sign-in attempts. Try again later.' : 'Incorrect username or password'); }
+      response.setHeader('set-cookie', auth.cookie(request, result.token)); return json(response, 200, auth.info(result.session));
+    }
+    if (['GET', 'HEAD'].includes(request.method) && path === '/login' && session) { response.writeHead(303, { location: '/', 'cache-control': 'no-store' }); response.end(); return; }
+    const staticAsset = ['/login', '/login.js', '/auth.css', '/app.js', '/styles.css', '/enhancements.css', '/favicon.svg'].includes(path);
+    if (url.searchParams.get('include_disabled') === '1' && !session) return error(response, 401, 'Sign in to export disabled channels');
+    if (!staticAsset && !publicMediaRequest(request.method, path) && !session) {
+      if (['GET', 'HEAD'].includes(request.method) && path === '/') { response.writeHead(303, { location: '/login', 'cache-control': 'no-store' }); response.end(); return; }
+      return error(response, 401, 'Sign in to manage this server');
+    }
+    if (mutation && (!session || !auth.csrfValid(request, session))) return error(response, 403, 'Invalid request verification token');
+    if (request.method === 'GET' && path === '/api/auth/session') return json(response, 200, { ...auth.info(session), clientIP: clientIP(request.socket.remoteAddress) });
+    if (request.method === 'POST' && path === '/api/auth/logout') { auth.logout(session); response.setHeader('set-cookie', auth.clearCookie(request)); return json(response, 200, { ok: true }); }
+    if (request.method === 'POST' && path === '/api/auth/password') {
+      const value = await body(request, 4096); const result = await auth.changePassword(session, value.currentPassword, value.newPassword);
+      if (result.status !== 200) return error(response, result.status, result.error);
+      response.setHeader('set-cookie', auth.cookie(request, result.token)); logger.info('security', 'Administrator password changed; previous management sessions revoked');
+      return json(response, 200, auth.info(result.session));
+    }
+    if (mutation && auth.record.mustChangePassword) return error(response, 403, 'Change the initial administrator password in Settings first');
     if ((request.method === 'GET' || request.method === 'HEAD') && await serveStatic(response, path, request.method === 'HEAD')) return;
     if ((request.method === 'GET' || request.method === 'HEAD') && path === '/healthz') {
       response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
@@ -139,14 +190,29 @@ const server = http.createServer(async (request, response) => {
     }
     if (request.method === 'GET' && (path === '/epg.xml' || path === '/api/epg')) {
       const document = manager.epgSnapshot();
+      response.setHeader('cache-control', 'no-store, max-age=0');
+      response.setHeader('x-epg-refresh-seconds', '60');
+      if (document.updatedAt) response.setHeader('last-modified', new Date(document.updatedAt).toUTCString());
+      if (document.lastReceivedAt) response.setHeader('x-epg-last-received-at', document.lastReceivedAt);
       if (path === '/api/epg') return json(response, 200, document);
-      const value = xmltv(document); response.writeHead(200, { 'content-type': 'application/xml; charset=utf-8', 'content-length': Buffer.byteLength(value), 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }); response.end(value); return;
+      const value = xmltv(document); response.writeHead(200, { 'content-type': 'application/xml; charset=utf-8', 'content-length': Buffer.byteLength(value), 'x-content-type-options': 'nosniff' }); response.end(value); return;
     }
     if (request.method === 'GET' && path === '/api/config') {
       return json(response, 200, publicConfig());
     }
+    if (request.method === 'GET' && path === '/api/access') return json(response, 200, { ...store.value.access, clientIP: clientIP(request.socket.remoteAddress) });
+    if (request.method === 'PUT' && path === '/api/access') {
+      let access;
+      try { access = normalizeAccess(await body(request, 32768)); } catch (caught) { return error(response, 400, caught.message); }
+      const nextPolicy = new AccessPolicy(access);
+      await store.save({ ...store.value, access }); accessPolicy = nextPolicy;
+      const disconnectedSessions = sessions.disconnectWhere(entry => !accessPolicy.allows('streaming', entry.ip));
+      logger.info('security', 'Streaming and EPG IP restrictions updated');
+      return json(response, 200, { ...access, clientIP: clientIP(request.socket.remoteAddress), disconnectedSessions });
+    }
     if (request.method === 'GET' && path === '/api/events') {
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+      response.authSessionId = session.id;
       response.write(`event: status\ndata: ${JSON.stringify(status())}\n\n`); sseClients.add(response); response.on('close', () => sseClients.delete(response)); return;
     }
 
@@ -160,7 +226,7 @@ const server = http.createServer(async (request, response) => {
     const segment = path.match(/^\/hls\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9-]+)\.ts$/);
     if (request.method === 'GET' && segment) {
       const data = resolveWorker(segment[1])?.hls.get(segment[2]); if (!data) return error(response, 404, 'Segment not found');
-      response.writeHead(200, { 'content-type': 'video/mp2t', 'content-length': data.length, 'cache-control': 'public, max-age=30' }); response.end(data); return;
+      response.writeHead(200, { 'content-type': 'video/mp2t', 'content-length': data.length, 'cache-control': 'private, no-store' }); response.end(data); return;
     }
 
     const streamRoute = path.match(/^\/api\/streams\/([a-zA-Z0-9_-]+)$/);
@@ -175,22 +241,39 @@ const server = http.createServer(async (request, response) => {
       const id = adapterScanRoute[1];
       const adapter = await findAdapter(id);
       if (!adapter?.configured) return error(response, 404, 'Save the DVB adapter configuration before scanning');
-      if (adapterScans.has(id)) return error(response, 409, 'A scan is already running on this adapter');
-      adapterScans.add(id);
+      const key = `${adapter.adapter}:${adapter.frontend}`;
+      if (adapterScans.has(key)) return error(response, 409, 'A scan is already running on this adapter');
+      adapterScans.add(key);
+      const controller = new AbortController();
+      const cancel = () => { if (!response.writableEnded) controller.abort(); }; response.once('close', cancel);
       try {
         const options = await body(request);
-        const result = await scanDVBAdapter(adapter, { networkScan: Boolean(options.networkScan), timeoutMultiply: options.timeoutMultiply, timeoutMs: options.timeoutMs });
+        const configured = store.value.adapters.find(item => item.adapter === adapter.adapter && item.frontend === adapter.frontend);
+        const result = await manager.dvbPool.scan(configured || adapter, { networkScan: Boolean(options.networkScan), timeoutMultiply: options.timeoutMultiply, timeoutMs: options.timeoutMs, signal: controller.signal });
+        result.services = annotateDVBServices(result.services, adapter, store.value.streams, store.value.adapters);
         logger.info(id, `DVB scan found ${result.services.length} services`);
         return json(response, 200, result);
-      } finally { adapterScans.delete(id); }
+      } finally { adapterScans.delete(key); response.removeListener('close', cancel); }
     }
     if (request.method === 'PUT' && streamRoute) {
       const value = normalizeStream({ ...(await body(request)), id: streamRoute[1] });
       const saved = await manager.upsert(value); broadcast('config', { resource: 'stream', id: saved.id }); return json(response, 200, saved);
     }
     if (request.method === 'POST' && path === '/api/streams') {
-      const value = normalizeStream(await body(request));
+      const incoming = await body(request); const value = normalizeStream(incoming);
       if (manager.get(value.id)) return error(response, 409, 'Stream already exists');
+      if (incoming.scanImport) {
+        for (const input of value.inputs) {
+          let url; try { url = new URL(input.url); } catch { continue; }
+          if (url.protocol !== 'dvb:') continue;
+          const adapter = store.value.adapters.find(item => item.id === url.hostname);
+          const serviceId = Number(url.searchParams.get('service')) || Number(value.service?.serviceId || value.service?.id);
+          if (adapter && serviceId) {
+            const existing = existingDVBStreams(store.value.streams, adapter, serviceId, store.value.adapters);
+            if (existing.length) return error(response, 409, `Service already added as ${existing.map(item => item.name).join(', ')}`);
+          }
+        }
+      }
       const saved = await manager.upsert(value); broadcast('config', { resource: 'stream', id: saved.id }); return json(response, 201, saved);
     }
     if (request.method === 'POST' && path === '/api/streams/delete') {
@@ -220,15 +303,16 @@ const server = http.createServer(async (request, response) => {
     }
     error(response, 404, 'Not found');
   } catch (caught) {
-    logger.error('http', caught.message); error(response, caught instanceof SyntaxError ? 400 : 500, caught.message);
+    logger.error('http', caught.message); error(response, caught.statusCode || (caught instanceof SyntaxError ? 400 : 500), caught.message);
   }
 });
 
-const heartbeat = setInterval(() => broadcast('status', status()), 2000);
+const heartbeat = setInterval(async () => { await resources.sample(); broadcast('status', status()); }, 2000);
+const epgMaintenance = setInterval(() => manager.maintainEPG(), 60000); epgMaintenance.unref();
 server.listen(store.value.server.port, store.value.server.host, () => logger.info('system', `Listening on ${store.value.server.host}:${store.value.server.port}`));
 
 function shutdown() {
-  clearInterval(heartbeat); manager.stop(); for (const client of sseClients) client.end();
+  clearInterval(heartbeat); clearInterval(epgMaintenance); manager.stop(); for (const client of sseClients) client.end();
   server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 5000).unref();
 }
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);

@@ -23,5 +23,10 @@ export class RelaySessions extends EventEmitter {
     for (const record of this.entries.values()) if (record.response.destroyed || record.response.writableEnded || record.socket.destroyed) record.cleanup();
     return [...this.entries.values()].map(({ entry, startedAt }) => ({ ...entry, uptimeSeconds: Math.max(0, Math.floor((this.now() - startedAt) / 1000)) }));
   }
+  disconnectWhere(predicate) {
+    let count = 0;
+    for (const record of this.entries.values()) if (predicate(record.entry)) { record.cleanup(); record.response.destroy(); count++; }
+    return count;
+  }
   get size() { return this.entries.size; }
 }

@@ -27,12 +27,20 @@ elif ! git -C "$source_dir" apply --reverse --check "$patch_file"; then
   echo "Cannot apply the required tsdecrypt EMM PID fix." >&2
   exit 1
 fi
+protection_patch="$(cd "$(dirname "$0")" && pwd)/patches/tsdecrypt-ecm-protection.patch"
+if git -C "$source_dir" apply --check "$protection_patch"; then
+  git -C "$source_dir" apply "$protection_patch"
+elif ! git -C "$source_dir" apply --reverse --check "$protection_patch"; then
+  echo "Cannot apply the required tsdecrypt ECM protection patch." >&2
+  exit 1
+fi
 make -C "$source_dir" clean all
 install -o root -g root -m 0755 "$source_dir/tsdecrypt" /usr/local/bin/tsdecrypt
 install -d -o root -g root -m 0755 /usr/local/share/licenses/tsdecrypt
 install -o root -g root -m 0644 "$source_dir/COPYING" /usr/local/share/licenses/tsdecrypt/COPYING
 /usr/local/bin/tsdecrypt --version
 install -o root -g root -m 0644 "$patch_file" /usr/local/share/licenses/tsdecrypt/astra-emm-pid.patch
+install -o root -g root -m 0644 "$protection_patch" /usr/local/share/licenses/tsdecrypt/astra-ecm-protection.patch
 
 if [[ ! -d "$oscam_source_dir/.git" ]]; then
   git clone https://git.streamboard.tv/common/oscam.git "$oscam_source_dir"

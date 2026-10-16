@@ -12,6 +12,7 @@
     "logLimit": 1000
   },
   "adapters": [],
+  "access": { "streamingAllowedIPs": [], "epgAllowedIPs": [] },
   "casProfiles": [],
   "streams": [
     {

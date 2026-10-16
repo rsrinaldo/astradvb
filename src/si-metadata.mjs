@@ -1,13 +1,6 @@
 import { decodeDVBText } from './dvb-text.mjs';
-
-export function mpegCRC32(bytes) {
-  let crc = 0xffffffff;
-  for (const byte of bytes) {
-    crc ^= byte << 24;
-    for (let bit = 0; bit < 8; bit++) crc = (crc & 0x80000000) ? ((crc << 1) ^ 0x04c11db7) >>> 0 : (crc << 1) >>> 0;
-  }
-  return crc >>> 0;
-}
+import { mpegCRC32 } from './mpeg-crc.mjs';
+export { mpegCRC32 } from './mpeg-crc.mjs';
 
 function finishSection(header, body) {
   const section = Buffer.concat([header, body, Buffer.alloc(4)]);
@@ -23,7 +16,7 @@ function finishSection(header, body) {
 // Reassemble sections before changing them: UTF-8 can expand descriptor and
 // section sizes, so editing bytes in the original TS packets is not safe.
 export class SISectionAssembler {
-  constructor() { this.buffer = Buffer.alloc(0); this.cc = null; }
+  constructor({ acceptSection = null } = {}) { this.buffer = Buffer.alloc(0); this.cc = null; this.acceptSection = acceptSection; }
   reset() { this.buffer = Buffer.alloc(0); this.cc = null; }
   push(packet) {
     const control = (packet[3] >> 4) & 3;
@@ -61,7 +54,7 @@ export class SISectionAssembler {
       if (length < 8 || length > 4096) { this.buffer = Buffer.alloc(0); break; }
       if (this.buffer.length < length) break;
       const section = this.buffer.subarray(0, length);
-      if (mpegCRC32(section) === 0) sections.push(section);
+      if ((!this.acceptSection || this.acceptSection(section)) && mpegCRC32(section) === 0) sections.push(section);
       this.buffer = this.buffer.subarray(length);
     }
     return sections;
@@ -159,6 +152,14 @@ export class StreamMetadata {
     return Buffer.concat(packets);
   }
   push(chunk) {
+    // Most media chunks contain no SI at all. Pass those immutable bytes on
+    // without allocating one Buffer view per packet and copying them again.
+    let hasSI = false;
+    for (let offset = 0; offset + 188 <= chunk.length; offset += 188) {
+      const pid = ((chunk[offset + 1] & 31) << 8) | chunk[offset + 2];
+      if (this.assemblers.has(pid)) { hasSI = true; break; }
+    }
+    if (!hasSI) return chunk.length % 188 ? chunk.subarray(0, chunk.length - (chunk.length % 188)) : chunk;
     const output = [];
     for (let offset = 0; offset + 188 <= chunk.length; offset += 188) {
       const packet = chunk.subarray(offset, offset + 188);

@@ -25,3 +25,12 @@ test('prunes destroyed sockets even if a close notification was missed', () => {
   const sessions = new RelaySessions(); const c = client(); sessions.track(c.request, c.response, 'channel');
   c.socket.destroyed = true; assert.deepEqual(sessions.list(), []); assert.equal(sessions.size, 0);
 });
+
+test('disconnects newly blocked relay sessions without touching allowed clients', () => {
+  const sessions = new RelaySessions(); const a = client(); const b = client(); let destroyed = false;
+  a.socket.remoteAddress = '192.0.2.1'; b.socket.remoteAddress = '198.51.100.1';
+  a.response.destroy = () => { destroyed = true; }; b.response.destroy = () => { throw Error('Allowed client was disconnected'); };
+  sessions.track(a.request, a.response, 'one'); sessions.track(b.request, b.response, 'two');
+  assert.equal(sessions.disconnectWhere(entry => entry.ip === '192.0.2.1'), 1);
+  assert.equal(destroyed, true); assert.equal(sessions.list().length, 1); assert.equal(sessions.list()[0].streamId, 'two');
+});

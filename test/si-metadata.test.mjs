@@ -39,6 +39,14 @@ function read(data, pid) {
 }
 function packets(pid, bytes) { return new StreamMetadata('Packetizer').packets(pid, bytes); }
 
+test('media-only metadata fast path preserves exact bytes without per-packet copies', () => {
+  const metadata=new StreamMetadata('Selected',100);
+  const media=Buffer.alloc(188*7,0xaa);
+  for(let i=0;i<7;i++)media.set([0x47,0x01,0x00,0x10|(i&15)],188*i);
+  assert.equal(metadata.push(media),media);
+  assert.deepEqual(metadata.push(Buffer.concat([media,Buffer.from([1,2,3])])),media);
+});
+
 test('selects one SDT service, uses the configured Unicode channel name, and preserves A/V bytes', () => {
   const metadata = new StreamMetadata('Shqipëri Ç', 100);
   const video = Buffer.alloc(188, 0xaa); video.set([0x47, 0x01, 0, 0x10]);

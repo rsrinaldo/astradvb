@@ -29,19 +29,19 @@ export class MPEGTSAnalyzer {
         offset = next;
         continue;
       }
-      this.#packet(this.buffer.subarray(offset, offset + PACKET_SIZE));
+      this.#packet(this.buffer, offset);
       offset += PACKET_SIZE;
     }
     this.buffer = this.buffer.subarray(offset);
   }
 
-  #packet(packet) {
+  #packet(packet, offset) {
     this.packets += 1;
-    const payloadStart = Boolean(packet[1] & 0x40);
-    const pid = ((packet[1] & 0x1f) << 8) | packet[2];
-    const scrambling = (packet[3] >> 6) & 0x03;
-    const adaptation = (packet[3] >> 4) & 0x03;
-    const cc = packet[3] & 0x0f;
+    const payloadStart = Boolean(packet[offset + 1] & 0x40);
+    const pid = ((packet[offset + 1] & 0x1f) << 8) | packet[offset + 2];
+    const scrambling = (packet[offset + 3] >> 6) & 0x03;
+    const adaptation = (packet[offset + 3] >> 4) & 0x03;
+    const cc = packet[offset + 3] & 0x0f;
     const hasPayload = adaptation === 1 || adaptation === 3;
     const stat = this.pidStats.get(pid) || { packets: 0, continuityErrors: 0, lastCC: null };
     stat.packets += 1;

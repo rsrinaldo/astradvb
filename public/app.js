@@ -1,10 +1,14 @@
 const state = { status: null, streams: [], adapters: [], sessions: [], logs: [], config: null, query: '', selectedStreams: new Set(), editing: null, editingProfile: null, editingAdapter: null, editingAdapterDeviceId: null, scanningAdapter: null, scanServices: [], cardCapabilities: {}, loadingCards: new Set() };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
+let administrator = null;
+let events = null;
 
 async function api(path, options = {}) {
   const headers = { ...(options.body ? { 'content-type': 'application/json' } : {}), ...(options.headers || {}) };
+  if (options.method && !['GET', 'HEAD'].includes(options.method.toUpperCase()) && administrator) headers['x-csrf-token'] = administrator.csrfToken;
   const response = await fetch(path, { ...options, headers });
+  if (response.status === 401) { events?.close(); location.replace('/login'); throw new Error('Your management session has expired. Sign in again.'); }
   const value = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(value.error || `Request failed: ${response.status}`);
   return value;
@@ -34,16 +38,22 @@ function render() {
   $('#engine-status').textContent = status.engine === 'online' ? 'Engine online' : 'Engine offline';
   $('#engine-detail').textContent = `Uptime ${duration(status.uptimeSeconds)} · v${status.version || '?'}`;
   for (const [id, path] of [['playlist-url', '/playlist.m3u'], ['epg-xml-url', '/epg.xml'], ['epg-json-url', '/api/epg']]) { const link = $(`#${id}`); link.href = path; link.textContent = `${location.origin}${path}`; }
+  const epg = status.epg;
+  $('#epg-freshness').textContent = epg?.lastReceivedAt ? `Live EPG · ${number(epg.channelsWithEPG)}/${number(status.streams?.total)} channels with programmes · last broadcast data ${new Date(epg.lastReceivedAt).toLocaleTimeString()} · exports are live; refresh your receiving system every 60 seconds` : 'Waiting for broadcast EPG · exports are live; refresh your receiving system every 60 seconds';
   const bitrate = state.streams.reduce((sum, stream) => sum + (stream.bitrateKbps || 0), 0);
   const running = state.streams.filter((stream) => stream.state === 'running').length;
   const scrambled = state.streams.filter((stream) => stream.state === 'scrambled').length;
   const cards = groupAdapterCards();
+  const cpu = status.resources?.cpu;
+  const ram = status.resources?.memory;
   $('#metrics').innerHTML = [
     ['●', 'Running streams', `${running}/${state.streams.length}`, `${scrambled} scrambled · ${status.streams?.warning || 0} need attention`],
     ['⌁', 'Aggregate bitrate', `${(bitrate / 1000).toFixed(1)} Mb/s`, 'Measured MPEG-TS payload'],
     ['◉', 'DVB hardware', `${cards.length} cards`, `${state.adapters.length} tuners available`],
     ['♙', 'HTTP sessions', `${status.sessions || 0}`, 'Connected relay clients'],
-  ].map(([icon, label, value, detail]) => `<article class="metric"><span class="metric-icon">${icon}</span><div><label>${label}</label><strong>${value}</strong><small>${detail}</small></div></article>`).join('');
+    ['◴', 'Server CPU', percent(cpu?.usagePercent), cpu?.cores ? `Across ${number(cpu.cores)} logical CPUs` : 'Waiting for a CPU sample', cpu?.usagePercent],
+    ['▤', 'Server RAM', percent(ram?.usagePercent), Number.isFinite(ram?.usedBytes) && Number.isFinite(ram?.totalBytes) ? `${(ram.usedBytes / 1073741824).toFixed(1)} / ${(ram.totalBytes / 1073741824).toFixed(1)} GiB used` : 'Memory usage unavailable', ram?.usagePercent],
+  ].map(([icon, label, value, detail, usage]) => `<article class="metric"><span class="metric-icon">${icon}</span><div><label>${label}</label><strong>${value}</strong><small>${detail}</small>${Number.isFinite(usage) ? `<progress class="resource-meter${usage >= 90 ? ' critical' : usage >= 75 ? ' elevated' : ''}" max="100" value="${Math.min(100, Math.max(0, usage))}" aria-label="${label} usage"></progress>` : ''}</div></article>`).join('');
   renderAdapters(); renderStreams(); renderSessions(); renderLogs();
 }
 
@@ -142,6 +152,8 @@ function fillSettings() {
   if (!state.config) return;
   const form = $('#settings-form');
   for (const [key, value] of Object.entries(state.config.settings || {})) if (form.elements[key]) form.elements[key].value = value;
+  const access = $('#access-form');
+  for (const key of ['streamingAllowedIPs', 'epgAllowedIPs']) access.elements[key].value = (state.config.access?.[key] || []).join('\n');
   renderCASProfiles();
 }
 
@@ -214,7 +226,7 @@ function openAdapterScan() {
   const profiles = (state.config?.casProfiles || []).filter((profile) => profile.configured);
   $('#scan-cam-profile').innerHTML = ['<option value="">None — keep encrypted services scrambled</option>', ...profiles.map((profile) => `<option value="${escapeHTML(profile.id)}">${escapeHTML(profile.name)} (${escapeHTML(profile.id)})</option>`)].join('');
   $('#adapter-dialog').close(); $('#scan-dialog-title').textContent = `Scan ${state.editingAdapter}`;
-  $('#scan-status').textContent = 'The saved tuner settings are used as the initial transponder.';
+  $('#scan-status').textContent = 'Current-transponder scans reuse the live tuner without interrupting streams. NIT network scans require an idle tuner.';
   $('#scan-service-rows').innerHTML = '<tr><td colspan="5" class="muted">No scan results yet.</td></tr>';
   $('#create-scanned-streams').classList.add('hidden'); $('#select-all-services').checked = false;
   $('#scan-dialog').showModal();
@@ -225,17 +237,30 @@ async function scanAdapter(event) {
   const button = $('#start-scan'); const networkScan = event.currentTarget.elements.networkScan.checked;
   button.disabled = true; button.textContent = 'Scanning…'; $('#scan-status').textContent = 'Tuning and reading PAT/PMT/SDT tables. Keep this window open…';
   try {
-    const result = await api(`/api/adapters/${encodeURIComponent(state.scanningAdapter)}/scan`, { method: 'POST', body: JSON.stringify({ networkScan, timeoutMultiply: 2, timeoutMs: networkScan ? 240000 : 90000 }) });
+    const result = await api(`/api/adapters/${encodeURIComponent(state.scanningAdapter)}/scan`, { method: 'POST', body: JSON.stringify({ networkScan, timeoutMultiply: 2, timeoutMs: networkScan ? 240000 : 15000 }) });
     state.scanServices = result.services || [];
-    $('#scan-status').textContent = `Found ${state.scanServices.length} services.`;
-    $('#scan-service-rows').innerHTML = state.scanServices.map((service, index) => `<tr><td><input type="checkbox" data-scan-service="${index}" checked /></td><td><strong>${escapeHTML(service.name)}</strong></td><td>${number(service.serviceId)}</td><td>${escapeHTML((service.videoPids || []).join(', ') || '—')}</td><td>${escapeHTML((service.audioPids || []).join(', ') || '—')}</td></tr>`).join('');
-    $('#select-all-services').checked = true; $('#create-scanned-streams').classList.remove('hidden');
+    const added = state.scanServices.filter(service => service.alreadyAdded).length;
+    $('#scan-status').textContent = `Found ${state.scanServices.length} services: ${added} already added, ${state.scanServices.length - added} new.${result.source === 'live' ? ' Read from the current multiplex without retuning.' : ''}${result.complete === false ? ' Some service information is incomplete; you can scan again.' : ''}`;
+    renderScanServices(); $('#create-scanned-streams').classList.remove('hidden');
   } catch (error) { $('#scan-status').textContent = error.message; toast(error.message, true); }
   finally { button.disabled = false; button.textContent = 'Start scan'; }
 }
 
+function renderScanServices() {
+  $('#scan-service-rows').innerHTML = state.scanServices.map((service, index) => `<tr class="${service.alreadyAdded ? 'scan-service-existing' : ''}"><td><input type="checkbox" aria-label="Add ${escapeHTML(service.name)}" data-scan-service="${index}"${service.alreadyAdded ? ' disabled' : ' checked'} /></td><td><strong>${escapeHTML(service.name)}</strong>${service.alreadyAdded ? `<small class="scan-existing">Already added${service.existingStreams?.length ? ` as ${escapeHTML(service.existingStreams.map(item => item.name).join(', '))}` : ''}</small>` : ''}</td><td>${number(service.serviceId)}</td><td>${escapeHTML((service.videoPids || []).join(', ') || '—')}</td><td>${escapeHTML((service.audioPids || []).join(', ') || '—')}</td></tr>`).join('');
+  updateScanSelection();
+}
+
+function updateScanSelection() {
+  const eligible = $$('[data-scan-service]:not(:disabled)'); const selected = eligible.filter(item => item.checked).length;
+  $('#select-all-services').disabled = eligible.length === 0;
+  $('#select-all-services').checked = eligible.length > 0 && selected === eligible.length;
+  $('#select-all-services').indeterminate = selected > 0 && selected < eligible.length;
+  $('#create-scanned-streams').disabled = selected === 0;
+}
+
 async function createScannedStreams() {
-  const selected = $$('[data-scan-service]:checked').map((checkbox) => state.scanServices[Number(checkbox.dataset.scanService)]).filter(Boolean);
+  const selected = $$('[data-scan-service]:checked:not(:disabled)').map((checkbox) => state.scanServices[Number(checkbox.dataset.scanService)]).filter(service => service && !service.alreadyAdded);
   if (!selected.length) return toast('Select at least one service', true);
   const camProfile = $('#scan-cam-profile').value;
   const button = $('#create-scanned-streams'); button.disabled = true; button.textContent = 'Creating…';
@@ -243,12 +268,14 @@ async function createScannedStreams() {
   for (const service of selected) {
     const id = `${state.scanningAdapter}-${service.serviceId}`.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64);
     try {
-      await api('/api/streams', { method: 'POST', body: JSON.stringify({ id, name: service.name || `Service ${service.serviceId}`, enabled: true, inputs: [{ url: service.inputUrl }], outputs: [], http: true, hls: true, hlsCompatibility: false, onDemand: false, service: { serviceId: service.serviceId }, cam: { enabled: Boolean(camProfile), profile: camProfile || 'default' } }) });
+      await api('/api/streams', { method: 'POST', body: JSON.stringify({ id, name: service.name || `Service ${service.serviceId}`, enabled: true, inputs: [{ url: service.inputUrl }], outputs: [], http: true, hls: true, hlsCompatibility: false, onDemand: false, service: { serviceId: service.serviceId, transportStreamId: service.transportStreamId, originalNetworkId: service.originalNetworkId }, cam: { enabled: Boolean(camProfile), profile: camProfile || 'default' }, scanImport: true }) });
+      service.alreadyAdded = true; service.existingStreams = [{ id, name: service.name }];
       created += 1;
     } catch (error) { failed.push(`${service.name}: ${error.message}`); }
   }
   button.disabled = false; button.textContent = 'Create selected streams';
   state.config = null; await refresh();
+  renderScanServices();
   if (failed.length) { $('#scan-status').textContent = `Created ${created}; ${failed.length} failed: ${failed.join('; ')}`; toast(`Created ${created} streams; ${failed.length} failed`, true); }
   else { $('#scan-dialog').close(); toast(`Created ${created} DVB streams${camProfile ? ' with Newcamd' : ''}`); }
 }
@@ -305,7 +332,8 @@ async function saveStream(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const id = state.editing || form.elements.id.value.trim();
-  const value = { id, name: form.elements.name.value.trim(), enabled: form.elements.enabled.checked, inputs: lines(form.elements.inputs.value).map((url) => ({ url })), outputs: lines(form.elements.outputs.value).map((url) => ({ url })), http: form.elements.http.checked, hls: form.elements.hls.checked, hlsCompatibility: form.elements.hlsCompatibility.checked, onDemand: form.elements.onDemand.checked, keepActiveSeconds: Number(form.elements.keepActiveSeconds.value) || 0, cam: { enabled: form.elements.camEnabled.checked, profile: form.elements.camProfile.value.trim() || 'default' } };
+  const previous = state.config?.streams.find(stream => stream.id === state.editing) || {};
+  const value = { ...previous, id, name: form.elements.name.value.trim(), enabled: form.elements.enabled.checked, inputs: lines(form.elements.inputs.value).map((url) => ({ url })), outputs: lines(form.elements.outputs.value).map((url) => ({ url })), http: form.elements.http.checked, hls: form.elements.hls.checked, hlsCompatibility: form.elements.hlsCompatibility.checked, onDemand: form.elements.onDemand.checked, keepActiveSeconds: Number(form.elements.keepActiveSeconds.value) || 0, cam: { enabled: form.elements.camEnabled.checked, profile: form.elements.camProfile.value.trim() || 'default' } };
   try {
     await api(state.editing ? `/api/streams/${encodeURIComponent(id)}` : '/api/streams', { method: state.editing ? 'PUT' : 'POST', body: JSON.stringify(value) });
     $('#stream-dialog').close(); state.config = null; await refresh(); toast(`${value.name} saved`);
@@ -334,6 +362,7 @@ function toast(message, failed = false) { const node = $('#toast'); node.textCon
 function streamName(id) { return state.streams.find((stream) => stream.id === id)?.name || id; }
 function lines(value) { return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean); }
 function number(value) { return Number.isFinite(Number(value)) ? Number(value) : 0; }
+function percent(value) { return Number.isFinite(value) ? `${value.toFixed(1)}%` : '—'; }
 function duration(seconds) { seconds = Math.max(0, Math.floor(number(seconds))); const days = Math.floor(seconds / 86400); const clock = [Math.floor(seconds % 86400 / 3600), Math.floor(seconds % 3600 / 60), seconds % 60].map((part) => String(part).padStart(2, '0')).join(':'); return `${days ? `${days}d ` : ''}${clock}`; }
 function escapeHTML(value) { return String(value ?? '').replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]); }
 
@@ -363,7 +392,8 @@ $('#use-adapter-stream').addEventListener('click', useAdapterInStream);
 $('#scan-adapter').addEventListener('click', openAdapterScan);
 $('#scan-form').addEventListener('submit', scanAdapter);
 $('#create-scanned-streams').addEventListener('click', createScannedStreams);
-$('#select-all-services').addEventListener('change', (event) => $$('[data-scan-service]').forEach((checkbox) => { checkbox.checked = event.target.checked; }));
+$('#select-all-services').addEventListener('change', (event) => { $$('[data-scan-service]:not(:disabled)').forEach((checkbox) => { checkbox.checked = event.target.checked; }); updateScanSelection(); });
+$('#scan-service-rows').addEventListener('change', updateScanSelection);
 $('#adapter-form').elements.device.addEventListener('change', (event) => {
   const [adapter, frontend] = event.target.value.split(':').map(Number); const id = `adapter${adapter}-frontend${frontend}`;
   state.editingAdapterDeviceId = id; $('#adapter-form').elements.id.value = id; $('#adapter-form').elements.inputUrl.value = `dvb://${id}`;
@@ -383,6 +413,48 @@ $('#export-form').addEventListener('submit', (event) => {
   $('#export-dialog').close();
 });
 
-refresh(); setInterval(refresh, 3000);
-const events = new EventSource('/api/events'); events.addEventListener('status', (event) => { state.status = JSON.parse(event.data); render(); }); events.addEventListener('log', (event) => { state.logs.unshift(JSON.parse(event.data)); state.logs = state.logs.slice(0, 100); renderLogs(); });
-events.addEventListener('sessions', (event) => { state.sessions = JSON.parse(event.data).sessions; if (state.status) state.status.sessions = state.sessions.length; render(); });
+function showAdministrator() {
+  $('#admin-username').textContent = administrator.username;
+  $('#password-message').textContent = administrator.mustChangePassword ? 'Change the initial password before modifying server settings.' : 'Changing your password signs out other management sessions. Playback is unaffected.';
+  $('#management-transport-warning').hidden = location.protocol === 'https:';
+  $('#access-client-ip').textContent = administrator.clientIP ? `Your IP as seen by the server: ${administrator.clientIP}` : 'Use the client IP as seen by this server.';
+}
+$('#logout').addEventListener('click', async () => {
+  try { await api('/api/auth/logout', { method: 'POST', body: '{}' }); events?.close(); location.replace('/login'); }
+  catch (error) { toast(error.message, true); }
+});
+$('#password-form').addEventListener('submit', async (event) => {
+  event.preventDefault(); const form = event.currentTarget; const button = form.querySelector('button[type="submit"]');
+  if (form.elements.newPassword.value !== form.elements.confirmPassword.value) { toast('The new passwords do not match', true); return; }
+  button.disabled = true;
+  try {
+    administrator = { ...await api('/api/auth/password', { method: 'POST', body: JSON.stringify({ currentPassword: form.elements.currentPassword.value, newPassword: form.elements.newPassword.value }) }), clientIP: administrator.clientIP };
+    form.reset(); showAdministrator(); connectEvents(); toast('Password changed. Other management sessions have been signed out.');
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+});
+$('#access-form').addEventListener('submit', async (event) => {
+  event.preventDefault(); const form = event.currentTarget; const button = form.querySelector('button[type="submit"]'); button.disabled = true;
+  try {
+    const value = await api('/api/access', { method: 'PUT', body: JSON.stringify({ streamingAllowedIPs: form.elements.streamingAllowedIPs.value, epgAllowedIPs: form.elements.epgAllowedIPs.value }) });
+    if (state.config) state.config.access = value;
+    for (const key of ['streamingAllowedIPs', 'epgAllowedIPs']) form.elements[key].value = value[key].join('\n');
+    toast(`Access restrictions saved${value.disconnectedSessions ? `; ${value.disconnectedSessions} relay sessions disconnected` : ''}`);
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+});
+function connectEvents() {
+  events?.close(); events = new EventSource('/api/events');
+  events.addEventListener('status', (event) => { state.status = JSON.parse(event.data); render(); });
+  events.addEventListener('log', (event) => { state.logs.unshift(JSON.parse(event.data)); state.logs = state.logs.slice(0, 100); renderLogs(); });
+  events.addEventListener('sessions', (event) => { state.sessions = JSON.parse(event.data).sessions; if (state.status) state.status.sessions = state.sessions.length; render(); });
+}
+async function initialize() {
+  try {
+    administrator = await api('/api/auth/session'); showAdministrator();
+    if (administrator.mustChangePassword) document.querySelector('[data-view="settings"]').click();
+    await refresh(); setInterval(refresh, 3000);
+    connectEvents();
+  } catch (error) { toast(error.message, true); }
+}
+initialize();

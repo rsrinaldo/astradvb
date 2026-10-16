@@ -1,4 +1,5 @@
 import { decodeDVBText as text } from './dvb-text.mjs';
+import { SISectionAssembler } from './si-metadata.mjs';
 
 const EIT_PID = 0x12;
 const MJD_EPOCH = Date.UTC(1858, 10, 17);
@@ -13,43 +14,24 @@ function dvbTime(buffer) {
 }
 
 export class EPGCollector {
-  constructor() { this.buffer = Buffer.alloc(0); this.events = new Map(); }
+  constructor({ serviceId = 0, now = Date.now, maxEvents = 4096, pastHours = 6, futureDays = 14 } = {}) {
+    this.events = new Map(); this.serviceId = Number(serviceId); this.now = now;
+    this.maxEvents = maxEvents; this.pastMs = pastHours * 3600000; this.futureMs = futureDays * 86400000;
+    this.lastReceivedAt = 0; this.updatedAt = 0; this.nextPruneAt = 0;
+    this.sections = new SISectionAssembler({ acceptSection: section => section.length >= 18 && section[0] >= 0x4e && section[0] <= 0x6f && Boolean(section[5] & 1) && (!this.serviceId || section.readUInt16BE(3) === this.serviceId) });
+  }
 
   push(data) {
-    for (let offset = 0; offset + 188 <= data.length; offset += 188) this.#packet(data.subarray(offset, offset + 188));
-  }
-
-  #packet(packet) {
-    if (packet[0] !== 0x47 || (((packet[1] & 0x1f) << 8) | packet[2]) !== EIT_PID) return;
-    const payloadStart = Boolean(packet[1] & 0x40);
-    const adaptation = (packet[3] >> 4) & 0x03;
-    if (adaptation === 0 || adaptation === 2) return;
-    let offset = 4;
-    if (adaptation === 3) offset += 1 + packet[offset];
-    if (offset >= 188) return;
-    if (payloadStart) {
-      const pointer = packet[offset]; offset += 1;
-      if (pointer && this.buffer.length) this.buffer = Buffer.concat([this.buffer, packet.subarray(offset, Math.min(188, offset + pointer))]);
-      this.#sections();
-      offset += pointer;
-      this.buffer = Buffer.alloc(0);
+    for (let offset = 0; offset + 188 <= data.length; offset += 188) {
+      if (data[offset] !== 0x47 || (((data[offset + 1] & 0x1f) << 8) | data[offset + 2]) !== EIT_PID) continue;
+      for (const section of this.sections.push(data.subarray(offset, offset + 188))) this.#section(section);
     }
-    if (offset < 188) { this.buffer = Buffer.concat([this.buffer, packet.subarray(offset)]); this.#sections(); }
-  }
-
-  #sections() {
-    while (this.buffer.length >= 3) {
-      if (this.buffer[0] === 0xff) { this.buffer = Buffer.alloc(0); return; }
-      const length = 3 + (((this.buffer[1] & 0x0f) << 8) | this.buffer[2]);
-      if (length < 18 || length > 4096) { this.buffer = this.buffer.subarray(1); continue; }
-      if (this.buffer.length < length) return;
-      this.#section(this.buffer.subarray(0, length));
-      this.buffer = this.buffer.subarray(length);
-    }
+    if (this.now() >= this.nextPruneAt) this.prune();
   }
 
   #section(section) {
     if (section[0] < 0x4e || section[0] > 0x6f) return;
+    const now = this.now(); this.lastReceivedAt = now;
     const serviceId = section.readUInt16BE(3);
     for (let offset = 14; offset + 12 <= section.length - 4;) {
       const eventId = section.readUInt16BE(offset);
@@ -80,28 +62,46 @@ export class EPGCollector {
       if (extended) description = [description, extended].filter(Boolean).join('\n');
       if (start) {
         const stop = new Date(start.getTime() + durationSeconds * 1000);
-        this.events.set(`${serviceId}:${eventId}:${start.toISOString()}`, { serviceId, eventId, start: start.toISOString(), stop: stop.toISOString(), title, description });
+        if (start.getTime() <= now + this.futureMs && stop.getTime() >= now - this.pastMs && Number.isFinite(stop.getTime())) {
+          const key = `${serviceId}:${eventId}:${start.toISOString()}`;
+          const event = { serviceId, eventId, start: start.toISOString(), stop: stop.toISOString(), title, description };
+          const previous = this.events.get(key);
+          if (!previous || previous.stop !== event.stop || previous.title !== title || previous.description !== description) { this.events.set(key, event); this.updatedAt = now; }
+          if (this.events.size > this.maxEvents) this.prune();
+        }
       }
       offset = end;
     }
   }
 
+  prune() {
+    const now = this.now(); const oldest = now - this.pastMs; const latest = now + this.futureMs; const before = this.events.size;
+    for (const [key, event] of this.events) { const stop = Date.parse(event.stop); const start = Date.parse(event.start); if (!Number.isFinite(stop) || !Number.isFinite(start) || stop < oldest || start > latest) this.events.delete(key); }
+    if (this.events.size > this.maxEvents) {
+      const sorted = [...this.events].sort((a, b) => a[1].start.localeCompare(b[1].start));
+      for (const [key] of sorted.slice(this.maxEvents)) this.events.delete(key);
+    }
+    if (this.events.size !== before) this.updatedAt = now;
+    this.nextPruneAt = now + 60000;
+  }
+
   snapshot(serviceId = null) {
-    const oldest = Date.now() - 6 * 3600000;
-    for (const [key, event] of this.events) if (new Date(event.stop).getTime() < oldest) this.events.delete(key);
+    this.prune();
     return [...this.events.values()].filter((event) => !serviceId || event.serviceId === Number(serviceId)).sort((a, b) => a.start.localeCompare(b.start));
   }
 }
 
 export function epgDocument(workers) {
   const channels = []; const programmes = [];
+  let updatedAt = 0; let lastReceivedAt = 0;
   for (const worker of workers) {
     const stream = worker.config; if (!stream.enabled) continue;
     const serviceId = stream.service?.id ?? stream.service?.serviceId ?? null;
     channels.push({ id: stream.id, name: stream.name, serviceId });
     for (const event of worker.epg.snapshot(serviceId)) programmes.push({ channel: stream.id, ...event });
+    updatedAt = Math.max(updatedAt, worker.epg.updatedAt || 0); lastReceivedAt = Math.max(lastReceivedAt, worker.epg.lastReceivedAt || 0);
   }
-  return { generatedAt: new Date().toISOString(), channels, programmes };
+  return { generatedAt: new Date().toISOString(), updatedAt: updatedAt ? new Date(updatedAt).toISOString() : null, lastReceivedAt: lastReceivedAt ? new Date(lastReceivedAt).toISOString() : null, recommendedRefreshSeconds: 60, channels, programmes };
 }
 
 function xmltvDate(value) { return new Date(value).toISOString().replace(/[-:]/g, '').replace('.000Z', ' +0000').replace('T', ''); }

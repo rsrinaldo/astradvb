@@ -1,0 +1,16 @@
+# Local runtime state, credentials and generated native binaries.
+/data/
+/.env*
+/config.json
+/**/admin-auth.json
+/**/initial-admin-password
+/**/oscam.conf
+/**/oscam.server
+/**/oscam.user
+/bin/*.so
+/test/native-dvb-buffer
+/test/native-dvb-buffer-abi
+/node_modules/
+/coverage/
+*.log
+*.pid
