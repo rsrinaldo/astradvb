@@ -306,6 +306,7 @@ ip maddr
 Common causes:
 
 - **Dashboard opens but cannot save:** sign in again if your session expired, change the initial password if prompted, and inspect browser errors and service logs. API mutations require a valid session cookie and `X-CSRF-Token`.
+- **Flussonic HLS works but sessions show zero:** upgrade to v0.8.37 or newer. Earlier versions counted only MPEG-TS relay connections. HLS now counts completed segment downloads grouped by stream, source IP and player identity, with uptime and automatic idle expiration (at least 30 seconds). Manifest probes do not count. Flussonic's downstream viewers cannot be counted at this origin server.
 - **HTTP URL returns 404:** enable HTTP MPEG-TS for that stream and check the stream ID.
 - **HTTP connection opens but no video arrives:** inspect input state, bitrate, continuity errors, and service logs.
 - **Multicast input is idle:** confirm the multicast group reaches the correct NIC and Linux has a route for it.

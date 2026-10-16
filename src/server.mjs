@@ -225,7 +225,10 @@ const server = http.createServer(async (request, response) => {
     }
     const segment = path.match(/^\/hls\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9-]+)\.ts$/);
     if (request.method === 'GET' && segment) {
-      const data = resolveWorker(segment[1])?.hls.get(segment[2]); if (!data) return error(response, 404, 'Segment not found');
+      const worker = resolveWorker(segment[1]);
+      const data = worker?.config.hls && worker.hls.get(segment[2]); if (!data) return error(response, 404, 'Segment not found');
+      const segmentSeconds = Math.max(worker.hls.segmentMs / 1000, ...worker.hls.segments.map(item => item.duration));
+      sessions.trackHLS(request, response, worker.config.id, { segmentSeconds });
       response.writeHead(200, { 'content-type': 'video/mp2t', 'content-length': data.length, 'cache-control': 'private, no-store' }); response.end(data); return;
     }
 
@@ -307,7 +310,7 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-const heartbeat = setInterval(async () => { await resources.sample(); broadcast('status', status()); }, 2000);
+const heartbeat = setInterval(async () => { sessions.prune(); await resources.sample(); broadcast('status', status()); }, 2000);
 const epgMaintenance = setInterval(() => manager.maintainEPG(), 60000); epgMaintenance.unref();
 server.listen(store.value.server.port, store.value.server.host, () => logger.info('system', `Listening on ${store.value.server.host}:${store.value.server.port}`));
 

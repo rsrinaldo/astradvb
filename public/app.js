@@ -50,7 +50,7 @@ function render() {
     ['●', 'Running streams', `${running}/${state.streams.length}`, `${scrambled} scrambled · ${status.streams?.warning || 0} need attention`],
     ['⌁', 'Aggregate bitrate', `${(bitrate / 1000).toFixed(1)} Mb/s`, 'Measured MPEG-TS payload'],
     ['◉', 'DVB hardware', `${cards.length} cards`, `${state.adapters.length} tuners available`],
-    ['♙', 'HTTP sessions', `${status.sessions || 0}`, 'Connected relay clients'],
+    ['♙', 'HTTP sessions', `${state.sessions.length}`, `${state.sessions.filter(session => session.protocol === 'hls').length} HLS · ${state.sessions.filter(session => session.protocol !== 'hls').length} MPEG-TS`],
     ['◴', 'Server CPU', percent(cpu?.usagePercent), cpu?.cores ? `Across ${number(cpu.cores)} logical CPUs` : 'Waiting for a CPU sample', cpu?.usagePercent],
     ['▤', 'Server RAM', percent(ram?.usagePercent), Number.isFinite(ram?.usedBytes) && Number.isFinite(ram?.totalBytes) ? `${(ram.usedBytes / 1073741824).toFixed(1)} / ${(ram.totalBytes / 1073741824).toFixed(1)} GiB used` : 'Memory usage unavailable', ram?.usagePercent],
   ].map(([icon, label, value, detail, usage]) => `<article class="metric"><span class="metric-icon">${icon}</span><div><label>${label}</label><strong>${value}</strong><small>${detail}</small>${Number.isFinite(usage) ? `<progress class="resource-meter${usage >= 90 ? ' critical' : usage >= 75 ? ' elevated' : ''}" max="100" value="${Math.min(100, Math.max(0, usage))}" aria-label="${label} usage"></progress>` : ''}</div></article>`).join('');
@@ -123,12 +123,14 @@ function loadCardSummaries(cards) {
 }
 
 function renderStreams() {
+  const hlsClients = new Map();
+  for (const session of state.sessions) if (session.protocol === 'hls') hlsClients.set(session.streamId, (hlsClients.get(session.streamId) || 0) + 1);
   const rank = { running: 0, scrambled: 1, starting: 2, connecting: 3, warning: 4, failover: 5, error: 6, stopped: 7 };
   const streams = state.streams
     .filter((stream) => `${stream.name} ${stream.id}`.toLowerCase().includes(state.query.toLowerCase()))
     .sort((a, b) => (rank[a.state] ?? 8) - (rank[b.state] ?? 8) || a.name.localeCompare(b.name, undefined, { numeric: true }));
   $('#stream-count').textContent = streams.length;
-  $('#streams').innerHTML = streams.length ? streams.map((stream) => `<article class="stream-card${state.selectedStreams.has(stream.id) ? ' selected' : ''}" data-stream="${escapeHTML(stream.id)}"><label class="stream-select" title="Select ${escapeHTML(stream.name)}"><input type="checkbox" aria-label="Select ${escapeHTML(stream.name)}" data-stream-select="${escapeHTML(stream.id)}"${state.selectedStreams.has(stream.id) ? ' checked' : ''} /><span>Select</span></label><button type="button" class="stream-main stream-edit" data-edit-stream="${escapeHTML(stream.id)}" aria-label="Edit ${escapeHTML(stream.name)}"><span class="stream-orb ${escapeHTML(stream.state)}">⌁</span><span class="stream-description"><strong>${escapeHTML(stream.name)}</strong><small>${stream.activeInput >= 0 ? `Input ${stream.activeInput + 1}` : 'No active input'} · ${stream.clients || 0} viewers</small></span></button><div class="stream-uptime" title="Continuous output uptime; resets after restart, failover, or an output interruption"><span>Uptime</span><time>${stream.startedAt ? duration(stream.uptimeSeconds) : '—'}</time></div><div class="stream-foot"><strong>${number(stream.bitrateKbps).toLocaleString()} <small>Kbit/s</small></strong><span class="state ${escapeHTML(stream.state)}">${escapeHTML(stream.state)}</span></div></article>`).join('') : '<div class="empty">No streams match the current view.</div>';
+  $('#streams').innerHTML = streams.length ? streams.map((stream) => `<article class="stream-card${state.selectedStreams.has(stream.id) ? ' selected' : ''}" data-stream="${escapeHTML(stream.id)}"><label class="stream-select" title="Select ${escapeHTML(stream.name)}"><input type="checkbox" aria-label="Select ${escapeHTML(stream.name)}" data-stream-select="${escapeHTML(stream.id)}"${state.selectedStreams.has(stream.id) ? ' checked' : ''} /><span>Select</span></label><button type="button" class="stream-main stream-edit" data-edit-stream="${escapeHTML(stream.id)}" aria-label="Edit ${escapeHTML(stream.name)}"><span class="stream-orb ${escapeHTML(stream.state)}">⌁</span><span class="stream-description"><strong>${escapeHTML(stream.name)}</strong><small>${stream.activeInput >= 0 ? `Input ${stream.activeInput + 1}` : 'No active input'} · ${(stream.clients || 0) + (hlsClients.get(stream.id) || 0)} clients</small></span></button><div class="stream-uptime" title="Continuous output uptime; resets after restart, failover, or an output interruption"><span>Uptime</span><time>${stream.startedAt ? duration(stream.uptimeSeconds) : '—'}</time></div><div class="stream-foot"><strong>${number(stream.bitrateKbps).toLocaleString()} <small>Kbit/s</small></strong><span class="state ${escapeHTML(stream.state)}">${escapeHTML(stream.state)}</span></div></article>`).join('') : '<div class="empty">No streams match the current view.</div>';
   const visibleIds = streams.map((stream) => stream.id);
   const selectedVisible = visibleIds.filter((id) => state.selectedStreams.has(id)).length;
   const selectAll = $('#select-all-streams');
@@ -140,8 +142,8 @@ function renderStreams() {
 }
 
 function renderSessions() {
-  $('#session-summary').textContent = `${state.sessions.length} active connections`;
-  $('#session-rows').innerHTML = state.sessions.length ? state.sessions.map((session) => `<tr><td>${escapeHTML(streamName(session.streamId))}</td><td><code>${escapeHTML(session.ip || '')}</code></td><td>${escapeHTML(new Date(session.connectedAt).toLocaleString())}</td><td class="session-uptime">${duration(Math.max(0, Math.floor((Date.now() - new Date(session.connectedAt).getTime()) / 1000)))}</td><td>${escapeHTML(session.userAgent || '—')}</td></tr>`).join('') : '<tr><td colspan="5" class="muted">No active HTTP relay sessions.</td></tr>';
+  $('#session-summary').textContent = `${state.sessions.length} active sessions`;
+  $('#session-rows').innerHTML = state.sessions.length ? state.sessions.map((session) => `<tr><td>${escapeHTML(streamName(session.streamId))}</td><td>${session.protocol === 'hls' ? 'HLS' : 'MPEG-TS'}</td><td><code>${escapeHTML(session.ip || '')}</code></td><td>${escapeHTML(new Date(session.connectedAt).toLocaleString())}</td><td class="session-uptime">${duration(Math.max(0, Math.floor((Date.now() - new Date(session.connectedAt).getTime()) / 1000)))}</td><td>${escapeHTML(session.userAgent || '—')}</td></tr>`).join('') : '<tr><td colspan="6" class="muted">No active HLS or MPEG-TS sessions.</td></tr>';
 }
 
 function renderLogs() {
