@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import test from 'node:test';
 import { RingLogger } from '../src/logger.mjs';
 import { StreamWorker } from '../src/stream-manager.mjs';
+import { PacketPool } from '../src/packet-pool.mjs';
 
 function packet(pid, cc) {
   const value = Buffer.alloc(188, 0xff);
@@ -11,18 +12,20 @@ function packet(pid, cc) {
   return value;
 }
 
-test('receives a live UDP transport stream', async () => {
+for (const multicore of [false, true]) test(`receives a live UDP transport stream (${multicore ? 'multicore' : 'synchronous'})`, async t => {
   const reserve = dgram.createSocket('udp4');
   reserve.bind(0, '127.0.0.1');
   await once(reserve, 'listening');
   const port = reserve.address().port;
   reserve.close();
-  const worker = new StreamWorker({ id: 'udp-test', name: 'UDP test', enabled: true, inputs: [{ url: `udp://127.0.0.1:${port}` }], outputs: [], hls: true, http: true, onDemand: false, keepActiveSeconds: 0 }, { inputTimeoutMs: 1000, failoverDelayMs: 50, hlsSegmentSeconds: 2, hlsWindowSegments: 3 }, new RingLogger());
+  const pool = multicore ? new PacketPool(new RingLogger(), { count: 1 }) : null; if (pool) t.after(() => pool.stop());
+  const worker = new StreamWorker({ id: 'udp-test', name: 'UDP test', enabled: true, inputs: [{ url: `udp://127.0.0.1:${port}` }], outputs: [], hls: true, http: true, onDemand: false, keepActiveSeconds: 0 }, { inputTimeoutMs: 1000, failoverDelayMs: 50, hlsSegmentSeconds: 2, hlsWindowSegments: 3 }, new RingLogger(), [], [], null, new Map(), pool);
   worker.start();
   await new Promise((resolve) => setTimeout(resolve, 20));
   const sender = dgram.createSocket('udp4');
   sender.send(Buffer.concat([packet(300, 0), packet(300, 1), packet(300, 2)]), port, '127.0.0.1');
   await new Promise((resolve) => setTimeout(resolve, 30));
+  if (worker.dataPlane) await worker.dataPlane.flush();
   assert.ok(worker.snapshot().packets >= 3);
   sender.close(); worker.stop();
 });

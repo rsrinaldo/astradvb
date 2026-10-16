@@ -19,7 +19,14 @@ test('real HLS routes count canonical segment clients, keep bytes unchanged and 
     for (const worker of manager.workers.values()) {
       worker.hls.push(Buffer.from('test-media-bytes'), 1000); worker.hls.flush(7000);
     }
-    process.on('message', command => {
+    process.on('message', async command => {
+      if (command === 'worker-media') {
+        const worker = manager.workers.get('2');
+        const handle = manager.packetPool.register({ id: '2', name: 'Second Channel', hls: true }, { hlsSegmentSeconds: 6, hlsWindowSegments: 5 }, { onSegment: segment => worker.hls.appendSegment(segment), sequence: () => worker.hls.sequence });
+        const data = Buffer.alloc(188, 0xff); data.set([0x47, 0x41, 0, 0x30, 1, 0x40]);
+        handle.push('output', data, 1000); handle.push('output', data, 7000); await handle.flush();
+        process.send('worker-media-ready'); return;
+      }
       if (command !== 'rotate') return;
       const worker = manager.workers.get('1');
       for (let now = 7000; now <= 31000; now += 6000) {
@@ -74,6 +81,13 @@ test('real HLS routes count canonical segment clients, keep bytes unchanged and 
   await (await fetch(`${base}${secondManifest.split('\n').find(line => line.startsWith('/hls/'))}`, { headers: { 'user-agent': 'Flussonic' } })).arrayBuffer();
   assert.equal((await list()).length, 3);
   assert.equal((await (await fetch(`${base}/api/status`, { headers: { cookie } })).json()).sessions, 3);
+  const workerReady = once(child, 'message'); child.send('worker-media'); await workerReady;
+  const sharedManifest = await (await fetch(`${base}/hls/second-channel/index.m3u8`)).text();
+  const sharedPath = sharedManifest.split('\n').filter(line => line.startsWith('/hls/')).at(-1);
+  const sharedSegment = await fetch(`${base}${sharedPath}`, { headers: { 'user-agent': 'Flussonic' } });
+  assert.equal(sharedSegment.status, 200); const sharedMedia = Buffer.from(await sharedSegment.arrayBuffer());
+  assert.equal(sharedMedia.length, 188); assert.equal(sharedMedia[0], 0x47); assert.equal(sharedMedia[5], 0x40);
+  assert.equal((await list()).length, 3);
   const restriction = await fetch(`${base}/api/access`, { method: 'PUT', headers, body: JSON.stringify({ streamingAllowedIPs: ['192.0.2.1'], epgAllowedIPs: [] }) });
   assert.equal(restriction.status, 200); assert.equal((await restriction.json()).disconnectedSessions, 3);
   assert.equal((await list()).length, 0);

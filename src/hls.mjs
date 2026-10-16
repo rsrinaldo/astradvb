@@ -67,7 +67,8 @@ function pcr(packet) {
 }
 
 export class HLSSegmenter {
-  constructor({ segmentSeconds = 6, windowSegments = 5, retainedBytes = 128 * 1024 * 1024 } = {}) {
+  constructor({ segmentSeconds = 6, windowSegments = 5, retainedBytes = 128 * 1024 * 1024, createData = Buffer.concat, onSegment = null } = {}) {
+    this.createData = createData; this.onSegment = onSegment;
     this.segmentMs = Math.max(2, Math.min(60, Number(segmentSeconds) || 6)) * 1000;
     this.window = Math.max(3, Math.min(60, Math.trunc(Number(windowSegments) || 5)));
     // Keep the advertised ceiling fixed, including across source restarts.
@@ -161,11 +162,20 @@ export class HLSSegmenter {
   #publish(time, now) {
     if (!this.currentInputBytes) { this.current = []; return; }
     const duration = Math.max(0.1, (time - this.startedAt) / 1000);
-    this.segments.push({ id: `${this.sequence}-${randomUUID().slice(0, 8)}`, sequence: this.sequence++, duration, data: Buffer.concat(this.current), discontinuity: this.nextDiscontinuity });
+    const segment = { id: `${this.sequence}-${randomUUID().slice(0, 8)}`, sequence: this.sequence, duration, data: this.createData(this.current), discontinuity: this.nextDiscontinuity };
     this.nextDiscontinuity = false;
     this.current = [];
     this.currentInputBytes = 0;
     this.startedAt = time;
+    this.appendSegment(segment, now);
+    this.onSegment?.(segment);
+  }
+
+  appendSegment(segment, now = performance.now()) {
+    if (segment.sequence < this.sequence) return;
+    this.sequence = segment.sequence + 1;
+    this.segments.push(segment);
+    const duration = segment.duration;
     this.playlistSeconds += duration;
     this.longestPlaylistSeconds = Math.max(this.longestPlaylistSeconds, this.playlistSeconds);
     // A segment-count preference must not shorten a live window below 3x

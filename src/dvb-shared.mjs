@@ -44,10 +44,11 @@ function caPids(descriptors, target) {
 }
 
 export class MPEGTSServiceFilter {
-  constructor(serviceId) {
+  constructor(serviceId, onPID = null) {
     this.serviceId = Math.max(0, Math.trunc(Number(serviceId) || 0));
     this.pmtPid = -1; this.pat = null; this.patCC = 0;
     this.allowed = new Set([0, 1, 17, 18, 20]);
+    this.onPID = onPID;
     this.patSections = new SectionAssembler(); this.pmtSections = new SectionAssembler(); this.catSections = new SectionAssembler();
   }
   push(chunk) {
@@ -58,21 +59,28 @@ export class MPEGTSServiceFilter {
       const pid = ((chunk[offset + 1] & 0x1f) << 8) | chunk[offset + 2];
       // Reject other services before creating a Buffer view for their packets.
       if (pid !== 0 && pid !== 1 && pid !== this.pmtPid && !this.allowed.has(pid)) continue;
-      const packet = chunk.subarray(offset, offset + PACKET_SIZE);
+      const value = this.packet(chunk.subarray(offset, offset + PACKET_SIZE));
+      if (value) output.push(value);
+    }
+    return output.length ? Buffer.concat(output) : Buffer.alloc(0);
+  }
+  packet(packet) {
+      const pid = ((packet[1] & 0x1f) << 8) | packet[2];
       if (pid === 0) {
         for (const section of this.patSections.push(packet)) this.#pat(section);
-        output.push(this.pat ? this.#patPacket() : packet);
+        return this.pat ? this.#patPacket() : packet;
       } else if (pid === 1) {
         for (const section of this.catSections.push(packet)) {
           if (section[0] === 0x01 && section.length >= 12) caPids(section.subarray(8, section.length - 4), this.allowed);
         }
-        output.push(packet);
+        for (const allowed of this.allowed) this.onPID?.(allowed);
+        return packet;
       } else if (pid === this.pmtPid) {
         for (const section of this.pmtSections.push(packet)) this.#pmt(section);
-        output.push(packet);
-      } else if (this.allowed.has(pid)) output.push(packet);
-    }
-    return output.length ? Buffer.concat(output) : Buffer.alloc(0);
+        for (const allowed of this.allowed) this.onPID?.(allowed);
+        return packet;
+      } else if (this.allowed.has(pid)) return packet;
+      return null;
   }
   #pat(section) {
     if (section[0] !== 0x00 || section.length < 12) return;
@@ -80,7 +88,7 @@ export class MPEGTSServiceFilter {
     for (let offset = 8; offset + 4 <= end; offset += 4) {
       const program = section.readUInt16BE(offset);
       if (program !== this.serviceId) continue;
-      this.pmtPid = ((section[offset + 2] & 0x1f) << 8) | section[offset + 3]; this.allowed.add(this.pmtPid);
+      this.pmtPid = ((section[offset + 2] & 0x1f) << 8) | section[offset + 3]; this.allowed.add(this.pmtPid); this.onPID?.(this.pmtPid);
       const pat = Buffer.alloc(12);
       pat[0] = 0x00; pat[1] = 0xb0; pat[2] = 13; section.copy(pat, 3, 3, 8);
       pat.writeUInt16BE(this.serviceId, 8); pat[10] = 0xe0 | ((this.pmtPid >> 8) & 0x1f); pat[11] = this.pmtPid & 0xff;
@@ -108,8 +116,60 @@ export class MPEGTSServiceFilter {
   }
 }
 
+// One multiplex pass, independent filter state and callbacks per subscriber.
+export class MPEGTSDispatcher {
+  constructor({ shared = false } = {}) { this.routes = new Array(8192); this.entries = new Map(); this.shared = shared; }
+  add(key, filter, onData) {
+    this.remove(key);
+    const entry = { filter, onData, pids: new Set() };
+    const route = pid => { if (entry.pids.has(pid)) return; entry.pids.add(pid); (this.routes[pid] ||= new Set()).add(entry); };
+    this.entries.set(key, entry);
+    if (filter.serviceId) { filter.onPID = route; for (const pid of filter.allowed) route(pid); }
+  }
+  remove(key) {
+    const entry = this.entries.get(key); if (!entry) return;
+    entry.filter.onPID = null;
+    for (const pid of entry.pids) { this.routes[pid]?.delete(entry); if (!this.routes[pid]?.size) this.routes[pid] = null; }
+    this.entries.delete(key);
+  }
+  push(chunk) {
+    const outputs = new Map();
+    for (let offset = 0; offset + PACKET_SIZE <= chunk.length; offset += PACKET_SIZE) {
+      if (chunk[offset] !== 0x47) continue;
+      const targets = this.routes[((chunk[offset + 1] & 31) << 8) | chunk[offset + 2]];
+      if (!targets?.size) continue;
+      const packet = chunk.subarray(offset, offset + PACKET_SIZE);
+      for (const entry of targets) {
+        const value = entry.filter.packet(packet); if (!value) continue;
+        let output = outputs.get(entry);
+        if (!output) { output = { chunks: [], start: -1, end: -1 }; outputs.set(entry, output); }
+        if (value === packet && output.end === offset) output.end += PACKET_SIZE;
+        else {
+          if (output.start >= 0) output.chunks.push(chunk.subarray(output.start, output.end));
+          if (value === packet) { output.start = offset; output.end = offset + PACKET_SIZE; }
+          else { output.chunks.push(value); output.start = -1; output.end = -1; }
+        }
+      }
+    }
+    for (const [key, entry] of this.entries) {
+      if (!entry.filter.serviceId) { entry.onData(chunk); continue; }
+      const output = outputs.get(entry); if (!output) continue;
+      if (output.start >= 0) output.chunks.push(chunk.subarray(output.start, output.end));
+      if (this.entries.get(key) === entry) {
+        if (!this.shared) entry.onData(Buffer.concat(output.chunks));
+        else {
+          const data = Buffer.from(new SharedArrayBuffer(output.chunks.reduce((sum, bytes) => sum + bytes.length, 0)));
+          let offset = 0; for (const bytes of output.chunks) { data.set(bytes, offset); offset += bytes.length; }
+          entry.onData(data);
+        }
+      }
+    }
+  }
+  clear() { for (const key of this.entries.keys()) this.remove(key); }
+}
+
 export class DVBInputPool {
-  constructor(logger, options = {}) { this.logger = logger; this.entries = new Map(); this.reservations = new Map(); this.inputRunner = options.inputRunner || runDVBInput; this.networkScanner = options.networkScanner || scanDVBAdapter; }
+  constructor(logger, options = {}) { this.logger = logger; this.entries = new Map(); this.reservations = new Map(); this.inputRunner = options.inputRunner || runDVBInput; this.networkScanner = options.networkScanner || scanDVBAdapter; this.sharedTransport = Boolean(options.sharedTransport); }
   frontendKey(adapter) { return `${adapter.adapter}:${adapter.frontend}`; }
   activeEntry(adapter) { return [...this.entries.values()].find(entry => this.frontendKey(entry.adapter) === this.frontendKey(adapter)); }
   async scan(adapter, options = {}) {
@@ -168,20 +228,22 @@ export class DVBInputPool {
     });
     let entry = this.entries.get(adapter.id) || this.activeEntry(adapter);
     if (!entry) {
-      entry = { adapter, controller: new AbortController(), subscribers: new Set(), ready: false, releaseTimer: null, framer: new TransportStreamFramer() };
-      this.entries.set(adapter.id, entry); this.#start(entry);
+      entry = { adapter, controller: new AbortController(), subscribers: new Set(), ready: false, releaseTimer: null, framer: new TransportStreamFramer(), dispatcher: new MPEGTSDispatcher({ shared: this.sharedTransport }) };
+      this.entries.set(adapter.id, entry);
     }
     if (entry.releaseTimer) { clearTimeout(entry.releaseTimer); entry.releaseTimer = null; }
     const subscriber = { filter: new MPEGTSServiceFilter(serviceId), onData, onReady, resolve: null, reject: null };
     entry.subscribers.add(subscriber);
-    if (entry.ready) queueMicrotask(() => onReady?.({ adapter: adapter.id, serviceId, shared: true }));
+    entry.dispatcher.add(subscriber, subscriber.filter, onData);
+    if (entry.ready) queueMicrotask(() => { if (entry.subscribers.has(subscriber)) onReady?.({ adapter: adapter.id, serviceId, shared: true }); });
     return new Promise((resolve, reject) => {
       subscriber.resolve = resolve; subscriber.reject = reject;
       const release = () => {
-        signal.removeEventListener('abort', release); entry.subscribers.delete(subscriber); resolve();
+        signal.removeEventListener('abort', release); entry.subscribers.delete(subscriber); entry.dispatcher.remove(subscriber); resolve();
         if (!entry.subscribers.size && !entry.releaseTimer) entry.releaseTimer = setTimeout(() => { if (!entry.subscribers.size) { if (this.entries.get(entry.adapter.id) === entry) this.entries.delete(entry.adapter.id); entry.controller.abort(); } }, 1000);
       };
       signal.addEventListener('abort', release, { once: true }); if (signal.aborted) release();
+      if (!entry.started && !signal.aborted) { entry.started = true; this.#start(entry); }
     });
   }
   stop() { for (const entry of this.entries.values()) { clearTimeout(entry.releaseTimer); entry.controller.abort(); } this.entries.clear(); }
@@ -191,7 +253,7 @@ export class DVBInputPool {
       onReady: () => { entry.ready = true; for (const subscriber of entry.subscribers) subscriber.onReady?.({ adapter: entry.adapter.id, shared: true }); },
       onData: (chunk) => {
         const aligned = entry.framer.push(chunk); if (!aligned.length) return;
-        for (const subscriber of entry.subscribers) { const filtered = subscriber.filter.push(aligned); if (filtered.length) subscriber.onData(filtered); }
+        entry.dispatcher.push(aligned);
       },
     }).then(() => this.#finish(entry, entry.controller.signal.aborted ? null : new Error('Shared DVB input ended')))
       .catch((error) => this.#finish(entry, entry.controller.signal.aborted ? null : error));
@@ -200,6 +262,7 @@ export class DVBInputPool {
     clearTimeout(entry.releaseTimer);
     if (this.entries.get(entry.adapter.id) === entry) this.entries.delete(entry.adapter.id);
     for (const subscriber of entry.subscribers) error ? subscriber.reject?.(error) : subscriber.resolve?.();
+    entry.dispatcher.clear();
     entry.subscribers.clear();
   }
 }

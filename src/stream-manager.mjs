@@ -8,6 +8,7 @@ import { EPGCollector, EPG_REFRESH_SECONDS, epgDocument } from './epg.mjs';
 import { DVBInputPool } from './dvb-shared.mjs';
 import { CASProxyManager } from './cas-proxy.mjs';
 import { StreamMetadata } from './si-metadata.mjs';
+import { PacketPool } from './packet-pool.mjs';
 
 const wait = (ms, signal) => new Promise((resolve) => {
   const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
@@ -30,11 +31,12 @@ export function scramblingStats(chunk) {
 }
 
 export class StreamWorker extends EventEmitter {
-  constructor(config, settings, logger, casProfiles = [], adapters = [], dvbPool = null, casConnections = new Map()) {
+  constructor(config, settings, logger, casProfiles = [], adapters = [], dvbPool = null, casConnections = new Map(), packetPool = null) {
     super(); this.config = config; this.settings = settings; this.logger = logger;
+    this.packetPool = packetPool; this.dataPlane = null;
     this.runningSince = null;
     this.analyzer = new MPEGTSAnalyzer(); this.inputAnalyzer = new MPEGTSAnalyzer(); this.epg = new EPGCollector({ serviceId: config.service?.serviceId || config.service?.id || 0 });
-    this.framer = new TransportStreamFramer(); this.outputFramer = new TransportStreamFramer(); this.cam = null; this.camProfile = null; this.camConnection = null; this.casMode = 'disabled'; this.casBuffer = []; this.casBufferBytes = 0; this.casProbePackets = 0; this.casProbeScrambled = 0; this.casProfiles = casProfiles; this.casConnections = casConnections; this.adapters = adapters; this.dvbPool = dvbPool;
+    this.framer = new TransportStreamFramer({ shared: Boolean(packetPool?.count) }); this.outputFramer = new TransportStreamFramer({ shared: Boolean(packetPool?.count) }); this.cam = null; this.camProfile = null; this.camConnection = null; this.casMode = 'disabled'; this.casBuffer = []; this.casBufferBytes = 0; this.casProbePackets = 0; this.casProbeScrambled = 0; this.casProfiles = casProfiles; this.casConnections = casConnections; this.adapters = adapters; this.dvbPool = dvbPool;
     this.hls = new HLSSegmenter({ segmentSeconds: settings.hlsSegmentSeconds, windowSegments: settings.hlsWindowSegments });
     this.hlsFramer = new TransportStreamFramer(); this.hlsBridge = null;
     this.hlsMetadata = new StreamMetadata(config.name);
@@ -49,9 +51,21 @@ export class StreamWorker extends EventEmitter {
   start() {
     if (this.abort || !this.config.enabled) return;
     this.abort = new AbortController(); this.state = 'starting';
+    if (this.packetPool?.count && !this.dataPlane) {
+      const input = this.config.inputs.find(item => item.url.startsWith('dvb://'));
+      const group = input ? `dvb:${new URL(input.url).hostname}` : `stream:${this.config.id}`;
+      this.dataPlane = this.packetPool.register({ id: this.config.id, name: this.config.name, serviceId: this.config.service?.serviceId || this.config.service?.id || 0, camEnabled: Boolean(this.config.cam?.enabled), hls: Boolean(this.config.hls), hlsCompatibility: Boolean(this.config.hlsCompatibility) }, this.settings, {
+        sequence: () => this.hls.sequence,
+        onSegment: segment => this.hls.appendSegment(segment),
+        onData: data => { if (this.abort) this.#deliverProcessed(data); },
+        onGap: () => { this.runningSince = null; this.lastDataAt = 0; },
+      }, group);
+      this.analyzer = this.dataPlane.analyzer; this.inputAnalyzer = this.dataPlane.inputAnalyzer; this.epg = this.dataPlane.epg;
+    }
     this.outputs = this.config.outputs.filter((output) => /^(udp|rtp):/.test(output.url)).map((output) => new UDPOutput(output.url));
     if (this.config.hls && this.config.hlsCompatibility) {
       this.hlsBridge = new HLSCompatibilityBridge((chunk) => {
+        if (this.dataPlane) { this.dataPlane.push('hls', chunk); return; }
         const aligned = this.hlsFramer.push(chunk);
         if (aligned.length) { const normalized = this.hlsMetadata.push(aligned); if (normalized.length) this.hls.push(normalized); }
       }, (error) => this.logger.warn(this.config.id, error.message));
@@ -59,7 +73,7 @@ export class StreamWorker extends EventEmitter {
     }
     if (this.config.cam?.enabled) {
       this.camProfile = this.casProfiles.find((item) => item.id === this.config.cam.profile);
-      if (!this.camProfile?.lineEncrypted) { this.state = 'error'; this.logger.error(this.config.id, `CAS profile ${this.config.cam.profile} has no credentials`); this.outputs.forEach((output) => output.close()); this.outputs = []; this.abort = null; return; }
+      if (!this.camProfile?.lineEncrypted) { this.state = 'error'; this.logger.error(this.config.id, `CAS profile ${this.config.cam.profile} has no credentials`); this.outputs.forEach((output) => output.close()); this.outputs = []; this.dataPlane?.close(); this.dataPlane = null; this.abort = null; return; }
       this.camConnection = this.casConnections.get(this.config.cam.profile) || null;
       this.casMode = 'detecting';
     }
@@ -68,6 +82,7 @@ export class StreamWorker extends EventEmitter {
   stop() {
     this.runningSince = null;
     this.abort?.abort(); this.abort = null; this.cam?.stop(); this.cam = null; this.camProfile = null; this.camConnection = null; this.casMode = 'disabled'; this.casBuffer = []; this.casBufferBytes = 0; this.casProbePackets = 0; this.casProbeScrambled = 0; this.hlsBridge?.stop(); this.hlsBridge = null; this.hlsFramer.reset(); this.outputs.forEach((output) => output.close()); this.outputs = []; this.state = 'stopped'; this.activeInput = -1;
+    this.dataPlane?.close(); this.dataPlane = null;
     for (const client of this.clients) client.end(); this.clients.clear();
   }
   subscribe(response) {
@@ -85,11 +100,14 @@ export class StreamWorker extends EventEmitter {
     const aligned = this.framer.push(chunk);
     if (!aligned.length) return;
     this.inputDataAt = Date.now();
-    if (this.config.cam?.enabled) { this.epg.push(aligned); this.#pushCAS(aligned); return; }
+    if (this.config.cam?.enabled) {
+      if (this.dataPlane) this.dataPlane.push('input', aligned); else this.epg.push(aligned);
+      this.#pushCAS(aligned); return;
+    }
     this.#deliver(aligned);
   }
   #pushCAS(aligned) {
-    this.inputAnalyzer.push(aligned);
+    if (!this.dataPlane) this.inputAnalyzer.push(aligned);
     if (this.casMode === 'descrambling') { this.cam.write(aligned); return; }
     if (this.casMode === 'error') return;
     this.#rememberCAS(aligned);
@@ -100,8 +118,8 @@ export class StreamWorker extends EventEmitter {
     this.casProbePackets = 0; this.casProbeScrambled = 0;
     if (encrypted) {
       try {
-        this.casMode = 'descrambling'; this.outputFramer.reset(); this.hls.markDiscontinuity();
-        this.cam = new SoftcamBridge(this.config, this.camProfile, this.camConnection, (chunk) => this.#deliver(this.outputFramer.push(chunk)), this.logger, { onDiscontinuity: () => { this.outputFramer.reset(); this.hls.markDiscontinuity(); } }); this.cam.start();
+        this.casMode = 'descrambling'; this.outputFramer.reset(); this.#discontinuity();
+        this.cam = new SoftcamBridge(this.config, this.camProfile, this.camConnection, (chunk) => this.#deliver(this.outputFramer.push(chunk)), this.logger, { onDiscontinuity: () => { this.outputFramer.reset(); this.#discontinuity(); } }); this.cam.start();
         for (const chunk of this.casBuffer) this.cam.write(chunk);
         this.casBuffer = []; this.casBufferBytes = 0;
       } catch (error) { this.casMode = 'error'; this.state = 'error'; this.logger.error(this.config.id, `Descrambling stopped: ${error.message}`); }
@@ -121,14 +139,21 @@ export class StreamWorker extends EventEmitter {
   }
   #deliver(aligned) {
     if (!aligned.length) return;
+    if (this.dataPlane) { this.dataPlane.push('output', aligned); return; }
     aligned = this.metadata.push(aligned);
     if (!aligned.length) return;
+    this.analyzer.push(aligned);
+    if (!this.config.cam?.enabled) this.epg.push(aligned);
+    if (this.config.hls && !this.hlsBridge) this.hls.push(aligned);
+    this.#deliverProcessed(aligned);
+  }
+  #discontinuity() { if (this.dataPlane) this.dataPlane.control('discontinuity'); else this.hls.markDiscontinuity(); }
+  #deliverProcessed(aligned) {
     const input = this.config.inputs[this.activeInput];
     const timeout = input && isAdaptiveManifest(input.url) ? Math.max(30000, this.settings.inputTimeoutMs * 3) : this.settings.inputTimeoutMs;
     if (!this.runningSince || Date.now() - this.lastDataAt > timeout) this.runningSince = Date.now();
-    this.lastDataAt = Date.now(); this.analyzer.push(aligned);
-    if (!this.config.cam?.enabled) this.epg.push(aligned);
-    if (this.config.hls) { if (this.hlsBridge) this.hlsBridge.write(aligned); else this.hls.push(aligned); }
+    this.lastDataAt = Date.now();
+    if (this.hlsBridge) this.hlsBridge.write(aligned);
     for (const output of this.outputs) output.send(aligned);
     for (const client of this.clients) {
       if (client.destroyed || client.writableEnded) { this.clients.delete(client); continue; }
@@ -157,10 +182,11 @@ export class StreamWorker extends EventEmitter {
     const inputFlowing = this.inputDataAt > 0 && Date.now() - this.inputDataAt <= staleTimeoutMs;
     const encryptedInput = inputMetrics.packets >= 100 && inputMetrics.scrambledPackets / inputMetrics.packets >= 0.05;
     const waitingForKeys = Boolean(this.config.cam?.enabled && this.casMode === 'descrambling' && stale && inputFlowing && encryptedInput);
-    const state = this.state === 'running' && ((scrambled && (!stale || inputFlowing)) || waitingForKeys) ? 'scrambled' : stale && this.state === 'running' ? 'warning' : this.state;
+    const processingUnavailable = this.dataPlane && this.dataPlane.state !== 'running';
+    const state = processingUnavailable && this.state === 'running' ? 'warning' : this.state === 'running' && ((scrambled && (!stale || inputFlowing)) || waitingForKeys) ? 'scrambled' : stale && this.state === 'running' ? 'warning' : this.state;
     const continuity = this.config.cam?.enabled ? { input: inputMetrics.continuityErrors, output: outputMetrics.continuityErrors } : null;
     const startedAt = !stale && this.state === 'running' ? this.runningSince : null;
-    return { id: this.config.id, name: this.config.name, enabled: this.config.enabled, state, startedAt: startedAt ? new Date(startedAt).toISOString() : null, uptimeSeconds: startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0, activeInput: this.activeInput, clients: this.clients.size, cas: casStatus ? { profile: this.config.cam.profile, status: casStatus, continuity, diagnostics: this.cam?.diagnostics } : null, ...metrics };
+    return { id: this.config.id, name: this.config.name, enabled: this.config.enabled, state, startedAt: startedAt ? new Date(startedAt).toISOString() : null, uptimeSeconds: startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0, activeInput: this.activeInput, clients: this.clients.size, processing: this.dataPlane?.status() || null, cas: casStatus ? { profile: this.config.cam.profile, status: casStatus, continuity, diagnostics: this.cam?.diagnostics } : null, ...metrics };
   }
   async #loop(signal) {
     if (!this.config.inputs.length) { this.state = 'error'; this.logger.error(this.config.id, 'No inputs configured'); return; }
@@ -173,6 +199,7 @@ export class StreamWorker extends EventEmitter {
       const abortAttempt = () => attempt.abort(); signal.addEventListener('abort', abortAttempt, { once: true });
       this.framer.reset();
       this.metadata.reset(); this.hlsMetadata.reset();
+      this.dataPlane?.control('reset');
       this.activeInput = inputIndex; this.state = 'connecting'; this.lastDataAt = 0; this.inputDataAt = 0;
       this.logger.info(this.config.id, `Connecting input #${inputIndex + 1}`);
       const startupTimeoutMs = usesFFmpegBridge(input.url, input) ? Math.max(30000, this.settings.inputTimeoutMs * 3) : this.settings.inputTimeoutMs;
@@ -189,7 +216,7 @@ export class StreamWorker extends EventEmitter {
       } finally {
         this.runningSince = null;
         clearInterval(watchdog); signal.removeEventListener('abort', abortAttempt);
-        if (!signal.aborted) this.hls.markDiscontinuity();
+        if (!signal.aborted) this.#discontinuity();
       }
       if (!signal.aborted) { cursor += 1; this.state = 'failover'; await wait(this.settings.failoverDelayMs, signal); }
     }
@@ -199,11 +226,12 @@ export class StreamWorker extends EventEmitter {
 
 export class StreamManager {
   constructor(configStore, logger, options = {}) {
-    this.store = configStore; this.logger = logger; this.workers = new Map(); this.dvbPool = options.dvbPool || new DVBInputPool(logger); this.casProxy = options.casProxy || new CASProxyManager(logger); this.workerFactory = options.workerFactory || ((...args) => new StreamWorker(...args)); this.reconcileQueue = Promise.resolve();
+    this.packetPool = options.packetPool || new PacketPool(logger, options.workerFactory ? { count: 0 } : {});
+    this.store = configStore; this.logger = logger; this.workers = new Map(); this.dvbPool = options.dvbPool || new DVBInputPool(logger, { sharedTransport: Boolean(this.packetPool.count) }); this.casProxy = options.casProxy || new CASProxyManager(logger); this.workerFactory = options.workerFactory || ((...args) => new StreamWorker(...args)); this.reconcileQueue = Promise.resolve();
     this.casProxy.on?.('availability', available => { for (const worker of this.workers.values()) worker.cam?.setBackendAvailable?.(available); });
   }
   async start() { await this.reconcile(this.store.value); }
-  stop() { for (const worker of this.workers.values()) worker.stop(); this.workers.clear(); this.dvbPool.stop(); void this.casProxy.stop(); }
+  stop() { for (const worker of this.workers.values()) worker.stop(); this.workers.clear(); this.dvbPool.stop(); void this.casProxy.stop(); void this.packetPool.stop(); }
   reconcile(config) {
     const work = this.reconcileQueue.catch(() => {}).then(() => this.#apply(config));
     this.reconcileQueue = work;
@@ -226,7 +254,7 @@ export class StreamManager {
     this.dvbPool.reconcile(config.adapters);
     for (const [id, { stream, signature }] of desired) {
       if (this.workers.has(id)) continue;
-      const worker = this.workerFactory(stream, config.settings, this.logger, config.casProfiles, config.adapters, this.dvbPool, casConnections);
+      const worker = this.workerFactory(stream, config.settings, this.logger, config.casProfiles, config.adapters, this.dvbPool, casConnections, this.packetPool);
       worker.configSignature = signature; this.workers.set(id, worker);
       if (stream.enabled && !stream.onDemand) worker.start();
     }

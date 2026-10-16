@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { HLSSegmenter } from '../src/hls.mjs';
+import { PacketPool } from '../src/packet-pool.mjs';
+import { RingLogger } from '../src/logger.mjs';
 
 const available = ['ffmpeg', 'ffprobe'].every(binary => spawnSync(binary, ['-version'], { timeout: 5000, stdio: 'ignore' }).status === 0);
 
@@ -49,4 +51,20 @@ test('real H.264/MP2 transport retains every AV packet and produces decodable, a
   const decoded = spawnSync('ffmpeg', ['-nostdin', '-hide_banner', '-loglevel', 'error', '-protocol_whitelist', 'file,crypto,data', '-i', manifestPath, '-map', '0:v:0', '-map', '0:a:0', '-f', 'null', '-'], { timeout: 20000, maxBuffer: 1024 * 1024 });
   assert.equal(decoded.status, 0, decoded.stderr?.toString());
   assert.equal(decoded.stderr.toString().trim(), '');
+
+  const pool = new PacketPool(new RingLogger(), { count: 2 }); t.after(() => pool.stop());
+  const workerCache = new HLSSegmenter(); const output = [];
+  const worker = pool.register({ id: 'native', name: 'Shqipëri HD', serviceId: 1, hls: true }, { hlsSegmentSeconds: 6, hlsWindowSegments: 5 }, { onData: data => output.push(data), onSegment: segment => workerCache.appendSegment(segment), sequence: () => workerCache.sequence });
+  for (let offset = 0; offset < source.stdout.length; offset += 188 * 347) {
+    assert.equal(worker.push('output', source.stdout.subarray(offset, offset + 188 * 347)), true);
+    if (offset % (188 * 347 * 8) === 0) await worker.flush();
+  }
+  worker.control('flushHLS'); await worker.flush();
+  assert.deepEqual(av(Buffer.concat(output)), av(source.stdout));
+  assert.equal(worker.droppedBytes, 0); assert.equal(worker.restarts, 0);
+  assert.ok(workerCache.segments.every(segment => segment.data.buffer instanceof SharedArrayBuffer));
+  for (const segment of workerCache.segments) await writeFile(join(directory, `${segment.id}.ts`), segment.data);
+  await writeFile(manifestPath, workerCache.playlist(directory) + '#EXT-X-ENDLIST\n');
+  const workerDecoded = spawnSync('ffmpeg', ['-nostdin', '-hide_banner', '-loglevel', 'error', '-protocol_whitelist', 'file,crypto,data', '-i', manifestPath, '-map', '0:v:0', '-map', '0:a:0', '-f', 'null', '-'], { timeout: 20000, maxBuffer: 1024 * 1024 });
+  assert.equal(workerDecoded.status, 0, workerDecoded.stderr?.toString()); assert.equal(workerDecoded.stderr.toString().trim(), '');
 });

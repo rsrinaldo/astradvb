@@ -81,10 +81,11 @@ export function alignTransportStream(chunk) {
 }
 
 export class TransportStreamFramer {
-  constructor() { this.buffer = Buffer.alloc(0); }
+  constructor({ shared = false } = {}) { this.buffer = Buffer.alloc(0); this.shared = shared; }
 
   push(chunk) {
     if (!chunk?.length) return Buffer.alloc(0);
+    if (this.shared) return this.#shared(chunk);
     this.buffer = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : Buffer.from(chunk);
     let start = this.buffer.indexOf(0x47);
     while (start >= 0 && this.buffer.length - start >= PACKET_SIZE * 2 && this.buffer[start + PACKET_SIZE] !== 0x47) {
@@ -103,4 +104,18 @@ export class TransportStreamFramer {
   }
 
   reset() { this.buffer = Buffer.alloc(0); }
+
+  #shared(chunk) {
+    const data = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : chunk;
+    let start = data.indexOf(0x47);
+    while (start >= 0 && data.length - start >= PACKET_SIZE * 2 && data[start + PACKET_SIZE] !== 0x47) start = data.indexOf(0x47, start + 1);
+    if (start < 0) { this.buffer = Buffer.from(data.subarray(Math.max(0, data.length - PACKET_SIZE + 1))); return Buffer.alloc(0); }
+    const length = Math.floor((data.length - start) / PACKET_SIZE) * PACKET_SIZE;
+    this.buffer = Buffer.from(data.subarray(start + length));
+    if (!length) return Buffer.alloc(0);
+    const aligned = data.subarray(start, start + length);
+    // Shared frames remain read-only. Copy only the producer's private tail.
+    if (aligned.buffer instanceof SharedArrayBuffer) return aligned;
+    const result = Buffer.from(new SharedArrayBuffer(length)); result.set(aligned); return result;
+  }
 }

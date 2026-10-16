@@ -101,6 +101,7 @@ function status() {
     casProxy: { ...manager.casProxy.metrics, providerGuards: manager.casProxy.guardMetrics?.() || [] },
     memory: process.memoryUsage(),
     resources: resources.value,
+    processing: manager.packetPool.status(),
     epg: { ...manager.epgStatus(), publication: epgPublisher.status },
   };
 }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DVBServiceCollector, annotateDVBServices, existingDVBStreams } from '../src/dvb-services.mjs';
-import { DVBInputPool } from '../src/dvb-shared.mjs';
+import { DVBInputPool, MPEGTSDispatcher, MPEGTSServiceFilter } from '../src/dvb-shared.mjs';
 import { StreamMetadata, mpegCRC32 } from '../src/si-metadata.mjs';
 import { RingLogger } from '../src/logger.mjs';
 
@@ -74,4 +74,30 @@ test('cancels a live scan and releases only its own shared subscription', async 
   const controller = new AbortController(); const scan = pool.scan(adapter, { signal: controller.signal }); controller.abort();
   await assert.rejects(scan, /cancelled/); assert.equal(pool.activeEntry(adapter).subscribers.size, 1);
   streamController.abort(); await stream;
+});
+
+test('one-pass multiplex dispatch matches independent legacy filters byte-for-byte, including scan taps and duplicates', () => {
+  const sender = new StreamMetadata('Mux'); const mux = tables(sender);
+  const av = pid => { const packet = Buffer.alloc(188, 0xff); packet.set([0x47, (pid >> 8) & 31, pid & 255, 0x10]); return packet; };
+  const data = Buffer.concat([mux, ...Array.from({ length: 300 }, (_, index) => av([256, 257, 258, 259, 300, 777, 0x1fff][index % 7]))]);
+  const dispatcher = new MPEGTSDispatcher(); const actual = [[], [], [], []]; const expected = [[], [], [], []];
+  const ids = [100, 101, 100, 0]; const filters = ids.map(id => new MPEGTSServiceFilter(id));
+  ids.forEach((id, index) => dispatcher.add(index, new MPEGTSServiceFilter(id), bytes => actual[index].push(bytes)));
+  for (let offset = 0; offset < data.length; offset += 188 * 7) {
+    const chunk = data.subarray(offset, offset + 188 * 7); dispatcher.push(chunk);
+    filters.forEach((filter, index) => expected[index].push(filter.push(chunk)));
+  }
+  ids.forEach((_, index) => assert.deepEqual(Buffer.concat(actual[index]), Buffer.concat(expected[index])));
+  const count = actual[0].length; dispatcher.remove(0); dispatcher.push(data);
+  assert.equal(actual[0].length, count); assert.ok(actual[2].length > count);
+  dispatcher.clear(); assert.equal(dispatcher.entries.size, 0); assert.equal(dispatcher.routes.filter(Boolean).length, 0);
+});
+
+test('a late service join has independent PSI state and does not reset existing subscribers', () => {
+  const dispatcher = new MPEGTSDispatcher(); const first = []; const joined = [];
+  dispatcher.add('first', new MPEGTSServiceFilter(100), bytes => first.push(bytes)); dispatcher.push(tables());
+  dispatcher.add('joined', new MPEGTSServiceFilter(100), bytes => joined.push(bytes)); dispatcher.push(tables());
+  const fresh = new MPEGTSServiceFilter(100).push(tables());
+  assert.deepEqual(joined[0], fresh); assert.equal(first.length, 2);
+  assert.notEqual(first[1][3] & 15, joined[0][3] & 15);
 });

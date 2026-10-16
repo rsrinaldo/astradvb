@@ -38,6 +38,22 @@ test('frames transport packets split across arbitrary chunks', () => {
   assert.equal(Buffer.concat([first, second]).length, 376);
 });
 
+test('shared framing preserves all bytes across arbitrary boundaries without retaining or mutating private producer buffers', () => {
+  const source = Buffer.concat([Buffer.from([1, 2, 3]), ...Array.from({ length: 200 }, (_, i) => packet(256, i & 15))]);
+  const legacy = new TransportStreamFramer(); const shared = new TransportStreamFramer({ shared: true });
+  const expected = []; const actual = [];
+  for (let offset = 0; offset < source.length; offset += 337) {
+    const original = Buffer.from(source.subarray(offset, offset + 337));
+    expected.push(legacy.push(original)); const result = shared.push(original); actual.push(result);
+    if (result.length) assert.ok(result.buffer instanceof SharedArrayBuffer);
+    original.fill(0); // Framer must not retain the producer's reused private tail.
+  }
+  assert.deepEqual(Buffer.concat(actual), Buffer.concat(expected));
+  const immutable = Buffer.from(new SharedArrayBuffer(188)); immutable.set(packet(257, 0));
+  const direct = new TransportStreamFramer({ shared: true }).push(immutable);
+  assert.equal(direct.buffer, immutable.buffer); assert.deepEqual(direct, packet(257, 0));
+});
+
 function psiPacket(pid, section) {
   const value = packet(pid, 0, true); value[4] = 0; section.copy(value, 5); return value;
 }
