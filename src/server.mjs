@@ -12,9 +12,11 @@ import { RelaySessions } from './sessions.mjs';
 import { ManagementAuth, publicMediaRequest } from './auth.mjs';
 import { AccessPolicy, clientIP, mediaScope, normalizeAccess } from './access.mjs';
 import { parseNewcamdLine } from './softcam.mjs';
-import { discoverDVBDevices, inspectDVBFrontend, mergeDVBAdapters, probeDVBFrontend } from './dvb.mjs';
+import { discoverDVBDevices, inspectDVBFrontend, mergeDVBAdapters } from './dvb.mjs';
+import { DVBProbeBroker } from './dvb-probe-broker.mjs';
 import { annotateDVBServices, existingDVBStreams } from './dvb-services.mjs';
 import { SystemResources } from './system-resources.mjs';
+import { DiagnosticSnapshot, mediaDiagnostics } from './diagnostics.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const packageInfo = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
@@ -24,7 +26,10 @@ const auth = new ManagementAuth(store.path);
 await auth.load();
 let accessPolicy = new AccessPolicy(store.value.access);
 const logger = new RingLogger(store.value.settings.logLimit, (source) => store.value.streams.find((stream) => stream.id === source)?.name || store.value.adapters.find((adapter) => adapter.id === source)?.name || source);
+const probeBroker = new DVBProbeBroker(logger);
+await probeBroker.start();
 const manager = new StreamManager(store, logger);
+manager.signalMonitor = probeBroker;
 await manager.start();
 const epgPublisher = new DailyEPGPublisher({ path: join(dirname(store.path), 'epg-published.json'), snapshot: () => manager.epgSnapshot(), warmupMs: store.value.streams.some(stream => stream.enabled) ? 300000 : 0, onError: error => logger.warn('epg', `Daily EPG publication unavailable: ${error.message}; retaining the previous guide and retrying`) });
 await epgPublisher.load();
@@ -68,7 +73,7 @@ async function adapterStatus(force = false) {
   const value = await Promise.all(merged.map(async (adapter) => {
     if (adapterScans.has(`${adapter.adapter}:${adapter.frontend}`)) return { ...adapter, lock: null, status: 'scanning' };
     if (!adapter.configured || !adapter.detected || !adapter.enabled) return { ...adapter, lock: false, status: adapter.detected ? 'unconfigured' : 'missing' };
-    try { return { ...adapter, ...(await probeDVBFrontend(adapter)) }; }
+    try { return { ...adapter, ...(await probeBroker.probe(adapter)) }; }
     catch (error) { return { ...adapter, lock: null, status: 'unknown', error: error.message }; }
   }));
   adapterCache = { expires: Date.now() + 4000, value };
@@ -118,6 +123,7 @@ function broadcast(event, data) {
   const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const response of sseClients) {
     if (!auth.byId(response.authSessionId)) { sseClients.delete(response); response.end(); continue; }
+    if (response.destroyed || response.writableEnded || response.writableLength + Buffer.byteLength(message) > 1024 * 1024) { sseClients.delete(response); response.destroy(); continue; }
     response.write(message);
   }
 }
@@ -320,10 +326,12 @@ const server = http.createServer(async (request, response) => {
 const heartbeat = setInterval(async () => { sessions.prune(); await resources.sample(); broadcast('status', status()); }, 2000);
 const epgMaintenance = setInterval(() => manager.maintainEPG(), 60000); epgMaintenance.unref();
 const epgPublication = setInterval(() => { void epgPublisher.tick(); }, 60000); epgPublication.unref();
+const diagnostics = new DiagnosticSnapshot(join(dirname(store.path), 'diagnostics.json'), () => mediaDiagnostics(manager, packageInfo.version), { onError: () => logger.warn('diagnostics', 'Local media diagnostics unavailable; streaming is unaffected') });
+void diagnostics.tick();
 server.listen(store.value.server.port, store.value.server.host, () => logger.info('system', `Listening on ${store.value.server.host}:${store.value.server.port}`));
 
 function shutdown() {
-  clearInterval(heartbeat); clearInterval(epgMaintenance); clearInterval(epgPublication); epgPublisher.stop(); manager.stop(); for (const client of sseClients) client.end();
+  clearInterval(heartbeat); clearInterval(epgMaintenance); clearInterval(epgPublication); void diagnostics.stop(); void probeBroker.stop(); epgPublisher.stop(); manager.stop(); for (const client of sseClients) client.end();
   server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 5000).unref();
 }
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);

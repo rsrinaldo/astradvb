@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MPEGTSAnalyzer, alignTransportStream, TransportStreamFramer } from '../src/mpegts.mjs';
 import { MPEGTSServiceFilter } from '../src/dvb-shared.mjs';
+import { mpegCRC32 } from '../src/mpeg-crc.mjs';
 
 function packet(pid, cc, payloadStart = false) {
   const value = Buffer.alloc(188, 0xff);
@@ -20,6 +21,41 @@ test('analyzes aligned MPEG-TS packets and continuity', () => {
   assert.equal(result.pidCount, 1);
   assert.equal(result.pesStarts, 1);
   assert.equal(result.continuityErrors, 1);
+});
+
+test('continuity diagnostics accept duplicate payload, null padding and explicitly declared counter resets', () => {
+  const analyzer = new MPEGTSAnalyzer(); const original = packet(256, 0); const reset = packet(256, 9);
+  reset[3] = 0x30 | 9; reset[4] = 1; reset[5] = 0x80;
+  analyzer.push(Buffer.concat([original, original, packet(256, 1), packet(0x1fff, 2), packet(0x1fff, 10), reset, packet(256, 10)]));
+  const result = analyzer.snapshot();
+  assert.equal(result.continuityErrors, 0); assert.equal(result.duplicatePackets, 1); assert.equal(result.discontinuities, 1);
+  assert.equal(result.pids.find(value => value.pid === 256).duplicatePackets, 1);
+});
+
+test('same CC with changed payload is corruption, but a changed PCR with identical payload is a duplicate', () => {
+  const analyzer = new MPEGTSAnalyzer(); const first = packet(256, 0); first[3] = 0x30; first[4] = 7; first[5] = 0x10;
+  const duplicate = Buffer.from(first); duplicate[6] ^= 1;
+  const corrupt = Buffer.from(duplicate); corrupt[30] ^= 1;
+  analyzer.push(Buffer.concat([first, duplicate, corrupt, packet(256, 1)]));
+  assert.equal(analyzer.snapshot().continuityErrors, 1); assert.equal(analyzer.snapshot().duplicatePackets, 1);
+});
+
+test('adaptation-only packets retain CC and can declare a reset without generating artificial loss', () => {
+  const analyzer = new MPEGTSAnalyzer(); const adaptation = packet(256, 0); adaptation[3] = 0x20; adaptation[4] = 183; adaptation[5] = 0;
+  const reset = Buffer.from(adaptation); reset[3] = 0x2c; reset[5] = 0x80;
+  analyzer.push(Buffer.concat([packet(256, 0), adaptation, packet(256, 1), reset, packet(256, 4)]));
+  assert.equal(analyzer.snapshot().continuityErrors, 0); assert.equal(analyzer.snapshot().discontinuities, 1);
+  const badAdaptation = Buffer.from(adaptation); badAdaptation[3] = 0x27; analyzer.push(badAdaptation);
+  assert.equal(analyzer.snapshot().continuityErrors, 1);
+});
+
+test('transport errors and malformed adaptation fields are counted separately instead of trusted as continuity evidence', () => {
+  const analyzer = new MPEGTSAnalyzer(); const damaged = packet(256, 9); damaged[1] |= 0x80;
+  const malformed = packet(257, 3); malformed[3] = 0x33; malformed[4] = 184;
+  const reserved = packet(258, 2); reserved[3] = 2;
+  analyzer.push(Buffer.concat([packet(256, 0), damaged, packet(256, 5), malformed, reserved]));
+  const result = analyzer.snapshot(); assert.equal(result.teiPackets, 1); assert.equal(result.malformedPackets, 2); assert.equal(result.continuityErrors, 0);
+  assert.equal(result.pids.find(value => value.pid === 256).teiPackets, 1);
 });
 
 test('aligns data to whole 188-byte packets', () => {
@@ -55,6 +91,7 @@ test('shared framing preserves all bytes across arbitrary boundaries without ret
 });
 
 function psiPacket(pid, section) {
+  section.writeUInt32BE(mpegCRC32(section.subarray(0, -4)), section.length - 4);
   const value = packet(pid, 0, true); value[4] = 0; section.copy(value, 5); return value;
 }
 

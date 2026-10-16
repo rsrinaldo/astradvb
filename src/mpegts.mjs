@@ -8,6 +8,10 @@ export class MPEGTSAnalyzer {
     this.packets = 0;
     this.syncErrors = 0;
     this.continuityErrors = 0;
+    this.duplicatePackets = 0;
+    this.discontinuities = 0;
+    this.teiPackets = 0;
+    this.malformedPackets = 0;
     this.pesStarts = 0;
     this.scrambledPackets = 0;
     this.pidStats = new Map();
@@ -43,21 +47,48 @@ export class MPEGTSAnalyzer {
     const adaptation = (packet[offset + 3] >> 4) & 0x03;
     const cc = packet[offset + 3] & 0x0f;
     const hasPayload = adaptation === 1 || adaptation === 3;
-    const stat = this.pidStats.get(pid) || { packets: 0, continuityErrors: 0, lastCC: null };
+    const stat = this.pidStats.get(pid) || { packets: 0, continuityErrors: 0, duplicatePackets: 0, discontinuities: 0, teiPackets: 0, malformedPackets: 0, lastCC: null, payload: null, payloadLength: 0 };
     stat.packets += 1;
-    if (hasPayload && stat.lastCC !== null && cc !== ((stat.lastCC + 1) & 0x0f)) {
-      stat.continuityErrors += 1;
-      this.continuityErrors += 1;
-    }
-    if (hasPayload) stat.lastCC = cc;
-    if (payloadStart && pid > 0x1f) this.pesStarts += 1;
+    const tei = Boolean(packet[offset + 1] & 0x80);
+    const adaptationLength = adaptation === 2 || adaptation === 3 ? packet[offset + 4] : 0;
+    const malformed = adaptation === 0 || (adaptation === 2 && adaptationLength !== 183) || (adaptation === 3 && adaptationLength > 182);
+    if (tei) { stat.teiPackets++; this.teiPackets++; }
+    if (malformed) { stat.malformedPackets++; this.malformedPackets++; }
     if (scrambling) this.scrambledPackets += 1;
+    if (tei || malformed) {
+      // Do not turn an untrusted CC into a second, artificial error on the
+      // following good packet. The actual transport damage remains explicit.
+      stat.lastCC = null; this.pidStats.set(pid, stat); return;
+    }
+    const discontinuity = (adaptation === 2 || adaptation === 3) && adaptationLength > 0 && Boolean(packet[offset + 5] & 0x80);
+    if (discontinuity) { stat.lastCC = null; stat.discontinuities++; this.discontinuities++; }
+    if (pid !== 0x1fff) {
+      const payloadOffset = offset + (adaptation === 3 ? 5 + adaptationLength : 4);
+      let error = false;
+      if (hasPayload && stat.lastCC !== null) {
+        if (cc === stat.lastCC) {
+          const duplicate = stat.payloadLength === offset + PACKET_SIZE - payloadOffset && packet.compare(stat.payload, 0, stat.payloadLength, payloadOffset, offset + PACKET_SIZE) === 0;
+          if (duplicate) { stat.duplicatePackets++; this.duplicatePackets++; }
+          else error = true;
+        } else error = cc !== ((stat.lastCC + 1) & 0x0f);
+      } else if (!hasPayload && stat.lastCC !== null) error = cc !== stat.lastCC;
+      if (error) { stat.continuityErrors++; this.continuityErrors++; }
+      if (hasPayload) {
+        stat.lastCC = cc;
+        // Reuse one small private payload buffer per PID, rather than retaining
+        // an entire shared media frame or allocating on every TS packet.
+        stat.payload ||= Buffer.allocUnsafe(184);
+        stat.payloadLength = offset + PACKET_SIZE - payloadOffset;
+        packet.copy(stat.payload, 0, payloadOffset, offset + PACKET_SIZE);
+      }
+    }
+    if (payloadStart && pid > 0x1f) this.pesStarts += 1;
     this.pidStats.set(pid, stat);
   }
 
   snapshot() {
     const elapsed = Math.max(1, Date.now() - this.startedAt);
-    const pids = [...this.pidStats.entries()].map(([pid, value]) => ({ pid, packets: value.packets, continuityErrors: value.continuityErrors })).sort((a, b) => b.packets - a.packets);
+    const pids = [...this.pidStats.entries()].map(([pid, value]) => ({ pid, packets: value.packets, continuityErrors: value.continuityErrors, duplicatePackets: value.duplicatePackets, discontinuities: value.discontinuities, teiPackets: value.teiPackets, malformedPackets: value.malformedPackets })).sort((a, b) => b.packets - a.packets);
     return {
       bitrateKbps: Math.round((this.bytes * 8) / elapsed),
       bytes: this.bytes,
@@ -66,6 +97,10 @@ export class MPEGTSAnalyzer {
       pids: pids.slice(0, 32),
       syncErrors: this.syncErrors,
       continuityErrors: this.continuityErrors,
+      duplicatePackets: this.duplicatePackets,
+      discontinuities: this.discontinuities,
+      teiPackets: this.teiPackets,
+      malformedPackets: this.malformedPackets,
       pesStarts: this.pesStarts,
       scrambledPackets: this.scrambledPackets,
       lastPacketAt: this.lastPacketAt,

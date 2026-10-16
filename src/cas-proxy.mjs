@@ -126,6 +126,7 @@ export class CASProxyManager extends EventEmitter {
     this.signature = null;
     this.stopping = false;
     this.guards = new Map();
+    this.guardedPorts = new Map();
     this.metrics = { found: 0, rejected: 0, timeout: 0, maxResponseMs: 0 }; this.logBuffer = '';
     this.spawnChild = options.spawnChild || spawn; this.waitForPorts = options.waitForPorts || waitForPorts;
     this.guardFactory = options.guardFactory || ((options) => new ProviderGuard(options));
@@ -146,24 +147,23 @@ export class CASProxyManager extends EventEmitter {
         const guard = this.guardFactory({ ...upstream, ...providerGuardOptions(), onReset: reason => this.logger.warn('cas', `Provider connection reset for profile ${profile.name || profile.id}: ${reason}`) });
         this.guards.set(profile.id, guard); guardedPorts.set(profile.id, await guard.start());
       }
+      const generated = buildOscamConfiguration(profiles, { guardedPorts });
+      for (const [id, connection] of generated.connections) Object.defineProperties(connection, {
+        scheduleDecoderStart: { value: start => this.guards.get(id).scheduleDecoderStart(start) },
+        isAvailable: { value: () => this.ready },
+      });
+      await rm(this.runtimeDir, { recursive: true, force: true });
+      await mkdir(this.runtimeDir, { recursive: true, mode: 0o700 });
+      await Promise.all([
+        writeFile(join(this.runtimeDir, 'oscam.conf'), generated.conf, { mode: 0o600 }),
+        writeFile(join(this.runtimeDir, 'oscam.server'), generated.server, { mode: 0o600 }),
+        writeFile(join(this.runtimeDir, 'oscam.user'), generated.user, { mode: 0o600 }),
+      ]);
+      this.stopping = false;
+      this.metrics = { found: 0, rejected: 0, timeout: 0, maxResponseMs: 0 };
+      this.connections = generated.connections; this.guardedPorts = guardedPorts; this.signature = signature; this.generated = generated; this.profiles = profiles; this.recoveryAttempt = 0;
+      await this.launch(this.generation);
     } catch (error) { await this.stop(); throw error; }
-    const generated = buildOscamConfiguration(profiles, { guardedPorts });
-    for (const [id, connection] of generated.connections) Object.defineProperties(connection, {
-      scheduleDecoderStart: { value: start => this.guards.get(id).scheduleDecoderStart(start) },
-      isAvailable: { value: () => this.ready },
-    });
-    await rm(this.runtimeDir, { recursive: true, force: true });
-    await mkdir(this.runtimeDir, { recursive: true, mode: 0o700 });
-    await Promise.all([
-      writeFile(join(this.runtimeDir, 'oscam.conf'), generated.conf, { mode: 0o600 }),
-      writeFile(join(this.runtimeDir, 'oscam.server'), generated.server, { mode: 0o600 }),
-      writeFile(join(this.runtimeDir, 'oscam.user'), generated.user, { mode: 0o600 }),
-    ]);
-    this.stopping = false;
-    this.metrics = { found: 0, rejected: 0, timeout: 0, maxResponseMs: 0 };
-    this.connections = generated.connections; this.signature = signature; this.generated = generated; this.profiles = profiles; this.recoveryAttempt = 0;
-    try { await this.launch(this.generation); }
-    catch (error) { await this.stop(); throw error; }
     this.logger.info('cas', `Shared CAS proxy active: ${profiles.length} profile${profiles.length === 1 ? '' : 's'}, one upstream connection per profile`);
     return this.connections;
   }
@@ -187,9 +187,23 @@ export class CASProxyManager extends EventEmitter {
     };
     child.stdout.on('data', (chunk) => {
       if (this.child !== child) return;
-      logBuffer = (logBuffer + String(chunk)).slice(-16384);
-      const lines = logBuffer.split(/\r?\n/); logBuffer = lines.pop();
+      // Bound the unfinished line, not the whole read. Truncating a large
+      // stdout chunk before splitting discarded valid reader-ready markers
+      // (and ECM metrics) when many startup lines arrived together.
+      const lines = String(chunk).split(/\r?\n/);
+      lines[0] = logBuffer + lines[0]; logBuffer = lines.pop().slice(-16384);
       for (const line of lines) {
+        // OSCam emits this only after LOGIN_ACK and a validated CARD_DATA
+        // response. Listening ports alone do not mean an upstream reader is
+        // authenticated. Do not retain or publish the raw line (it has IDs).
+        // cs_log() stdout identifies the protocol/thread, not the reader
+        // label. Match the generated guard's loopback endpoint instead; a
+        // provider address, account name or raw UserID is never retained.
+        const readyReader = line.match(/\bNewcamd Server:\s*127\.0\.0\.1:(\d+)\s+-\s+UserID:/);
+        if (readyReader) {
+          const port = Number(readyReader[1]);
+          for (const [id, guardedPort] of this.guardedPorts) if (guardedPort === port) this.guards.get(id)?.setReaderReady?.(true);
+        }
         if (!line.includes('(ecm)')) continue;
         const account = line.match(/\bastra_(\d+)\b/);
         const profile = account ? profiles[Number(account[1]) - 1] : null;
@@ -218,6 +232,7 @@ export class CASProxyManager extends EventEmitter {
   }
 
   setAvailable(available) {
+    if (!available) for (const guard of this.guards.values()) guard.setReaderReady?.(false);
     if (this.ready === available) return;
     this.ready = available; this.emit('availability', available);
   }
@@ -255,6 +270,7 @@ export class CASProxyManager extends EventEmitter {
     this.recoveryTimer = null; this.recovering = false;
     this.child = null;
     this.connections = new Map();
+    this.guardedPorts = new Map();
     this.signature = null;
     await Promise.all([...this.guards.values()].map(guard => guard.stop())); this.guards.clear();
     if (!child || child.exitCode !== null) return;

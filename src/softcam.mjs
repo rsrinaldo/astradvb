@@ -1,5 +1,27 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+
+export const NATIVE_CAS_POLICY_VERSION = 3;
+export const NATIVE_CAS_SOURCE_REVISION = 'f4876e84cf1866645f84b93f830af67193c85f69';
+const nativeVerification = new Map();
+
+// A leftover patch marker does not prove which executable is running. Verify
+// the installed build once per executable/manifest identity, without exposing
+// native argv, credentials, keys, or provider data.
+export function protectedNativeBuild(binary = process.env.ASTRA_TSDECRYPT || '/usr/local/bin/tsdecrypt', manifestPath = process.env.ASTRA_NATIVE_CAS_MANIFEST || '/usr/local/share/licenses/tsdecrypt/astra-native-cas.json') {
+  try {
+    const binaryStat = statSync(binary); const manifestStat = statSync(manifestPath);
+    const identity = [binaryStat.ino, binaryStat.size, binaryStat.mtimeMs, binaryStat.ctimeMs, manifestStat.ino, manifestStat.size, manifestStat.mtimeMs, manifestStat.ctimeMs].join(':');
+    const key = `${binary}\0${manifestPath}`; const cached = nativeVerification.get(key);
+    if (cached?.identity === identity) return cached.valid;
+    if (manifestStat.size > 16384 || binaryStat.size > 32 * 1024 * 1024) return false;
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    const valid = manifest.policyVersion === NATIVE_CAS_POLICY_VERSION && manifest.sourceRevision === NATIVE_CAS_SOURCE_REVISION && /^[a-f0-9]{64}$/.test(manifest.binarySha256 || '') && createHash('sha256').update(readFileSync(binary)).digest('hex') === manifest.binarySha256;
+    if (nativeVerification.size >= 16) nativeVerification.clear();
+    nativeVerification.set(key, { identity, valid }); return valid;
+  } catch { return false; }
+}
 
 // Default to live decryption. The legacy native packet delay does not retain
 // a key epoch per packet: key updates can invalidate packets still waiting in
@@ -43,8 +65,8 @@ export function formatTsdecryptCaid(value) {
 export class SoftcamBridge {
   constructor(stream, profile, connection, onData, logger, options = {}) {
     this.stream = stream; this.profile = profile; this.connection = connection; this.onData = onData; this.logger = logger; this.child = null; this.status = 'stopped'; this.lastOutputAt = 0; this.watchdog = null;
-    this.diagnostics = { outputPauses: 0, outputResumes: 0, cwFailures: 0, protocolErrors: 0, protocolReasons: {}, lastEvent: null }; this.stderrBuffer = '';
-    this.spawnChild = options.spawnChild || spawn; this.protectedBuild = options.protectedBuild || (() => existsSync('/usr/local/share/licenses/tsdecrypt/astra-ecm-protection.patch'));
+    this.diagnostics = { outputPauses: 0, outputResumes: 0, cwFailures: 0, protocolErrors: 0, protocolReasons: {}, nativeInputOverflows: 0, inputQueueOverflows: 0, startupDroppedBytes: 0, inputBytes: 0, outputBytes: 0, inputHighWaterBytes: 0, maxOutputGapMs: 0, lastEvent: null }; this.stderrBuffer = '';
+    this.spawnChild = options.spawnChild || spawn; this.protectedBuild = options.protectedBuild || protectedNativeBuild;
     this.setTimer = options.setTimer || setTimeout; this.clearTimer = options.clearTimer || clearTimeout;
     this.onDiscontinuity = options.onDiscontinuity || (() => {}); this.now = options.now || Date.now;
     this.stopped = true; this.backendAvailable = connection?.isAvailable?.() ?? true; this.retryTimer = null; this.retryAttempt = 0; this.startedBefore = false;
@@ -54,7 +76,7 @@ export class SoftcamBridge {
   start() {
     if (this.child || this.cancelStart || this.retryTimer) return;
     if (!this.connection) throw new Error(`Shared CAS connection for profile ${this.stream.cam.profile} is unavailable`);
-    if (!this.protectedBuild()) throw new Error('Install the protected tsdecrypt build with install-cas.sh before enabling CAS');
+    if (!this.protectedBuild()) throw new Error('Install the verified native CAS policy v3 build with install-cas.sh before enabling CAS');
     this.stopped = false; this.queueStart();
   }
 
@@ -75,6 +97,7 @@ export class SoftcamBridge {
   }
 
   #spawn() {
+    if (!this.protectedBuild()) throw new Error('Native CAS executable verification failed');
     const binary = process.env.ASTRA_TSDECRYPT || '/usr/local/bin/tsdecrypt';
     this.inputBufferMs = casInputBufferMs();
     const args = tsdecryptArgs(this.stream, this.profile, this.connection, this.inputBufferMs);
@@ -84,13 +107,13 @@ export class SoftcamBridge {
     this.startedBefore = true;
     child.stderr.on('data', (chunk) => {
       if (this.child !== child) return;
-      this.stderrBuffer = (this.stderrBuffer + String(chunk)).slice(-16384);
-      const lines = this.stderrBuffer.split(/\r?\n/); this.stderrBuffer = lines.pop();
+      const lines = (this.stderrBuffer + String(chunk)).split(/\r?\n/); this.stderrBuffer = lines.pop().slice(-16384);
       for (const line of lines) {
         let event;
-        if (/stopping output/.test(line)) { this.diagnostics.outputPauses++; event = 'invalid decrypted payload'; }
+        if (/stopping output/.test(line)) { this.diagnostics.outputPauses++; event = 'native payload validation paused'; }
         else if (/Got decrypted data/.test(line)) { this.diagnostics.outputResumes++; event = 'decrypted payload resumed'; }
         else if (/No valid code word|No code word has been received|Card was not able to decode/.test(line)) { this.diagnostics.cwFailures++; event = 'control word unavailable'; }
+        else if (/Decode buffer is full|Write buffer is full|write buffer is full/.test(line)) { this.diagnostics.nativeInputOverflows++; event = 'native media queue overflow'; }
         else if (/ERR \|/.test(line)) {
           this.diagnostics.protocolErrors++;
           const reason = ['Bad msg_id', 'msg_id sync error', 'Failed to read message', 'Checksum error', 'EMM rejected', 'EMM unexpected server response', 'Unexpected CAMD server response', 'Error sending ecm', 'Error sending emm', 'Login failed'].find((value) => line.includes(value)) || 'other';
@@ -103,6 +126,8 @@ export class SoftcamBridge {
     child.stdout.on('data', (chunk) => {
       if (this.child !== child || this.stopped) return;
       const now = this.now();
+      if (this.lastOutputAt) this.diagnostics.maxOutputGapMs = Math.max(this.diagnostics.maxOutputGapMs, now - this.lastOutputAt);
+      this.diagnostics.outputBytes += chunk.length;
       if (!this.healthySince || now - this.lastOutputAt > 5000) this.healthySince = now;
       if (now - this.healthySince >= 60000) this.retryAttempt = 0;
       this.lastOutputAt = now;
@@ -126,9 +151,11 @@ export class SoftcamBridge {
     if (this.stopped) return;
     if (this.cancelStart || this.retryTimer || !this.backendAvailable) {
       this.pending.push(chunk); this.pendingBytes += chunk.length;
-      while (this.pendingBytes > 512 * 1024 && this.pending.length) this.pendingBytes -= this.pending.shift().length;
+      while (this.pendingBytes > 512 * 1024 && this.pending.length) { const dropped = this.pending.shift().length; this.pendingBytes -= dropped; this.diagnostics.startupDroppedBytes += dropped; }
     } else if (this.child?.stdin.writable) {
-      if (this.child.stdin.writableLength + chunk.length > 2 * 1024 * 1024) { this.failed(this.child, 'decoder input queue overflow'); return; }
+      this.diagnostics.inputHighWaterBytes = Math.max(this.diagnostics.inputHighWaterBytes, this.child.stdin.writableLength + chunk.length);
+      if (this.child.stdin.writableLength + chunk.length > 2 * 1024 * 1024) { this.diagnostics.inputQueueOverflows++; this.failed(this.child, 'decoder input queue overflow'); return; }
+      this.diagnostics.inputBytes += chunk.length;
       this.child.stdin.write(chunk);
     }
   }

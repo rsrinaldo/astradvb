@@ -2,45 +2,19 @@ import { runDVBInput, scanDVBAdapter } from './dvb.mjs';
 import { TransportStreamFramer } from './mpegts.mjs';
 import { DVBServiceCollector } from './dvb-services.mjs';
 import { mpegCRC32 } from './mpeg-crc.mjs';
+import { SISectionAssembler } from './si-metadata.mjs';
 
 const PACKET_SIZE = 188;
 
-function payload(packet) {
-  const control = (packet[3] >> 4) & 0x03;
-  if (control !== 1 && control !== 3) return null;
-  const offset = control === 3 ? 5 + packet[4] : 4;
-  return offset < PACKET_SIZE ? packet.subarray(offset) : null;
-}
-
-class SectionAssembler {
-  constructor() { this.buffer = Buffer.alloc(0); }
-  push(packet) {
-    let data = payload(packet);
-    if (!data?.length) return [];
-    if (packet[1] & 0x40) {
-      const pointer = data[0];
-      data = data.subarray(Math.min(data.length, pointer + 1));
-      this.buffer = Buffer.alloc(0);
-    }
-    this.buffer = this.buffer.length ? Buffer.concat([this.buffer, data]) : Buffer.from(data);
-    const sections = [];
-    while (this.buffer.length >= 3 && this.buffer[0] !== 0xff) {
-      const length = 3 + (((this.buffer[1] & 0x0f) << 8) | this.buffer[2]);
-      if (length < 8 || length > 4096 || this.buffer.length < length) break;
-      sections.push(this.buffer.subarray(0, length)); this.buffer = this.buffer.subarray(length);
-    }
-    if (this.buffer.length && this.buffer[0] === 0xff) this.buffer = Buffer.alloc(0);
-    return sections;
-  }
-}
-
 function caPids(descriptors, target) {
-  for (let offset = 0; offset + 2 <= descriptors.length;) {
+  let offset = 0;
+  for (; offset + 2 <= descriptors.length;) {
     const length = descriptors[offset + 1];
-    if (offset + 2 + length > descriptors.length) break;
+    if (offset + 2 + length > descriptors.length) return false;
     if (descriptors[offset] === 0x09 && length >= 4) target.add(((descriptors[offset + 4] & 0x1f) << 8) | descriptors[offset + 5]);
     offset += 2 + length;
   }
+  return offset === descriptors.length;
 }
 
 export class MPEGTSServiceFilter {
@@ -48,8 +22,9 @@ export class MPEGTSServiceFilter {
     this.serviceId = Math.max(0, Math.trunc(Number(serviceId) || 0));
     this.pmtPid = -1; this.pat = null; this.patCC = 0;
     this.allowed = new Set([0, 1, 17, 18, 20]);
+    this.programPids = new Set(); this.catPids = new Set(); this.catVersion = null; this.catParts = new Map();
     this.onPID = onPID;
-    this.patSections = new SectionAssembler(); this.pmtSections = new SectionAssembler(); this.catSections = new SectionAssembler();
+    this.patSections = new SISectionAssembler(); this.pmtSections = new SISectionAssembler(); this.catSections = new SISectionAssembler();
   }
   push(chunk) {
     if (!this.serviceId || !chunk?.length) return chunk || Buffer.alloc(0);
@@ -71,26 +46,35 @@ export class MPEGTSServiceFilter {
         return this.pat ? this.#patPacket() : packet;
       } else if (pid === 1) {
         for (const section of this.catSections.push(packet)) {
-          if (section[0] === 0x01 && section.length >= 12) caPids(section.subarray(8, section.length - 4), this.allowed);
+          if (section[0] !== 0x01 || section.length < 12 || !(section[5] & 1)) continue;
+          const next = new Set();
+          if (!caPids(section.subarray(8, section.length - 4), next) || section[6] > section[7]) continue;
+          const version = `${section.readUInt16BE(3)}:${section[5]}:${section[7]}`;
+          if (this.catVersion !== version) { this.catVersion = version; this.catParts.clear(); }
+          this.catParts.set(section[6], next);
+          if (this.catParts.size === section[7] + 1) this.catPids = new Set([...this.catParts.values()].flatMap(value => [...value]));
+          else for (const pid of next) this.catPids.add(pid);
+          this.#routes();
         }
-        for (const allowed of this.allowed) this.onPID?.(allowed);
         return packet;
       } else if (pid === this.pmtPid) {
         for (const section of this.pmtSections.push(packet)) this.#pmt(section);
-        for (const allowed of this.allowed) this.onPID?.(allowed);
         return packet;
       } else if (this.allowed.has(pid)) return packet;
       return null;
   }
   #pat(section) {
-    if (section[0] !== 0x00 || section.length < 12) return;
+    if (section[0] !== 0x00 || section.length < 12 || !(section[5] & 1)) return;
     const end = section.length - 4;
     for (let offset = 8; offset + 4 <= end; offset += 4) {
       const program = section.readUInt16BE(offset);
       if (program !== this.serviceId) continue;
-      this.pmtPid = ((section[offset + 2] & 0x1f) << 8) | section[offset + 3]; this.allowed.add(this.pmtPid); this.onPID?.(this.pmtPid);
+      const nextPid = ((section[offset + 2] & 0x1f) << 8) | section[offset + 3];
+      if (this.pmtPid !== nextPid) { this.pmtSections.reset(); this.programPids.clear(); }
+      this.pmtPid = nextPid; this.#routes();
       const pat = Buffer.alloc(12);
       pat[0] = 0x00; pat[1] = 0xb0; pat[2] = 13; section.copy(pat, 3, 3, 8);
+      pat[6] = 0; pat[7] = 0; // The selected service is the whole output PAT.
       pat.writeUInt16BE(this.serviceId, 8); pat[10] = 0xe0 | ((this.pmtPid >> 8) & 0x1f); pat[11] = this.pmtPid & 0xff;
       const crc = mpegCRC32(pat);
       this.pat = Buffer.alloc(16); pat.copy(this.pat); this.pat.writeUInt32BE(crc, 12); return;
@@ -102,17 +86,31 @@ export class MPEGTSServiceFilter {
     this.pat.copy(packet, 5); return packet;
   }
   #pmt(section) {
-    if (section[0] !== 0x02 || section.length < 16 || section.readUInt16BE(3) !== this.serviceId) return;
+    if (section[0] !== 0x02 || section.length < 16 || section.readUInt16BE(3) !== this.serviceId || !(section[5] & 1)) return;
     const end = section.length - 4;
-    const pcrPid = ((section[8] & 0x1f) << 8) | section[9]; if (pcrPid < 0x1fff) this.allowed.add(pcrPid);
+    const next = new Set();
+    const pcrPid = ((section[8] & 0x1f) << 8) | section[9]; if (pcrPid < 0x1fff) next.add(pcrPid);
     const programInfoLength = ((section[10] & 0x0f) << 8) | section[11];
-    caPids(section.subarray(12, Math.min(end, 12 + programInfoLength)), this.allowed);
-    for (let offset = 12 + programInfoLength; offset + 5 <= end;) {
+    if (12 + programInfoLength > end || !caPids(section.subarray(12, 12 + programInfoLength), next)) return;
+    let offset = 12 + programInfoLength;
+    for (; offset + 5 <= end;) {
       const elementaryPid = ((section[offset + 1] & 0x1f) << 8) | section[offset + 2];
       const infoLength = ((section[offset + 3] & 0x0f) << 8) | section[offset + 4];
-      this.allowed.add(elementaryPid); caPids(section.subarray(offset + 5, Math.min(end, offset + 5 + infoLength)), this.allowed);
+      if (offset + 5 + infoLength > end) return;
+      next.add(elementaryPid); if (!caPids(section.subarray(offset + 5, offset + 5 + infoLength), next)) return;
       offset += 5 + infoLength;
     }
+    if (offset !== end) return;
+    // Replace, rather than accumulate, PMT PIDs: broadcasters can reassign an
+    // old video/ECM PID to another service after a table-version change.
+    this.programPids = next; this.#routes();
+  }
+  #routes() {
+    const next = new Set([0, 1, 17, 18, 20, ...this.catPids, ...this.programPids]);
+    if (this.pmtPid >= 0) next.add(this.pmtPid);
+    for (const pid of this.allowed) if (!next.has(pid)) this.onPID?.(pid, false);
+    for (const pid of next) if (!this.allowed.has(pid)) this.onPID?.(pid, true);
+    this.allowed = next;
   }
 }
 
@@ -122,7 +120,10 @@ export class MPEGTSDispatcher {
   add(key, filter, onData) {
     this.remove(key);
     const entry = { filter, onData, pids: new Set() };
-    const route = pid => { if (entry.pids.has(pid)) return; entry.pids.add(pid); (this.routes[pid] ||= new Set()).add(entry); };
+    const route = (pid, enabled = true) => {
+      if (!enabled) { entry.pids.delete(pid); this.routes[pid]?.delete(entry); if (!this.routes[pid]?.size) this.routes[pid] = null; return; }
+      if (entry.pids.has(pid)) return; entry.pids.add(pid); (this.routes[pid] ||= new Set()).add(entry);
+    };
     this.entries.set(key, entry);
     if (filter.serviceId) { filter.onPID = route; for (const pid of filter.allowed) route(pid); }
   }

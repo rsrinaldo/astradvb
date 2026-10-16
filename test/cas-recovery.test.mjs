@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
@@ -75,6 +75,19 @@ test('a local decoder launch exception is retried instead of escaping the admiss
   s.bridge.start(); assert.doesNotThrow(s.admit); assert.equal(s.bridge.retryTimer.ms, 2000); assert.equal(s.bridge.status, 'recovering');
 });
 
+test('queued admissions verify the executable again immediately before spawning', t => {
+  const s = decoderSetup(t); let valid = true; s.bridge.protectedBuild = () => valid;
+  s.bridge.start(); valid = false; s.admit();
+  assert.equal(s.children.length, 0); assert.equal(s.bridge.status, 'recovering');
+});
+
+test('coalesced native diagnostics retain early complete error lines without publishing raw text', t => {
+  const s = decoderSetup(t); s.bridge.start(); s.admit();
+  s.children[0].stderr.emit('data', Buffer.from('Decode buffer is full, waiting...\nERR | Checksum error\n' + 'ordinary native message\n'.repeat(1500)));
+  assert.equal(s.bridge.diagnostics.nativeInputOverflows, 1); assert.equal(s.bridge.diagnostics.protocolErrors, 1);
+  assert.equal(s.bridge.diagnostics.protocolReasons['Checksum error'], 1); assert.ok(s.bridge.stderrBuffer.length <= 16384);
+});
+
 test('recovering ninety decoders never bypasses the five-per-five-second startup limit', t => {
   let now = 0; let id = 0; const scheduled = new Map(); const starts = [];
   const setTimer = (fn, ms) => { const token = ++id; scheduled.set(token, { at: now + ms, fn }); return token; };
@@ -103,7 +116,7 @@ async function proxySetup(t) {
   process.env.ASTRA_SECRET_KEY = '55'.repeat(32);
   const directory = await mkdtemp(join(tmpdir(), 'astra-cas-recovery-')); const timer = timers(); const children = []; const guards = [];
   const profile = { id: 'provider', name: 'Provider', caid: '0B00', lineEncrypted: encryptSecret('host.example.test 15000 user pass 0102030405060708091011121314') };
-  const proxy = new CASProxyManager(new RingLogger(), { ...timer, runtimeDir: directory, spawnChild: () => { const child = fakeChild(); children.push(child); return child; }, waitForPorts: async () => {}, guardFactory: () => { const guard = { starts: 0, stops: 0, async start() { this.starts++; return 31000; }, async stop() { this.stops++; }, scheduleDecoderStart() {}, snapshot() { return {}; } }; guards.push(guard); return guard; } });
+  const proxy = new CASProxyManager(new RingLogger(), { ...timer, runtimeDir: directory, spawnChild: () => { const child = fakeChild(); children.push(child); return child; }, waitForPorts: async () => {}, guardFactory: () => { const guard = { starts: 0, stops: 0, readerStates: [], async start() { this.starts++; return 31000 + guards.indexOf(this); }, async stop() { this.stops++; }, setReaderReady(ready) { this.readerStates.push(ready); }, scheduleDecoderStart() {}, result() {}, snapshot() { return {}; } }; guards.push(guard); return guard; } });
   t.after(async () => { await proxy.stop(); await rm(directory, { recursive: true, force: true }); });
   return { proxy, profile, children, guards, timer, directory };
 }
@@ -125,4 +138,63 @@ test('repeated proxy crashes back off and stopping cancels recovery', async t =>
   s.children[0].crash(1); await s.timer.fire(s.proxy.recoveryTimer); s.children[1].crash(1);
   assert.equal(s.proxy.recoveryTimer.ms, 4000); const retry = s.proxy.recoveryTimer;
   await s.proxy.stop(); await s.timer.fire(retry); assert.equal(s.children.length, 2); assert.equal(s.guards[0].stops, 1);
+});
+
+test('listening downstream ports cannot admit a decoder before validated upstream card data', async t => {
+  const s = await proxySetup(t); await s.proxy.start([s.profile]);
+  assert.equal(s.proxy.ready, true); assert.deepEqual(s.guards[0].readerStates, []);
+  const connection = s.proxy.connections.get(s.profile.id);
+  assert.equal(connection.isAvailable(), true); // Process readiness is separate from reader admission.
+  s.children[0].stdout.write('profile_1 [newcamd] connecting to provider.test\nprofile_1 [newcamd] server greeting received\n');
+  assert.deepEqual(s.guards[0].readerStates, []);
+  s.children[0].stdout.write('00:00:00 12345678 p (newcamd) Newcamd Server: 127.0.0.1:31999 - UserID: 1\n');
+  assert.deepEqual(s.guards[0].readerStates, []);
+  s.children[0].stdout.write('00:00:00 12345678 p (newcamd) Newcamd Ser');
+  assert.deepEqual(s.guards[0].readerStates, []);
+  s.children[0].stdout.write('ver: 127.0.0.1:31000 - UserID: redacted\n'); assert.deepEqual(s.guards[0].readerStates, [true]);
+  assert.ok(!s.proxy.logger.entries.some(entry => entry.message.includes('redacted')), 'raw reader/card details must not enter application logs');
+});
+
+test('proxy recovery pauses pending admissions and ignores retired-child reader-ready output', async t => {
+  const s = await proxySetup(t); await s.proxy.start([s.profile]); const old = s.children[0];
+  old.stdout.write('00:00:00 12345678 p (newcamd) Newcamd Server: 127.0.0.1:31000 - UserID: redacted\n'); assert.deepEqual(s.guards[0].readerStates, [true]);
+  old.crash(1); assert.deepEqual(s.guards[0].readerStates, [true, false]);
+  old.stdout.write('00:00:00 12345678 p (newcamd) Newcamd Server: 127.0.0.1:31000 - UserID: retired\n'); assert.deepEqual(s.guards[0].readerStates, [true, false]);
+  await s.timer.fire(s.proxy.recoveryTimer); assert.equal(s.proxy.ready, true);
+  assert.deepEqual(s.guards[0].readerStates, [true, false]);
+  s.children[1].stdout.write('00:00:00 87654321 p (newcamd) Newcamd Server: 127.0.0.1:31000 - UserID: replacement\n');
+  assert.deepEqual(s.guards[0].readerStates, [true, false, true]);
+});
+
+test('large coalesced startup output cannot truncate the authenticated reader marker', async t => {
+  const s = await proxySetup(t); await s.proxy.start([s.profile]);
+  s.children[0].stdout.write(`00:00:00 12345678 p (newcamd) Newcamd Server: 127.0.0.1:31000 - UserID: redacted\n${'startup detail\n'.repeat(2000)}astra_1 (ecm) : found (24 ms)\n`);
+  assert.deepEqual(s.guards[0].readerStates, [true]); assert.equal(s.proxy.metrics.found, 1);
+  assert.equal(s.proxy.metrics.maxResponseMs, 24);
+});
+
+test('native reader readiness maps only its generated loopback guard port to the correct profile', async t => {
+  const s = await proxySetup(t); await s.proxy.start([s.profile, { ...s.profile, id: 'second' }]);
+  s.children[0].stdout.write('00:00:00 12345678 p (newcamd) Newcamd Server: 127.0.0.1:31001 - UserID: 1\n');
+  assert.deepEqual(s.guards[0].readerStates, []); assert.deepEqual(s.guards[1].readerStates, [true]);
+  s.children[0].stdout.write('00:00:00 12345678 p (newcamd) Newcamd Server: provider.test:31000 - UserID: 1\n');
+  assert.deepEqual(s.guards[0].readerStates, []);
+  s.children[0].stdout.write('00:00:00 12345678 p (newcamd) Newcamd Server: 127.0.0.1:31000 - UserID: 1\n');
+  assert.deepEqual(s.guards[0].readerStates, [true]); assert.deepEqual(s.guards[1].readerStates, [true]);
+});
+
+test('invalid generated configuration closes every started provider guard', async t => {
+  const s = await proxySetup(t);
+  await assert.rejects(s.proxy.start([{ ...s.profile, caid: 'invalid' }]), /four-digit hexadecimal CAID/);
+  assert.equal(s.guards.length, 1); assert.equal(s.guards[0].stops, 1); assert.equal(s.proxy.guards.size, 0);
+  assert.equal(s.proxy.connections.size, 0); assert.equal(s.proxy.child, null); assert.equal(s.children.length, 0);
+});
+
+test('runtime configuration write failure closes provider guards before rejecting startup', async t => {
+  const s = await proxySetup(t); const blocker = join(s.directory, 'regular-file'); await writeFile(blocker, 'fixture');
+  s.proxy.runtimeDir = join(blocker, 'cannot-create');
+  await assert.rejects(s.proxy.start([s.profile]));
+  assert.equal(s.guards.length, 1); assert.equal(s.guards[0].stops, 1); assert.equal(s.proxy.guards.size, 0);
+  assert.equal(s.proxy.connections.size, 0); assert.equal(s.proxy.child, null); assert.equal(s.children.length, 0);
+  assert.equal(await readFile(blocker, 'utf8'), 'fixture');
 });

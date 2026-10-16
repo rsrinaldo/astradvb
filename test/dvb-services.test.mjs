@@ -101,3 +101,67 @@ test('a late service join has independent PSI state and does not reset existing 
   assert.deepEqual(joined[0], fresh); assert.equal(first.length, 2);
   assert.notEqual(first[1][3] & 15, joined[0][3] & 15);
 });
+
+function mediaPacket(pid, cc = 0) {
+  const value = Buffer.alloc(188, 0xff); value.set([0x47, (pid >> 8) & 31, pid & 255, 0x10 | cc]); return value;
+}
+
+function selectedPMT(pid = 256, descriptors = Buffer.alloc(0)) {
+  return section([2, 0, 0, 0, 100, 0xc1, 0, 0, 0xe0 | (pid >> 8), pid & 255, 0xf0 | (descriptors.length >> 8), descriptors.length & 255], Buffer.concat([descriptors, Buffer.from([0x1b, 0xe0 | (pid >> 8), pid & 255, 0xf0, 0])]));
+}
+
+test('service filtering rejects damaged PMT CRC and next-version tables instead of admitting unrelated media', () => {
+  const sender = new StreamMetadata('Mux'); const filter = new MPEGTSServiceFilter(100); filter.push(tables(sender));
+  const corrupt = selectedPMT(777); corrupt[13] ^= 1;
+  const future = selectedPMT(778); future[5] &= 0xfe; future.writeUInt32BE(mpegCRC32(future.subarray(0, -4)), future.length - 4);
+  filter.push(Buffer.concat([sender.packets(100, corrupt), sender.packets(100, future)]));
+  assert.equal(filter.push(Buffer.concat([mediaPacket(777), mediaPacket(778)])).length, 0);
+  assert.equal(filter.push(mediaPacket(256)).length, 188);
+});
+
+test('service filtering completes a PMT in the next packet pointer bytes without losing its media PIDs', () => {
+  const filter = new MPEGTSServiceFilter(100); const sender = new StreamMetadata('Mux'); filter.push(sender.packets(0, section([0, 0, 0, 0, 1, 0xc1, 0, 0], Buffer.from([0, 100, 0xe0, 100]))));
+  const descriptors = Buffer.concat([Buffer.from([0x80, 170]), Buffer.alloc(170)]); const pmt = selectedPMT(512, descriptors);
+  const first = mediaPacket(100); first[1] |= 0x40; first[4] = 0; pmt.copy(first, 5, 0, 183);
+  const tail = pmt.subarray(183); const second = mediaPacket(100, 1); second[1] |= 0x40; second[4] = tail.length;
+  tail.copy(second, 5); pmt.copy(second, 5 + tail.length, 0, 183 - tail.length);
+  filter.push(Buffer.concat([first, second]));
+  assert.deepEqual(filter.push(mediaPacket(512)), mediaPacket(512));
+});
+
+test('a PMT PID remap removes old service routes and preserves the updated media byte-for-byte', () => {
+  const sender = new StreamMetadata('Mux'); const dispatcher = new MPEGTSDispatcher(); const output = [];
+  dispatcher.add('channel', new MPEGTSServiceFilter(100), bytes => output.push(bytes)); dispatcher.push(tables(sender));
+  dispatcher.push(sender.packets(100, selectedPMT(512))); output.length = 0;
+  dispatcher.push(Buffer.concat([mediaPacket(256), mediaPacket(257), mediaPacket(300), mediaPacket(512)]));
+  assert.deepEqual(Buffer.concat(output), mediaPacket(512));
+  assert.equal(dispatcher.routes[256], null); assert.equal(dispatcher.routes[257], null); assert.equal(dispatcher.routes[300], null);
+});
+
+test('a filtered PAT from a multi-section multiplex is a complete single-section service table', () => {
+  const sender = new StreamMetadata('Mux'); const filter = new MPEGTSServiceFilter(100);
+  const pat = section([0, 0, 0, 0, 1, 0xc1, 1, 2], Buffer.from([0, 100, 0xe0, 100]));
+  const output = filter.push(sender.packets(0, pat));
+  assert.equal(output[11], 0); assert.equal(output[12], 0);
+  assert.equal(mpegCRC32(output.subarray(5, 21)), 0);
+});
+
+test('changing a selected PMT PID removes the old PMT and elementary routes before learning the new table', () => {
+  const sender = new StreamMetadata('Mux'); const dispatcher = new MPEGTSDispatcher(); const output = [];
+  dispatcher.add('channel', new MPEGTSServiceFilter(100), bytes => output.push(bytes)); dispatcher.push(tables(sender));
+  const pat = section([0, 0, 0, 0, 1, 0xc3, 0, 0], Buffer.from([0, 100, 0xe0, 102]));
+  dispatcher.push(sender.packets(0, pat)); dispatcher.push(sender.packets(102, selectedPMT(512))); output.length = 0;
+  dispatcher.push(Buffer.concat([mediaPacket(100), mediaPacket(256), mediaPacket(512)]));
+  assert.deepEqual(Buffer.concat(output), mediaPacket(512)); assert.equal(dispatcher.routes[100], null);
+});
+
+test('multi-section CAT updates retain all current sections and retire PIDs only when the replacement is complete', () => {
+  const sender = new StreamMetadata('Mux'); const filter = new MPEGTSServiceFilter(100);
+  const cat = (part, version, pid) => section([1, 0, 0, 0, 1, version, part, 1], Buffer.from([9, 4, 0x0b, 0, 0xe0 | (pid >> 8), pid & 255]));
+  filter.push(sender.packets(1, cat(0, 0xc1, 300))); filter.push(sender.packets(1, cat(1, 0xc1, 301)));
+  assert.equal(filter.push(Buffer.concat([mediaPacket(300), mediaPacket(301)])).length, 376);
+  filter.push(sender.packets(1, cat(0, 0xc3, 302)));
+  assert.equal(filter.push(mediaPacket(301)).length, 188);
+  filter.push(sender.packets(1, cat(1, 0xc3, 303)));
+  assert.deepEqual(filter.push(Buffer.concat([mediaPacket(300), mediaPacket(301), mediaPacket(302), mediaPacket(303)])), Buffer.concat([mediaPacket(302), mediaPacket(303)]));
+});

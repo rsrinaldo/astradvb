@@ -1,0 +1,195 @@
+diff --git a/camd.c b/camd.c
+index 3333da4..ad72a50 100644
+--- a/camd.c
++++ b/camd.c
+@@ -105,11 +105,8 @@ void camd_set_cw(struct ts *ts, uint8_t *new_cw, int check_validity) {
+ 	c->key->ts = c->key->ts_keyset.tv_sec;
+ 	ts->cw_last_warn = c->key->ts;
+ 
+-	if (!check_validity || memcmp(new_cw, invalid_cw, 8) != 0)
+-		csa_set_even_cw(c->key->csakey, new_cw);
+-
+-	if (!check_validity || memcmp(new_cw + 8, invalid_cw, 8) != 0)
+-		csa_set_odd_cw(c->key->csakey, new_cw + 8);
++	/* Install both schedules atomically against the decode thread. */
++	csa_set_cw(c->key->csakey, new_cw, check_validity);
+ }
+ 
+ static int camd_recv_cw(struct ts *ts) {
+@@ -156,12 +153,12 @@ static int camd_recv_cw(struct ts *ts) {
+ 		ts_LOGf("CW  | OK: Valid code word was received.\n");
+ 		notify(ts, "CODE_WORD_OK", "Valid code word was received.");
+ 	}
+-	c->key->is_valid_cw = valid_cw;
+-
+ 	// At first ts_keyset is not initialized
+ 	last_ts_keyset = c->key->ts_keyset;
+-	if (c->key->is_valid_cw)
++	if (valid_cw)
+ 		camd_set_cw(ts, c->key->cw, 1);
++	/* Do not publish the first valid key before its schedules are installed. */
++	c->key->is_valid_cw = valid_cw;
+ 
+ 	if (ts->ecm_cw_log) {
+ 		ts_LOGf("CW  | SID 0x%04x CAID: 0x%04x CW_recv: %5llu ms LastKey: %5llu ms Data: %s\n",
+diff --git a/csa.c b/csa.c
+index ac08bce..0ca49f8 100644
+--- a/csa.c
++++ b/csa.c
+@@ -25,6 +25,7 @@
+ 
+ csakey_t *csa_key_alloc(void) {
+ 	struct csakey *key = calloc(1, sizeof(struct csakey));
++	pthread_mutex_init(&key->lock, NULL);
+ 	key->s_csakey[0] = dvbcsa_key_alloc();
+ 	key->s_csakey[1] = dvbcsa_key_alloc();
+ 	key->bs_csakey[0] = dvbcsa_bs_key_alloc();
+@@ -41,6 +42,7 @@ void csa_key_free(csakey_t **pcsakey) {
+ 		dvbcsa_bs_key_free(key->bs_csakey[0]);
+ 		dvbcsa_bs_key_free(key->bs_csakey[1]);
+ 		ffdecsa_key_free(key->ff_csakey);
++		pthread_mutex_destroy(&key->lock);
+ 		FREE(*pcsakey);
+ 	}
+ }
+@@ -55,22 +57,48 @@ inline unsigned int csa_get_batch_size(void) {
+ 	return 0;
+ }
+ 
+-inline void csa_set_even_cw(csakey_t *csakey, uint8_t *even_cw) {
++static void csa_set_even_cw_unlocked(csakey_t *csakey, uint8_t *even_cw) {
+ 	struct csakey *key = (struct csakey *)csakey;
+ 	dvbcsa_key_set(even_cw, key->s_csakey[0]);
+ 	dvbcsa_bs_key_set(even_cw, key->bs_csakey[0]);
+ 	ffdecsa_set_even_cw(key->ff_csakey, even_cw);
+ }
+ 
+-inline void csa_set_odd_cw(csakey_t *csakey, uint8_t *odd_cw) {
++static void csa_set_odd_cw_unlocked(csakey_t *csakey, uint8_t *odd_cw) {
+ 	struct csakey *key = (struct csakey *)csakey;
+ 	dvbcsa_key_set(odd_cw, key->s_csakey[1]);
+ 	dvbcsa_bs_key_set(odd_cw, key->bs_csakey[1]);
+ 	ffdecsa_set_odd_cw(key->ff_csakey, odd_cw);
+ }
+ 
++void csa_set_even_cw(csakey_t *csakey, uint8_t *cw) {
++	struct csakey *key = (struct csakey *)csakey;
++	pthread_mutex_lock(&key->lock);
++	csa_set_even_cw_unlocked(csakey, cw);
++	pthread_mutex_unlock(&key->lock);
++}
++
++void csa_set_odd_cw(csakey_t *csakey, uint8_t *cw) {
++	struct csakey *key = (struct csakey *)csakey;
++	pthread_mutex_lock(&key->lock);
++	csa_set_odd_cw_unlocked(csakey, cw);
++	pthread_mutex_unlock(&key->lock);
++}
++
++void csa_set_cw(csakey_t *csakey, uint8_t *cw, int check_validity) {
++	static const uint8_t zero[8] = {0};
++	struct csakey *key = (struct csakey *)csakey;
++	pthread_mutex_lock(&key->lock);
++	if (!check_validity || memcmp(cw, zero, 8) != 0)
++		csa_set_even_cw_unlocked(csakey, cw);
++	if (!check_validity || memcmp(cw + 8, zero, 8) != 0)
++		csa_set_odd_cw_unlocked(csakey, cw + 8);
++	pthread_mutex_unlock(&key->lock);
++}
++
+ inline void csa_decrypt_single_packet(csakey_t *csakey, uint8_t *ts_packet) {
+ 	struct csakey *key = (struct csakey *)csakey;
++	pthread_mutex_lock(&key->lock);
+ 	if (use_dvbcsa) {
+ 		unsigned int key_idx = ts_packet_get_scrambled(ts_packet) - 2;
+ 		unsigned int payload_offset = ts_packet_get_payload_offset(ts_packet);
+@@ -81,21 +109,28 @@ inline void csa_decrypt_single_packet(csakey_t *csakey, uint8_t *ts_packet) {
+ 		uint8_t *cluster[3] = { ts_packet, ts_packet + 188, NULL };
+ 		ffdecsa_decrypt_packets(key->ff_csakey, cluster);
+ 	}
++	pthread_mutex_unlock(&key->lock);
+ }
+ 
+ inline void csa_decrypt_multiple_even(csakey_t *csakey, struct csa_batch *batch) {
+ 	struct csakey *key = (struct csakey *)csakey;
++	pthread_mutex_lock(&key->lock);
+ 	dvbcsa_bs_decrypt(key->bs_csakey[0], (struct dvbcsa_bs_batch_s *)batch, 184);
++	pthread_mutex_unlock(&key->lock);
+ }
+ 
+ inline void csa_decrypt_multiple_odd(csakey_t *csakey, struct csa_batch *batch) {
+ 	struct csakey *key = (struct csakey *)csakey;
++	pthread_mutex_lock(&key->lock);
+ 	dvbcsa_bs_decrypt(key->bs_csakey[1], (struct dvbcsa_bs_batch_s *)batch, 184);
++	pthread_mutex_unlock(&key->lock);
+ }
+ 
+ inline void csa_decrypt_multiple_ff(csakey_t *csakey, uint8_t **cluster) {
+ 	struct csakey *key = (struct csakey *)csakey;
++	pthread_mutex_lock(&key->lock);
+ 	ffdecsa_decrypt_packets(key->ff_csakey, cluster);
++	pthread_mutex_unlock(&key->lock);
+ }
+ 
+ /* The following routine is taken from benchbitslice in libdvbcsa */
+diff --git a/csa.h b/csa.h
+index d5edce4..dab657e 100644
+--- a/csa.h
++++ b/csa.h
+@@ -14,6 +14,7 @@
+  */
+ #ifndef CSA_H
+ #define CSA_H
++#include <pthread.h>
+ 
+ // The following *MUST* be the same as struct dvbcsa_bs_batch_s from libdvbcsa
+ struct csa_batch {
+@@ -68,6 +69,7 @@ static inline int				ffdecsa_decrypt_packets(ffdecsa_key_t *keys, uint8_t **clus
+ #include "data.h"
+ 
+ struct csakey {
++	pthread_mutex_t lock;
+ 	dvbcsa_key_t		*s_csakey[2];
+ 	dvbcsa_bs_key_t		*bs_csakey[2];
+ 	ffdecsa_key_t		*ff_csakey;
+@@ -80,6 +82,7 @@ unsigned int	csa_get_batch_size	(void);
+ 
+ void			csa_set_even_cw		(csakey_t *csakey, uint8_t *even_cw);
+ void			csa_set_odd_cw		(csakey_t *csakey, uint8_t *odd_cw);
++void            csa_set_cw          (csakey_t *csakey, uint8_t *cw, int check_validity);
+ 
+ void			csa_decrypt_single_packet	(csakey_t *csakey, uint8_t *ts_packet);
+ void			csa_decrypt_multiple_even	(csakey_t *csakey, struct csa_batch *batch);
+diff --git a/data.c b/data.c
+index d16d974..4e1989e 100644
+--- a/data.c
++++ b/data.c
+@@ -54,6 +54,7 @@ void data_init(struct ts *ts) {
+ 
+ 	// Key
+ 	memset(&ts->key, 0, sizeof(ts->key));
++	atomic_init(&ts->key.is_valid_cw, 0);
+ 	ts->key.csakey = csa_key_alloc();
+ 	gettimeofday(&ts->key.ts_keyset, NULL);
+ 
+diff --git a/data.h b/data.h
+index 950548a..6501279 100644
+--- a/data.h
++++ b/data.h
+@@ -18,6 +18,7 @@
+ #include <pthread.h>
+ #include <limits.h>
+ #include <stdbool.h>
++#include <stdatomic.h>
+ 
+ // Prevent warnings about openssl functions. Apple may consider 'openssl'
+ // deprecated but changing perfectly working portable code just because they
+@@ -65,7 +66,7 @@ typedef void csakey_t;
+ struct key {
+ 	uint8_t				cw[CODEWORD_LENGTH];
+ 	csakey_t			*csakey;
+-	int					is_valid_cw;
++	_Atomic int			is_valid_cw;
+ 	time_t					ts;				// At what time the key is set
+ 	struct timeval			ts_keyset;		// At what time the key is set
+ };

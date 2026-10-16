@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import { SISectionAssembler } from './si-metadata.mjs';
 
 const PACKET_SIZE = 188;
 const PCR_WRAP = 2 ** 33 * 300;
@@ -7,31 +8,18 @@ const PCR_WRAP = 2 ** 33 * 300;
 function pid(packet) { return ((packet[1] & 0x1f) << 8) | packet[2]; }
 function payloadStart(packet) { return Boolean(packet[1] & 0x40); }
 
-function payloadOffset(packet) {
-  const control = (packet[3] >> 4) & 0x03;
-  if (control === 0 || control === 2) return -1;
-  if (control === 1) return 4;
-  const offset = 5 + packet[4];
-  return offset < PACKET_SIZE ? offset : -1;
-}
-
 function randomAccess(packet) {
   const control = (packet[3] >> 4) & 0x03;
   return (control === 2 || control === 3) && packet[4] > 0 && Boolean(packet[5] & 0x40);
 }
 
-function patPrograms(packet) {
-  if (pid(packet) !== 0 || !payloadStart(packet)) return [];
-  let offset = payloadOffset(packet);
-  if (offset < 0 || offset >= PACKET_SIZE) return [];
-  offset += 1 + packet[offset];
-  if (offset + 8 > PACKET_SIZE || packet[offset] !== 0x00) return [];
-  const sectionLength = ((packet[offset + 1] & 0x0f) << 8) | packet[offset + 2];
-  const end = Math.min(PACKET_SIZE, offset + 3 + sectionLength - 4);
+function patPrograms(section) {
+  if (section.length < 12 || section[0] !== 0 || !(section[5] & 1)) return [];
+  const end = section.length - 4;
   const programs = [];
-  for (let cursor = offset + 8; cursor + 4 <= end; cursor += 4) {
-    const program = packet.readUInt16BE(cursor);
-    if (program) programs.push(((packet[cursor + 2] & 0x1f) << 8) | packet[cursor + 3]);
+  for (let cursor = 8; cursor + 4 <= end; cursor += 4) {
+    const program = section.readUInt16BE(cursor);
+    if (program) programs.push(((section[cursor + 2] & 0x1f) << 8) | section[cursor + 3]);
   }
   return programs;
 }
@@ -40,22 +28,30 @@ function isTransportChunk(chunk) {
   return chunk?.length >= PACKET_SIZE && chunk.length % PACKET_SIZE === 0 && chunk[0] === 0x47;
 }
 
-function pmtClocks(packet) {
-  if (!payloadStart(packet)) return null;
-  let offset = payloadOffset(packet);
-  if (offset < 0) return null;
-  offset += 1 + packet[offset];
-  if (offset + 12 > PACKET_SIZE || packet[offset] !== 0x02) return null;
-  const length = 3 + (((packet[offset + 1] & 0x0f) << 8) | packet[offset + 2]);
-  if (offset + length > PACKET_SIZE) return null;
-  const end = offset + length - 4;
+function pmtClocks(section) {
+  if (section.length < 16 || section[0] !== 2 || !(section[5] & 1)) return null;
+  const end = section.length - 4;
   const video = [];
-  let cursor = offset + 12 + (((packet[offset + 10] & 0x0f) << 8) | packet[offset + 11]);
+  let cursor = 12 + (((section[10] & 0x0f) << 8) | section[11]);
+  if (cursor > end) return null;
   while (cursor + 5 <= end) {
-    if ([0x01, 0x02, 0x10, 0x1b, 0x24, 0x42].includes(packet[cursor])) video.push(((packet[cursor + 1] & 0x1f) << 8) | packet[cursor + 2]);
-    cursor += 5 + (((packet[cursor + 3] & 0x0f) << 8) | packet[cursor + 4]);
+    if ([0x01, 0x02, 0x10, 0x1b, 0x24, 0x42].includes(section[cursor])) video.push(((section[cursor + 1] & 0x1f) << 8) | section[cursor + 2]);
+    cursor += 5 + (((section[cursor + 3] & 0x0f) << 8) | section[cursor + 4]);
   }
-  return { video, pcr: ((packet[offset + 8] & 0x1f) << 8) | packet[offset + 9] };
+  if (cursor !== end) return null;
+  return { video, pcr: ((section[8] & 0x1f) << 8) | section[9] };
+}
+
+function tablePackets(packetPid, section, counter = 0) {
+  const packets = []; let offset = 0;
+  while (offset < section.length) {
+    const first = offset === 0; const packet = Buffer.alloc(PACKET_SIZE, 0xff);
+    packet.set([0x47, (packetPid >> 8) | (first ? 0x40 : 0), packetPid & 255, 0x10 | (counter++ & 15)]);
+    const start = first ? 5 : 4; if (first) packet[4] = 0;
+    const length = Math.min(PACKET_SIZE - start, section.length - offset); section.copy(packet, start, offset, offset + length);
+    offset += length; packets.push(packet);
+  }
+  return packets;
 }
 
 function pcr(packet) {
@@ -88,6 +84,8 @@ export class HLSSegmenter {
     this.sequence = 0;
     this.discontinuitySequence = 0;
     this.psi = new Map();
+    this.tableAssemblers = new Map([[0, new SISectionAssembler()]]);
+    this.patParts = new Map(); this.patVersion = null; this.programClocks = new Map();
     this.pmtPids = new Set();
     this.videoPids = new Set();
     this.pcrPid = null;
@@ -196,6 +194,8 @@ export class HLSSegmenter {
     this.startedAt = null;
     this.lastMediaTime = null;
     this.psi.clear();
+    this.tableAssemblers = new Map([[0, new SISectionAssembler()]]);
+    this.patParts.clear(); this.patVersion = null; this.programClocks.clear();
     this.pmtPids.clear();
     this.videoPids.clear();
     this.pcrPid = null;
@@ -261,17 +261,32 @@ export class HLSSegmenter {
 
   #cacheProgramTables(packet) {
     const packetPid = pid(packet);
-    if (packetPid === 0 && payloadStart(packet)) {
-      this.psi.set(0, [Buffer.from(packet)]);
-      for (const pmtPid of patPrograms(packet)) this.pmtPids.add(pmtPid);
-      return;
+    if (packetPid !== 0 && !this.pmtPids.has(packetPid)) return;
+    let assembler = this.tableAssemblers.get(packetPid);
+    if (!assembler) { assembler = new SISectionAssembler(); this.tableAssemblers.set(packetPid, assembler); }
+    for (const section of assembler.push(packet)) {
+      if (packetPid === 0) {
+        if (section[0] !== 0 || section.length < 12 || (section.length - 12) % 4 || !(section[5] & 1) || section[6] > section[7]) continue;
+        const version = `${section.readUInt16BE(3)}:${section[5]}:${section[7]}`;
+        if (version !== this.patVersion) { this.patVersion = version; this.patParts.clear(); }
+        this.patParts.set(section[6], Buffer.from(section));
+        for (const pmtPid of patPrograms(section)) this.pmtPids.add(pmtPid);
+        if (this.patParts.size === section[7] + 1) {
+          const parts = [...this.patParts].sort(([a], [b]) => a - b).map(([, value]) => value);
+          this.pmtPids = new Set(parts.flatMap(patPrograms));
+          this.psi.set(0, parts.flatMap(value => tablePackets(0, value, packet[3] & 15)));
+          for (const existing of this.tableAssemblers.keys()) if (existing && !this.pmtPids.has(existing)) { this.tableAssemblers.delete(existing); this.psi.delete(existing); this.programClocks.delete(existing); }
+        }
+      } else {
+        const clocks = pmtClocks(section); if (!clocks) continue;
+        this.programClocks.set(packetPid, clocks);
+        this.psi.set(packetPid, tablePackets(packetPid, section, packet[3] & 15));
+      }
+      const programs = [...this.pmtPids].map(value => this.programClocks.get(value)).filter(Boolean);
+      this.videoPids = new Set(programs.flatMap(value => value.video));
+      const clock = programs.find(value => value.video.length) || programs[0];
+      this.pcrPid = clock && clock.pcr !== 0x1fff ? clock.pcr : null;
     }
-    if (!this.pmtPids.has(packetPid)) return;
-    const clocks = pmtClocks(packet);
-    if (clocks) { this.videoPids = new Set(clocks.video); this.pcrPid = clocks.pcr === 0x1fff ? null : clocks.pcr; }
-    const packets = payloadStart(packet) || !this.psi.has(packetPid) ? [] : this.psi.get(packetPid);
-    if (packets.length < 8) packets.push(Buffer.from(packet));
-    this.psi.set(packetPid, packets);
   }
 
   #seedProgramTables() {

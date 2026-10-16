@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { HLSSegmenter } from '../src/hls.mjs';
+import { StreamMetadata, mpegCRC32 } from '../src/si-metadata.mjs';
 
 function packet(pid, { payloadStart = false, randomAccess = false } = {}) {
   const value = Buffer.alloc(188, 0xff);
@@ -14,6 +15,7 @@ function pat(pmtPid = 100) {
   const value = packet(0, { payloadStart: true });
   value[4] = 0;
   Buffer.from([0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0x00, 0x01, 0xe0 | ((pmtPid >> 8) & 0x1f), pmtPid & 0xff, 0, 0, 0, 0]).copy(value, 5);
+  value.writeUInt32BE(mpegCRC32(value.subarray(5, 17)), 17);
   return value;
 }
 
@@ -34,6 +36,7 @@ test('creates a bounded HLS playlist and serves segments', () => {
 function pmt(videoPid = 256, pcrPid = videoPid) {
   const value = packet(100, { payloadStart: true }); value[4] = 0;
   Buffer.from([0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe0 | (pcrPid >> 8), pcrPid & 255, 0xf0, 0, 0x1b, 0xe0 | (videoPid >> 8), videoPid & 255, 0xf0, 0, 0, 0, 0, 0]).copy(value, 5);
+  value.writeUInt32BE(mpegCRC32(value.subarray(5, 22)), 22);
   return value;
 }
 
@@ -197,7 +200,7 @@ test('retired media has a memory ceiling even for faster-than-real-time file inp
 
 test('cuts transport streams on random access and seeds program tables', () => {
   const hls = new HLSSegmenter({ segmentSeconds: 6, windowSegments: 5 });
-  hls.push(Buffer.concat([pat(), packet(100, { payloadStart: true }), packet(256)]), 1000);
+  hls.push(Buffer.concat([pat(), pmt(), packet(256)]), 1000);
   hls.push(packet(256, { payloadStart: true, randomAccess: true }), 3500);
   hls.push(packet(256, { payloadStart: true, randomAccess: true }), 10000);
   assert.equal(hls.segments.length, 2);
@@ -217,9 +220,28 @@ test('does not treat an audio random-access flag as a video segment boundary', (
   const hls = new HLSSegmenter({ segmentSeconds: 6 });
   const pmt = packet(100, { payloadStart: true }); pmt[4] = 0;
   Buffer.from([0x02, 0xb0, 0x17, 0, 1, 0xc1, 0, 0, 0xe1, 0, 0xf0, 0, 0x1b, 0xe1, 0, 0xf0, 0, 0x03, 0xe1, 1, 0xf0, 0, 0, 0, 0, 0]).copy(pmt, 5);
+  pmt.writeUInt32BE(mpegCRC32(pmt.subarray(5, 27)), 27);
   hls.push(Buffer.concat([pat(), pmt, packet(256)]), 0);
   hls.push(packet(257, { payloadStart: true, randomAccess: true }), 2500);
   assert.equal(hls.segments.length, 0);
   hls.push(packet(256, { payloadStart: true, randomAccess: true }), 3000);
   assert.equal(hls.segments.length, 1);
+});
+
+test('multipart PMTs select the video boundary and PCR clock and seed a complete table in every segment', () => {
+  const hls = new HLSSegmenter({ segmentSeconds: 6 }); const sender = new StreamMetadata('Mux');
+  const descriptors = Buffer.concat([Buffer.from([0x80, 170]), Buffer.alloc(170)]);
+  const section = Buffer.concat([Buffer.from([2, 0xb0, 0, 0, 1, 0xc1, 0, 0, 0xe1, 44, 0xf0, descriptors.length]), descriptors, Buffer.from([0x1b, 0xe1, 0, 0xf0, 0, 3, 0xe1, 1, 0xf0, 0]), Buffer.alloc(4)]);
+  section[2] = section.length - 3; section.writeUInt32BE(mpegCRC32(section.subarray(0, -4)), section.length - 4);
+  const fragments = sender.packets(100, section);
+  hls.push(Buffer.concat([pat(), fragments, clockPacket(0, { pid: 300 })]), 0);
+  assert.deepEqual([...hls.videoPids], [256]); assert.equal(hls.pcrPid, 300);
+  hls.push(clockPacket(200000, { pid: 301 }), 1000); hls.push(clockPacket(2500, { pid: 300 }), 2500);
+  hls.push(packet(257, { payloadStart: true, randomAccess: true }), 2500); assert.equal(hls.segments.length, 0);
+  hls.push(packet(256, { payloadStart: true, randomAccess: true }), 2500); assert.equal(hls.segments[0].duration, 2.5);
+  hls.push(clockPacket(9000, { pid: 300 }), 9000); hls.push(packet(256, { payloadStart: true, randomAccess: true }), 9000);
+  const seeded = hls.segments[1].data; const pidAt = offset => ((seeded[offset + 1] & 31) << 8) | seeded[offset + 2];
+  assert.equal(pidAt(0), 0); assert.equal(pidAt(188), 100); assert.equal(pidAt(376), 100);
+  const reconstructed = Buffer.concat([seeded.subarray(193, 376), seeded.subarray(380, 380 + section.length - 183)]);
+  assert.deepEqual(reconstructed, section);
 });
