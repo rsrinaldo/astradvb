@@ -41,6 +41,10 @@ test('system and container installations require a verified policy-3 executable 
   }
   assert.match(docker, /policyVersion:3/); assert.match(docker, /binarySha256:hash/);
   assert.match(docker, /protectedNativeBuild\(\)/); assert.match(docker, /sourceDirectory:"\/usr\/local\/src\/tsdecrypt"/);
+  assert.match(install, /protectedOscamBuild\("\/usr\/local\/bin\/oscam", "\/usr\/local\/share\/licenses\/oscam\/astra-native-oscam\.json"\)/);
+  assert.match(install, /oscam_verified \|\| \{[^\n]*rollback_install 1;/);
+  assert.match(docker, /oscam-newcamd-stream-io\.patch/);
+  assert.match(docker, /policyVersion:1/); assert.match(docker, /protectedOscamBuild\(\)/);
 });
 
 test('application upgrades compile off-line, preserve existing secrets, and stop before publishing the directory', () => {
@@ -78,6 +82,7 @@ for (const failure of ['compile', 'post-native-verification', 'new-service-healt
       file(`usr/local/share/licenses/${name}/COPYING`, `old-license-${name}`);
     }
     file('usr/local/share/licenses/tsdecrypt/astra-native-cas.json', '{"policyVersion":2,"binarySha256":"old"}\n');
+    file('usr/local/share/licenses/oscam/astra-native-oscam.json', '{"policyVersion":0,"binarySha256":"old-oscam"}\n');
     file('opt/astra-linux/release', 'old-application'); file('etc/systemd/system/astra-linux.service', 'old-unit');
     file('retained/astra-linux.service', 'old-unit'); file('calls', '');
     const oldInode = statSync(join(dir, 'usr/local/bin/tsdecrypt')).ino;
@@ -99,6 +104,7 @@ printf new-tsdecrypt > "${dir}/usr/local/bin/tsdecrypt"
 printf new-oscam > "${dir}/usr/local/bin/oscam"
 printf '{"policyVersion":3,"binarySha256":"new"}\\n' > "${dir}/usr/local/share/licenses/tsdecrypt/astra-native-cas.json"
 printf new-license > "${dir}/usr/local/share/licenses/tsdecrypt/COPYING"
+printf '{"policyVersion":1,"binarySha256":"new-oscam"}\\n' > "${dir}/usr/local/share/licenses/oscam/astra-native-oscam.json"
 ${failure === 'new-service-health' ? `activation_started=1; service_touched=1; systemctl stop astra-linux.service
 mv "${dir}/opt/astra-linux" "$rollback_dir/application"
 mkdir "${dir}/opt/astra-linux"; printf new-application > "${dir}/opt/astra-linux/release"
@@ -115,6 +121,7 @@ ${install.split('\n').find(line => line.startsWith('native_verified ||'))}` : 'f
       assert.equal(readFileSync(join(dir, `usr/local/share/licenses/${name}/COPYING`), 'utf8'), `old-license-${name}`);
     }
     assert.equal(readFileSync(join(dir, 'usr/local/share/licenses/tsdecrypt/astra-native-cas.json'), 'utf8'), '{"policyVersion":2,"binarySha256":"old"}\n');
+    assert.equal(readFileSync(join(dir, 'usr/local/share/licenses/oscam/astra-native-oscam.json'), 'utf8'), '{"policyVersion":0,"binarySha256":"old-oscam"}\n');
     assert.equal(readFileSync(join(dir, 'opt/astra-linux/release'), 'utf8'), 'old-application');
     assert.equal(readFileSync(join(dir, 'etc/systemd/system/astra-linux.service'), 'utf8'), 'old-unit');
     assert.notEqual(statSync(join(dir, 'usr/local/bin/tsdecrypt')).ino, oldInode, 'Rollback must replace the native inode, not overwrite a mapped binary');

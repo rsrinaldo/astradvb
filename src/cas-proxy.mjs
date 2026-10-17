@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { decryptSecret } from './secrets.mjs';
 import { parseNewcamdLine } from './softcam.mjs';
 import { ProviderGuard, providerGuardOptions } from './provider-guard.mjs';
+import { protectedOscamBuild } from './oscam-integrity.mjs';
 
 const LOCAL_HOST = '127.0.0.1';
 const FIRST_LOCAL_PORT = 23000;
@@ -129,6 +130,7 @@ export class CASProxyManager extends EventEmitter {
     this.guardedPorts = new Map();
     this.metrics = { found: 0, rejected: 0, timeout: 0, maxResponseMs: 0 }; this.logBuffer = '';
     this.spawnChild = options.spawnChild || spawn; this.waitForPorts = options.waitForPorts || waitForPorts;
+    this.protectedBuild = options.protectedBuild || protectedOscamBuild;
     this.guardFactory = options.guardFactory || ((options) => new ProviderGuard(options));
     this.setTimer = options.setTimer || setTimeout; this.clearTimer = options.clearTimer || clearTimeout; this.now = options.now || Date.now;
     this.recoveryTimer = null; this.recovering = false; this.recoveryAttempt = 0; this.generation = 0; this.ready = false;
@@ -170,6 +172,7 @@ export class CASProxyManager extends EventEmitter {
 
   async launch(generation) {
     if (this.stopping || generation !== this.generation) return;
+    if (!this.protectedBuild(this.binary)) throw new Error('Install the verified OSCam stream-I/O policy v1 build with install-cas.sh before enabling CAS');
     const profiles = this.profiles; const startedAt = this.now(); let ready = false; let logBuffer = '';
     const child = this.spawnChild(this.binary, ['--config-dir', this.runtimeDir, '--temp-dir', this.runtimeDir, '--pidfile', join(this.runtimeDir, 'oscam.pid')], { stdio: ['ignore', 'pipe', 'ignore'] });
     this.child = child;
@@ -208,7 +211,7 @@ export class CASProxyManager extends EventEmitter {
         const account = line.match(/\bastra_(\d+)\b/);
         const profile = account ? profiles[Number(account[1]) - 1] : null;
         if (profile) {
-          if (/: (?:found|cache\d*) \(/.test(line)) this.guards.get(profile.id)?.result(true);
+          if (/: (?:found|cache\d*) \(/.test(line)) this.guards.get(profile.id)?.result(true, { fresh: /: found \(/.test(line) });
           else if (/: (?:timeout|not found|rejected[^()]*) \(/.test(line)) this.guards.get(profile.id)?.result(false);
         }
         if (/: (?:found|cache\d*) \(/.test(line)) this.metrics.found++;

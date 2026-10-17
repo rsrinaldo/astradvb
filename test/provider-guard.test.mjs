@@ -5,7 +5,7 @@ import { EventEmitter, once } from 'node:events';
 import { DecoderStartQueue, ProviderGuard, providerGuardOptions } from '../src/provider-guard.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-async function until(check) { for (let i = 0; i < 200; i++) { if (check()) return; await wait(5); } throw new Error('Test condition timed out'); }
+async function until(check) { for (let i = 0; i < 600; i++) { if (check()) return; await wait(5); } throw new Error('Test condition timed out'); }
 const frame = n => Buffer.from([0, 2, n, n]);
 async function setup(t, options = {}) {
   const arrivals = []; const peers = new Set(); let connections = 0;
@@ -45,7 +45,7 @@ test('expires queued work by resetting the session without imposing a negative-k
   const s = await setup(t, { rate: 1, maxQueueMs: 50 });
   const c = client(s.port); c.resume(); t.after(() => c.destroy()); await once(c, 'connect');
   c.write(Buffer.concat([frame(1), frame(2), frame(3)])); await until(() => s.guard.snapshot().expiredConnections === 1);
-  assert.equal(s.arrivals.length, 1); assert.equal(s.guard.snapshot().state, 'idle');
+  assert.equal(s.arrivals.length, 1); assert.equal(s.guard.snapshot().state, 'reconnecting');
   const retry = client(s.port); t.after(() => retry.destroy()); retry.resume(); await until(() => s.connections() === 2);
   assert.equal(s.guard.snapshot().retryAfterMs, 0);
 });
@@ -159,13 +159,15 @@ test('frame rate and connection admission survive rapid TCP reconnects', async t
   const s = await fakeTransport(t, { rate: 1, maxQueueMs: 2000 });
   const first = s.accept(); first.emit('data', frame(1)); s.advance(0);
   assert.deepEqual(s.writes.map(item => item.at), [0]); first.destroy();
-  const second = s.accept(); second.emit('data', frame(2)); s.advance(499);
+  const second = s.accept(); second.emit('data', frame(2)); s.advance(999);
   assert.deepEqual(s.connections, [0]); assert.equal(second.destroyed, false);
-  s.advance(500); assert.deepEqual(s.connections, [0, 500]); assert.equal(s.writes.length, 1);
-  s.advance(1000); assert.deepEqual(s.writes.map(item => item.at), [0, 1000]); second.destroy();
-  for (let index = 0; index < 8; index++) { const local = s.accept(); local.emit('data', frame(index + 3)); s.advance(s.now() + 1000); local.destroy(); }
+  s.advance(1000); assert.deepEqual(s.connections, [0, 1000]); assert.deepEqual(s.writes.map(item => item.at), [0, 1000]); second.destroy();
+  const third = s.accept(); s.advance(3000); third.emit('data', frame(3)); s.advance(3000); third.destroy();
+  const fourth = s.accept(); s.advance(59999); assert.deepEqual(s.connections, [0, 1000, 3000]);
+  s.advance(60000); fourth.emit('data', frame(4)); s.advance(60000);
+  assert.deepEqual(s.connections, [0, 1000, 3000, 60000]);
   for (let index = 1; index < s.writes.length; index++) assert.ok(s.writes[index].at - s.writes[index - 1].at >= 1000);
-  for (let index = 1; index < s.connections.length; index++) assert.ok(s.connections[index] - s.connections[index - 1] >= 500);
+  for (const at of s.connections) assert.ok(s.connections.filter(time => time >= at && time < at + 60000).length <= 3);
   assert.equal(s.guard.snapshot().retryAfterMs, 0);
 });
 
@@ -191,7 +193,7 @@ test('ninety queued requests expire without replaying stale frames after reconne
   // Waiting for bounded connection admission does not make already-old ECMs
   // valid: the complete session is retired, never silently skipping a frame.
   assert.equal(retry.destroyed, true); assert.equal(s.connections.length, 1);
-  const fresh = s.accept(); s.advance(500); fresh.emit('data', frame(100)); s.advance(500);
+  const fresh = s.accept(); s.advance(1061); fresh.emit('data', frame(100)); s.advance(1061);
   assert.equal(s.writes.length, 3); assert.deepEqual(s.writes.at(-1).data, frame(100));
 });
 
@@ -202,7 +204,7 @@ test('partial frames expire and late events cannot reset or write to a replaceme
   const replacement = s.accept(); s.advance(500); retiredUpstream.writableLength = 100000;
   retiredUpstream.emit('data', Buffer.alloc(70000)); retiredUpstream.emit('error', new Error('late')); retiredUpstream.emit('connect');
   assert.equal(replacement.destroyed, false); assert.equal(s.guard.snapshot().connectionResets, 1);
-  replacement.emit('data', frame(2)); s.advance(500); assert.deepEqual(s.writes.map(item => item.data), [frame(2)]);
+  s.advance(1101); replacement.emit('data', frame(2)); s.advance(1101); assert.deepEqual(s.writes.map(item => item.data), [frame(2)]);
 });
 
 test('an unconnected upstream expires queued frames and only one local session can wait', async t => {
@@ -282,7 +284,7 @@ test('reader transport loss pauses only pending starts and resumes their origina
   assert.equal(s.guard.snapshot().circuitsOpened, 0); assert.equal(s.guard.snapshot().retryAfterMs, 0);
 });
 
-test('nonsecret wire telemetry is bounded, monotonic and accounts for reconnects and expired queue age', async t => {
+test('nonsecret write-admission telemetry is bounded, monotonic and accounts for reconnects and expired queue age', async t => {
   const s = await fakeTransport(t, { rate: 10000, maxQueueMs: 1500, startSpacingMs: 250 });
   assert.equal(s.guard.snapshot().rate, 100);
   const local = s.accept(); local.emit('data', Buffer.concat(Array.from({ length: 200 }, (_, index) => frame(index)))); s.advance(1501);
@@ -293,4 +295,138 @@ test('nonsecret wire telemetry is bounded, monotonic and accounts for reconnects
   for (let index = 0; index < 10; index++) { const retry = s.accept(); s.advance(s.now() + 250); retry.destroy(); }
   assert.ok(s.guard.snapshot().peakConnectionsPerSecond <= 4);
   assert.equal(Object.hasOwn(snapshot, 'host'), false); assert.equal(Object.hasOwn(snapshot, 'port'), false);
+});
+
+test('short authenticated sessions never reset the exponential delay or rolling attempt budget', async t => {
+  const s = await fakeTransport(t);
+  let local = s.accept(); s.advance(0); s.authenticate(local);
+  s.upstreams.at(-1).emit('data', frame(8)); s.guard.result(true, { fresh: true });
+  local.destroy(); assert.equal(s.guard.snapshot().reconnectFailures, 1);
+  local = s.accept(); s.advance(1100); s.authenticate(local); local.destroy();
+  assert.equal(s.guard.snapshot().reconnectFailures, 2);
+  local = s.accept(); s.advance(3200); s.authenticate(local); local.destroy();
+  assert.equal(s.guard.snapshot().reconnectFailures, 3);
+  local = s.accept(); s.advance(59999); assert.equal(s.connections.length, 3);
+  assert.equal(s.guard.snapshot().reconnectAfterMs, 1);
+  s.advance(60000); assert.equal(s.connections.length, 4); assert.equal(local.destroyed, false);
+  for (const at of s.connections) assert.ok(s.connections.filter(time => time >= at && time < at + 60000).length <= 3);
+});
+
+test('impatient local greeting clients cannot inflate failures or bypass a blocked attempt window', async t => {
+  const s = await fakeTransport(t);
+  for (const at of [0, 1000, 3000]) { const local = s.accept(); s.advance(at); local.destroy(); }
+  assert.equal(s.guard.snapshot().reconnectFailures, 3);
+  for (let at = 4000; at < 59000; at += 1000) { const local = s.accept(); s.advance(at); local.destroy(); }
+  assert.equal(s.connections.length, 3); assert.equal(s.guard.snapshot().reconnectFailures, 3);
+  assert.ok(s.guard.snapshot().resetHistory.length <= 16); assert.ok(s.guard.attemptTimes.length <= 3);
+  const waiting = s.accept(); s.advance(60000); assert.equal(s.connections.length, 4); assert.equal(waiting.destroyed, false);
+  assert.equal(s.guard.snapshot().attemptsLastWindow, 3);
+});
+
+test('only sustained fresh current-session CW replies reset transport failures; attempt history survives', async t => {
+  const s = await fakeTransport(t); const first = s.accept(); s.advance(0); first.destroy();
+  const local = s.accept(); s.advance(1000); s.authenticate(local);
+  s.advance(31100); assert.equal(s.guard.snapshot().reconnectFailures, 1, 'login alone must not reset');
+  for (const at of [31100, 46100, 61100]) {
+    s.advance(at); s.upstreams.at(-1).emit('data', frame(5)); s.guard.result(true, { fresh: false });
+  }
+  assert.equal(s.guard.snapshot().reconnectFailures, 1, 'cached answers must not establish provider health');
+  s.guard.result(true, { fresh: true });
+  s.advance(76100); s.guard.result(true, { fresh: true });
+  s.advance(91100); s.guard.result(true, { fresh: true });
+  assert.equal(s.guard.snapshot().reconnectFailures, 1, 'old buffered positives without new replies must not establish health');
+  for (const at of [91100, 106100, 121100]) {
+    s.advance(at); s.upstreams.at(-1).emit('data', frame(7)); s.guard.result(true, { fresh: true });
+  }
+  assert.equal(s.guard.snapshot().reconnectFailures, 0); assert.equal(s.guard.snapshot().stableRecoveries, 1);
+  assert.equal(s.guard.snapshot().connectionResets, 1); assert.equal(local.destroyed, false);
+  // A separate short fixture resets before the 60-second rolling window ends.
+  const early = await fakeTransport(t); const a = early.accept(); early.advance(0); a.destroy();
+  const b = early.accept(); early.advance(1000); early.authenticate(b);
+  for (const at of [1100, 16100, 31100]) { early.advance(at); early.upstreams.at(-1).emit('data', frame(9)); early.guard.result(true); }
+  assert.equal(early.guard.snapshot().reconnectFailures, 0); assert.equal(early.guard.snapshot().attemptsLastWindow, 2);
+});
+
+test('negative ECMs reset only stability evidence, never block healthy traffic or decoder admissions', async t => {
+  const s = await fakeTransport(t); const first = s.accept(); s.advance(0); first.destroy();
+  const local = s.accept(); s.advance(1000); s.authenticate(local);
+  for (const at of [1100, 16100]) { s.advance(at); s.upstreams.at(-1).emit('data', frame(9)); s.guard.result(true); }
+  s.guard.result(false); assert.equal(local.destroyed, false); assert.equal(s.guard.snapshot().reconnectAfterMs, 0);
+  s.advance(31100); s.upstreams.at(-1).emit('data', frame(9)); s.guard.result(true);
+  assert.equal(s.guard.snapshot().reconnectFailures, 1);
+  let starts = 0; s.guard.scheduleDecoderStart(() => starts++); s.advance(31100); assert.equal(starts, 1);
+  local.emit('data', frame(9)); s.advance(31100); assert.equal(s.writes.at(-1).at, 31100);
+  for (let index = 0; index < 100; index++) s.guard.result(false);
+  assert.equal(s.guard.snapshot().connections, 2); assert.equal(s.guard.snapshot().connectionResets, 1);
+  assert.equal(s.guard.snapshot().negativeECMReplies, 101); assert.equal(s.guard.snapshot().retryAfterMs, 0);
+});
+
+test('encrypted reply headers and bodies are withheld until the entire frame is assembled', async t => {
+  const s = await fakeTransport(t); const local = s.accept(); s.advance(0); const upstream = s.upstreams[0];
+  upstream.emit('data', Buffer.alloc(14, 42)); assert.equal(local.writes.length, 1);
+  const replies = [frame(1), frame(2), Buffer.concat([Buffer.from([0x0b, 0xb8]), Buffer.alloc(3000, 7)])];
+  for (const reply of replies) {
+    const before = local.writes.length;
+    for (const byte of reply.subarray(0, -1)) upstream.emit('data', Buffer.from([byte]));
+    assert.equal(local.writes.length, before, 'no partial LOGIN_ACK/card-data/CW frame reaches the native reader');
+    upstream.emit('data', reply.subarray(-1)); assert.equal(local.writes.length, before + 1); assert.deepEqual(local.writes.at(-1), reply);
+  }
+  assert.deepEqual(Buffer.concat(local.writes), Buffer.concat([Buffer.alloc(14, 42), ...replies]));
+  assert.equal(s.guard.snapshot().replyFramesReceived, 3); assert.equal(s.guard.snapshot().partialReplyBytes, 0);
+});
+
+test('incomplete encrypted replies have a bounded timeout even after reader readiness', async t => {
+  const s = await fakeTransport(t); const local = s.accept(); s.advance(0); s.authenticate(local);
+  const before = local.writes.length; s.upstreams[0].emit('data', frame(9).subarray(0, 1));
+  assert.equal(local.writes.length, before); assert.equal(s.guard.snapshot().partialReplyBytes, 1);
+  s.advance(10099); assert.equal(local.destroyed, false); s.advance(10100); assert.equal(local.destroyed, true);
+  assert.deepEqual(s.resets, ['incomplete provider reply timed out']);
+  assert.equal(s.guard.snapshot().reconnectFailures, 1); assert.equal(s.guard.snapshot().resetHistory[0].phase, 'ready');
+});
+
+test('request backpressure stops further writes until drain without catch-up bursts', async t => {
+  const s = await fakeTransport(t); const local = s.accept(); s.advance(0); const upstream = s.upstreams[0];
+  upstream.write = data => { s.writes.push({ at: s.now(), data: Buffer.from(data) }); return false; };
+  local.emit('data', Buffer.concat([frame(1), frame(2), frame(3)])); s.advance(200);
+  assert.equal(s.writes.length, 1); assert.equal(s.guard.snapshot().writeBackpressured, true); assert.equal(s.guard.snapshot().queuedFrames, 2);
+  upstream.write = data => { s.writes.push({ at: s.now(), data: Buffer.from(data) }); return true; };
+  upstream.emit('drain'); s.advance(250); assert.deepEqual(s.writes.map(item => item.at), [0, 200, 250]);
+  assert.equal(s.guard.snapshot().writeBackpressured, false); assert.equal(s.guard.snapshot().queuedFrames, 0);
+});
+
+test('guard diagnostics retain bounded reasons/times and protocol counts, never endpoint or payload data', async t => {
+  const s = await fakeTransport(t, { wallNow: () => 1700000000000 }); const local = s.accept(); s.advance(0); s.authenticate(local);
+  local.emit('data', frame(9)); s.advance(100);
+  let snapshot = s.guard.snapshot(); assert.equal(snapshot.outstandingClientFramesEstimate, 1);
+  s.upstreams[0].emit('data', frame(9)); snapshot = s.guard.snapshot(); assert.equal(snapshot.outstandingClientFramesEstimate, 0);
+  local.destroy(); snapshot = s.guard.snapshot();
+  assert.equal(snapshot.measurement, 'encrypted-frame-write-admission-not-provider-receipt'); assert.equal(snapshot.reconnectAfterMs, 1000);
+  assert.equal(snapshot.lastConnectionAt, '2023-11-14T22:13:20.000Z'); assert.equal(snapshot.lastReaderReadyAt, snapshot.lastConnectionAt);
+  assert.equal(snapshot.resetReasons['local CAS connection closed'], 1); assert.equal(snapshot.resetHistory[0].time, snapshot.lastResetAt);
+  snapshot.resetHistory[0].reason = 'modified'; assert.equal(s.guard.snapshot().resetHistory[0].reason, 'local CAS connection closed');
+  for (const secret of ['provider.test', 'host', 'port', 'frame', 'payload', 'ECM data']) assert.equal(Object.hasOwn(snapshot, secret), false);
+  assert.equal(JSON.stringify(snapshot).includes('provider.test'), false);
+});
+
+test('synchronous connection failures consume and report the same bounded upstream attempt budget', async t => {
+  const s = await fakeTransport(t, { createConnection() { throw new Error('private endpoint details'); } });
+  s.accept(); s.advance(0); let snapshot = s.guard.snapshot();
+  assert.equal(snapshot.connections, 1); assert.equal(snapshot.connectionsLastSecond, 1); assert.equal(snapshot.peakConnectionsPerSecond, 1);
+  for (const at of [1000, 3000]) { s.accept(); s.advance(at); }
+  snapshot = s.guard.snapshot(); assert.equal(snapshot.connections, 3); assert.equal(snapshot.attemptsLastWindow, 3); assert.equal(snapshot.reconnectFailures, 3);
+  const waiting = s.accept(); s.advance(59999); assert.equal(s.guard.snapshot().connections, 3); assert.equal(waiting.destroyed, false);
+  s.advance(60000); assert.equal(s.guard.snapshot().connections, 4); assert.equal(waiting.destroyed, true);
+  assert.equal(JSON.stringify(s.guard.snapshot()).includes('private endpoint details'), false);
+});
+
+test('retired partial-reply timers and stopped connection callbacks cannot affect a new session', async t => {
+  const s = await fakeTransport(t); const first = s.accept(); s.advance(0); s.authenticate(first);
+  s.upstreams[0].emit('data', frame(9).subarray(0, 1));
+  const oldPartialTimer = [...s.scheduled.values()].find(timer => timer.at === 10100).fn;
+  first.destroy(); const next = s.accept(); s.advance(1100); s.authenticate(next);
+  oldPartialTimer(); assert.equal(next.destroyed, false); assert.equal(s.guard.snapshot().readerReady, true);
+  next.destroy(); const waiting = s.accept();
+  const oldConnectTimer = [...s.scheduled.values()].find(timer => timer.at === 3200).fn;
+  await s.guard.stop(); oldConnectTimer(); s.advance(100000);
+  assert.equal(waiting.destroyed, true); assert.equal(s.guard.snapshot().connections, 2); assert.equal(s.scheduled.size, 0);
 });

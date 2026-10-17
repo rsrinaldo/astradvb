@@ -116,7 +116,7 @@ async function proxySetup(t) {
   process.env.ASTRA_SECRET_KEY = '55'.repeat(32);
   const directory = await mkdtemp(join(tmpdir(), 'astra-cas-recovery-')); const timer = timers(); const children = []; const guards = [];
   const profile = { id: 'provider', name: 'Provider', caid: '0B00', lineEncrypted: encryptSecret('host.example.test 15000 user pass 0102030405060708091011121314') };
-  const proxy = new CASProxyManager(new RingLogger(), { ...timer, runtimeDir: directory, spawnChild: () => { const child = fakeChild(); children.push(child); return child; }, waitForPorts: async () => {}, guardFactory: () => { const guard = { starts: 0, stops: 0, readerStates: [], async start() { this.starts++; return 31000 + guards.indexOf(this); }, async stop() { this.stops++; }, setReaderReady(ready) { this.readerStates.push(ready); }, scheduleDecoderStart() {}, result() {}, snapshot() { return {}; } }; guards.push(guard); return guard; } });
+  const proxy = new CASProxyManager(new RingLogger(), { ...timer, runtimeDir: directory, protectedBuild: () => true, spawnChild: () => { const child = fakeChild(); children.push(child); return child; }, waitForPorts: async () => {}, guardFactory: () => { const guard = { starts: 0, stops: 0, readerStates: [], results: [], async start() { this.starts++; return 31000 + guards.indexOf(this); }, async stop() { this.stops++; }, setReaderReady(ready) { this.readerStates.push(ready); }, scheduleDecoderStart() {}, result(success, metadata) { this.results.push({ success, metadata }); }, snapshot() { return {}; } }; guards.push(guard); return guard; } });
   t.after(async () => { await proxy.stop(); await rm(directory, { recursive: true, force: true }); });
   return { proxy, profile, children, guards, timer, directory };
 }
@@ -171,6 +171,22 @@ test('large coalesced startup output cannot truncate the authenticated reader ma
   s.children[0].stdout.write(`00:00:00 12345678 p (newcamd) Newcamd Server: 127.0.0.1:31000 - UserID: redacted\n${'startup detail\n'.repeat(2000)}astra_1 (ecm) : found (24 ms)\n`);
   assert.deepEqual(s.guards[0].readerStates, [true]); assert.equal(s.proxy.metrics.found, 1);
   assert.equal(s.proxy.metrics.maxResponseMs, 24);
+});
+
+test('cached positive replies cannot reset transport recovery health', async t => {
+  const s = await proxySetup(t); await s.proxy.start([s.profile]);
+  s.children[0].stdout.write('astra_1 (ecm) : cache1 (2 ms)\nastra_1 (ecm) : found (24 ms)\nastra_1 (ecm) : not found (10 ms)\n');
+  assert.deepEqual(s.guards[0].results, [
+    { success: true, metadata: { fresh: false } },
+    { success: true, metadata: { fresh: true } },
+    { success: false, metadata: undefined },
+  ]);
+});
+
+test('an unverified OSCam binary cannot launch or recover a shared proxy', async t => {
+  const s = await proxySetup(t); s.proxy.protectedBuild = () => false;
+  await assert.rejects(s.proxy.start([s.profile]), /verified OSCam stream-I\/O/);
+  assert.equal(s.children.length, 0); assert.equal(s.proxy.guards.size, 0);
 });
 
 test('native reader readiness maps only its generated loopback guard port to the correct profile', async t => {

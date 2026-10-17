@@ -119,12 +119,16 @@ trap 'rollback_install 143' TERM
 native_verified() {
   "$node_binary" --input-type=module -e 'import { pathToFileURL } from "node:url"; const { protectedNativeBuild } = await import(pathToFileURL(process.argv[1])); process.exit(protectedNativeBuild("/usr/local/bin/tsdecrypt", "/usr/local/share/licenses/tsdecrypt/astra-native-cas.json") ? 0 : 1);' "$installer_dir/src/softcam.mjs"
 }
-if [[ ! -x /usr/local/bin/oscam ]] || ! native_verified; then
+oscam_verified() {
+  "$node_binary" --input-type=module -e 'import { pathToFileURL } from "node:url"; const { protectedOscamBuild } = await import(pathToFileURL(process.argv[1])); process.exit(protectedOscamBuild("/usr/local/bin/oscam", "/usr/local/share/licenses/oscam/astra-native-oscam.json") ? 0 : 1);' "$installer_dir/src/oscam-integrity.mjs"
+}
+if ! oscam_verified || ! native_verified; then
   backup_native
   native_attempted=1
   "$installer_dir/install-cas.sh"
 fi
 native_verified || { echo "Native CAS policy/hash verification failed; restoring the previous native installation." >&2; rollback_install 1; }
+oscam_verified || { echo "OSCam stream-I/O policy/hash verification failed; restoring the previous native installation." >&2; rollback_install 1; }
 if ! id -u astra >/dev/null 2>&1; then
   useradd --system --user-group --home-dir /var/lib/astra-linux --shell /usr/sbin/nologin astra
 fi

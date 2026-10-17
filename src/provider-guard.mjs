@@ -48,7 +48,7 @@ export class DecoderStartQueue {
 // Never discard/reorder an individual encrypted frame: close the connection on
 // expiry/overflow so message IDs cannot be silently desynchronised.
 export class ProviderGuard {
-  constructor({ host, port, rate = 20, maxQueueMs = 1500, startSpacingMs = 500, startWindowMs = 5000, paused = false, onReset = () => {}, now = () => performance.now(), setTimer = setTimeout, clearTimer = clearTimeout, createConnection = options => net.createConnection(options), createServer = accept => net.createServer(accept) }) {
+  constructor({ host, port, rate = 20, maxQueueMs = 1500, startSpacingMs = 500, startWindowMs = 5000, reconnectBaseMs = 1000, reconnectMaxMs = 15000, reconnectWindowMs = 60000, reconnectAttempts = 3, stableMs = 30000, replyTimeoutMs = 10000, paused = false, onReset = () => {}, now = () => performance.now(), wallNow = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout, createConnection = options => net.createConnection(options), createServer = accept => net.createServer(accept) }) {
     Object.assign(this, { host, port, rate, maxQueueMs, paused, onReset, now, setTimer, clearTimer, createConnection, createServer });
     this.rate = Number.isFinite(Number(rate)) ? Math.max(1, Math.min(100, Math.trunc(Number(rate)))) : 20;
     this.frameIntervalMs = Math.ceil(1000 / this.rate);
@@ -57,11 +57,22 @@ export class ProviderGuard {
     // repeatedly reconnecting must not obtain a fresh immediate frame budget.
     this.nextSendAt = -Infinity; this.nextConnectAt = -Infinity;
     this.connectionSpacingMs = Math.max(250, startSpacingMs);
+    const bounded = (value, fallback, min, max) => Number.isFinite(Number(value)) ? Math.max(min, Math.min(max, Math.trunc(Number(value)))) : fallback;
+    this.reconnectBaseMs = bounded(reconnectBaseMs, 1000, 1000, 15000);
+    this.reconnectMaxMs = bounded(reconnectMaxMs, 15000, this.reconnectBaseMs, 60000);
+    this.reconnectWindowMs = bounded(reconnectWindowMs, 60000, 60000, 300000);
+    this.reconnectAttempts = bounded(reconnectAttempts, 3, 1, 3);
+    this.stableMs = bounded(stableMs, 30000, 30000, 300000);
+    this.replyTimeoutMs = bounded(replyTimeoutMs, 10000, 1000, 10000);
+    this.wallNow = wallNow;
+    this.attemptTimes = []; this.reconnectNotBefore = -Infinity; this.reconnectFailures = 0;
+    this.resetHistory = []; this.resetReasons = {}; this.lastResetAt = null;
+    this.lastConnectionAt = null; this.lastReaderReadyAt = null; this.lastPositiveECMAt = null; this.lastNegativeECMAt = null;
     this.readerReady = false;
     this.negativeReplies = 0;
     this.starts = new DecoderStartQueue({ spacingMs: Math.max(startSpacingMs, Math.ceil(2000 / this.rate)), windowMs: startWindowMs, paused: () => this.paused || !this.readerReady, now, setTimer, clearTimer });
     this.recentFrames = []; this.recentConnections = []; this.lastFrameAt = null;
-    this.stats = { framesSent: 0, connections: 0, blockedConnections: 0, expiredConnections: 0, circuitsOpened: 0, connectionResets: 0, peakFramesPerSecond: 0, peakConnectionsPerSecond: 0, minimumFrameIntervalMs: null, queueMaxAgeMsObserved: 0 };
+    this.stats = { framesSent: 0, replyFramesReceived: 0, connections: 0, blockedConnections: 0, expiredConnections: 0, circuitsOpened: 0, connectionResets: 0, peakFramesPerSecond: 0, peakConnectionsPerSecond: 0, minimumFrameIntervalMs: null, queueMaxAgeMsObserved: 0, positiveECMReplies: 0, negativeECMReplies: 0, stableRecoveries: 0 };
   }
   async start() {
     this.server = this.createServer(local => this.#accept(local));
@@ -74,28 +85,71 @@ export class ProviderGuard {
     // Requiring that the current transport completed those exchanges prevents
     // an old child's buffered marker from admitting a replacement session.
     if (ready && (!this.active?.connected || this.active.clientFrames < 2 || this.active.replyFrames < 2)) return false;
+    const changed = this.readerReady !== Boolean(ready);
     this.readerReady = Boolean(ready);
     if (this.readerReady) {
       if (this.active.handshakeTimer !== null) this.clearTimer(this.active.handshakeTimer);
       this.active.handshakeTimer = null; this.starts.wake();
+      if (changed) {
+        this.active.readerReadyAt = this.now(); this.lastReaderReadyAt = this.#timestamp();
+        this.active.positiveReplyBaseline = this.active.replyFrames;
+        this.active.positiveSince = null; this.active.lastFreshPositiveAt = null; this.active.positiveObservations = 0;
+      }
+    } else if (this.active) {
+      this.active.readerReadyAt = null; this.active.positiveSince = null; this.active.lastFreshPositiveAt = null; this.active.positiveObservations = 0;
     }
     return this.readerReady;
   }
-  result(success) {
+  result(success, { fresh = true } = {}) {
     if (success) this.negativeReplies = 0;
-    else this.negativeReplies++;
+    else { this.negativeReplies++; this.stats.negativeECMReplies++; this.lastNegativeECMAt = this.#timestamp(); }
+    const state = this.active;
+    if (!state || state.closed || !state.connected || !this.readerReady) return;
+    if (!success) { state.positiveSince = null; state.lastFreshPositiveAt = null; state.positiveObservations = 0; return; }
+    // Cache-only replies and buffered old log lines cannot establish a new
+    // session's health without actual complete replies on its current socket.
+    if (!fresh || state.replyFrames <= state.positiveReplyBaseline) return;
+    const now = this.now(); state.positiveReplyBaseline = state.replyFrames;
+    this.stats.positiveECMReplies++; this.lastPositiveECMAt = this.#timestamp();
+    if (state.positiveSince === null || now - state.lastFreshPositiveAt > this.stableMs) { state.positiveSince = now; state.positiveObservations = 0; }
+    state.lastFreshPositiveAt = now; state.positiveObservations++;
+    if (this.reconnectFailures && state.positiveObservations >= 3 && now - state.positiveSince >= this.stableMs && now - state.readerReadyAt >= this.stableMs) {
+      this.reconnectFailures = 0; this.reconnectNotBefore = -Infinity; this.stats.stableRecoveries++;
+      // Never clear attemptTimes: even healthy recovery must honor the same
+      // rolling provider connection budget until those attempts naturally age.
+    }
   }
   snapshot() {
-    this.#trimRecent(this.now());
-    return { ...this.stats, framesLastSecond: this.recentFrames.length, connectionsLastSecond: this.recentConnections.length, negativeReplies: this.negativeReplies, rate: this.rate, maxQueueMs: this.maxQueueMs, queuedDecoderStarts: this.starts.queue.length, startSpacingMs: this.starts.spacingMs, startWindowMs: this.starts.windowMs, readerReady: this.readerReady, state: this.paused ? 'paused' : this.active?.connected ? 'connected' : this.active ? 'connecting' : 'idle', retryAfterMs: 0 };
+    const now = this.now(); this.#trimRecent(now);
+    const state = this.active; const oldest = state?.queue[0]?.createdAt ?? state?.pendingAt;
+    const reconnectAfterMs = state?.connected || this.paused ? 0 : Math.max(0, this.#connectionDue(now) - now);
+    return { ...this.stats, measurement: 'encrypted-frame-write-admission-not-provider-receipt', framesLastSecond: this.recentFrames.length, connectionsLastSecond: this.recentConnections.length, negativeReplies: this.negativeReplies, rate: this.rate, maxQueueMs: this.maxQueueMs, queuedDecoderStarts: this.starts.queue.length, startSpacingMs: this.starts.spacingMs, startWindowMs: this.starts.windowMs, readerReady: this.readerReady, state: this.paused ? 'paused' : state?.connected ? 'connected' : reconnectAfterMs ? 'reconnecting' : state ? 'connecting' : 'idle', retryAfterMs: 0,
+      reconnectAfterMs, reconnectFailures: this.reconnectFailures, reconnectBaseMs: this.reconnectBaseMs, reconnectMaxMs: this.reconnectMaxMs, reconnectWindowMs: this.reconnectWindowMs, maxReconnectAttempts: this.reconnectAttempts, attemptsLastWindow: this.attemptTimes.length, stableMs: this.stableMs,
+      lastConnectionAt: this.lastConnectionAt, lastReaderReadyAt: this.lastReaderReadyAt, lastPositiveECMAt: this.lastPositiveECMAt, lastNegativeECMAt: this.lastNegativeECMAt, lastResetAt: this.lastResetAt, resetReasons: { ...this.resetReasons }, resetHistory: this.resetHistory.map(item => ({ ...item })),
+      queuedFrames: state?.queue.length || 0, queuedBytes: state?.bytes || 0, partialRequestBytes: state?.pending.length || 0, oldestQueuedAgeMs: oldest === null || oldest === undefined ? 0 : Math.max(0, now - oldest), partialReplyBytes: state?.replyPending.length || 0, outstandingClientFramesEstimate: state ? Math.max(0, state.clientFrames - state.replyFrames) : 0, upstreamWritableBytes: Number.isFinite(state?.upstream?.writableLength) ? state.upstream.writableLength : 0, writeBackpressured: Boolean(state?.writeBlocked),
+    };
   }
+  #timestamp() { return new Date(this.wallNow()).toISOString(); }
   #trimRecent(now) {
     while (this.recentFrames.length && now - this.recentFrames[0] >= 1000) this.recentFrames.shift();
     while (this.recentConnections.length && now - this.recentConnections[0] >= 1000) this.recentConnections.shift();
+    while (this.attemptTimes.length && now - this.attemptTimes[0] >= this.reconnectWindowMs) this.attemptTimes.shift();
+  }
+  #connectionDue(now = this.now()) {
+    this.#trimRecent(now);
+    return Math.max(now, this.nextConnectAt, this.reconnectNotBefore, this.attemptTimes.length >= this.reconnectAttempts ? this.attemptTimes[0] + this.reconnectWindowMs : now);
   }
   #reset(state, reason) {
     if (!state || state.closed || this.active !== state) return;
     this.stats.connectionResets++;
+    this.lastResetAt = this.#timestamp(); this.resetReasons[reason] = (this.resetReasons[reason] || 0) + 1;
+    this.resetHistory.push({ time: this.lastResetAt, reason, phase: state.connected ? this.readerReady ? 'ready' : state.greetingBytes ? 'greeting' : 'handshake' : state.attempted ? 'connecting' : 'waiting-for-admission' });
+    if (this.resetHistory.length > 16) this.resetHistory.shift();
+    if (state.attempted) {
+      this.reconnectFailures = Math.min(32, this.reconnectFailures + 1);
+      const delay = Math.min(this.reconnectMaxMs, this.reconnectBaseMs * 2 ** Math.min(16, this.reconnectFailures - 1));
+      this.reconnectNotBefore = Math.max(this.reconnectNotBefore, this.now() + delay);
+    }
     this.#dispose(state);
     this.onReset(reason);
   }
@@ -105,21 +159,22 @@ export class ProviderGuard {
     if (state.timer !== null) this.clearTimer(state.timer);
     if (state.connectTimer !== null) this.clearTimer(state.connectTimer);
     if (state.handshakeTimer !== null) this.clearTimer(state.handshakeTimer);
+    if (state.replyTimer !== null) this.clearTimer(state.replyTimer);
     state.local.destroy(); state.upstream?.destroy();
-    state.queue.length = 0; state.pending = Buffer.alloc(0);
+    state.queue.length = 0; state.bytes = 0; state.pending = Buffer.alloc(0); state.replyPending = Buffer.alloc(0); state.greeting = null;
     if (this.active === state) { this.active = null; this.setReaderReady(false); }
   }
   #accept(local) {
     if (this.paused || this.active) {
       this.stats.blockedConnections++; local.destroy(); return;
     }
-    const state = { local, upstream: null, queue: [], pending: Buffer.alloc(0), pendingAt: null, connected: false, closed: false, bytes: 0, timer: null, timerAt: Infinity, connectTimer: null, handshakeTimer: null, clientFrames: 0, replyFrames: 0, greetingBytes: 14, greeting: Buffer.alloc(14), replyPending: Buffer.alloc(0) };
+    const state = { local, upstream: null, queue: [], pending: Buffer.alloc(0), pendingAt: null, connected: false, closed: false, attempted: false, bytes: 0, timer: null, timerAt: Infinity, connectTimer: null, handshakeTimer: null, replyTimer: null, replyPendingAt: null, writeBlocked: false, readerReadyAt: null, positiveSince: null, lastFreshPositiveAt: null, positiveObservations: 0, positiveReplyBaseline: 0, clientFrames: 0, replyFrames: 0, greetingBytes: 14, greeting: Buffer.alloc(14), replyPending: Buffer.alloc(0) };
     this.active = state;
-    const fail = () => {
+    const fail = reason => {
       if (state.closed) return;
-      this.#reset(state, 'provider connection failed');
+      this.#reset(state, reason);
     };
-    local.on('error', fail); local.on('close', fail);
+    local.on('error', () => fail('local CAS connection failed')); local.on('close', () => fail('local CAS connection closed'));
     local.on('data', chunk => {
       if (state.closed || this.active !== state) return;
       if (state.bytes + state.pending.length + chunk.length > 65536) { this.#reset(state, 'request queue overflow'); return; }
@@ -138,24 +193,28 @@ export class ProviderGuard {
     });
     // Hold one accepted loopback session until its connection slot is due.
     // This is bounded transport admission, not a negative-key cooldown.
-    state.connectTimer = this.setTimer(() => {
+    const connect = () => {
       state.connectTimer = null;
       if (state.closed || this.active !== state) return;
+      const now = this.now(); const due = this.#connectionDue(now);
+      if (due > now) { state.connectTimer = this.setTimer(connect, due - now); state.connectTimer?.unref?.(); return; }
       this.nextConnectAt = this.now() + this.connectionSpacingMs;
+      state.attempted = true; this.attemptTimes.push(now); this.lastConnectionAt = this.#timestamp(); this.stats.connections++;
+      this.#trimRecent(now); this.recentConnections.push(now);
+      this.stats.peakConnectionsPerSecond = Math.max(this.stats.peakConnectionsPerSecond, this.recentConnections.length);
       let upstream;
       try { upstream = this.createConnection({ host: this.host, port: this.port }); }
       catch { this.#reset(state, 'provider connection failed'); return; }
-      state.upstream = upstream; this.stats.connections++;
-      this.#trimRecent(this.now()); this.recentConnections.push(this.now());
-      this.stats.peakConnectionsPerSecond = Math.max(this.stats.peakConnectionsPerSecond, this.recentConnections.length);
-      upstream.setTimeout(10000, fail);
+      state.upstream = upstream;
+      upstream.setTimeout(10000, () => fail('provider connection timed out'));
       upstream.once('connect', () => {
         if (state.closed || this.active !== state) return;
         state.connected = true; upstream.setTimeout(0);
         state.handshakeTimer = this.setTimer(() => this.#reset(state, 'provider handshake timed out'), 10000);
         state.handshakeTimer?.unref?.(); this.#arm(state);
       });
-      upstream.on('error', fail); upstream.on('close', fail);
+      upstream.on('error', () => fail('provider TCP error')); upstream.on('close', () => fail('provider TCP closed'));
+      upstream.on('drain', () => { if (state.closed || this.active !== state) return; state.writeBlocked = false; this.#arm(state); });
       upstream.on('data', chunk => {
         if (state.closed || this.active !== state) return;
         if (local.writableLength + chunk.length > 65536) { this.#reset(state, 'local reply queue overflow'); return; }
@@ -172,24 +231,46 @@ export class ProviderGuard {
           if (state.greetingBytes) return;
           local.write(state.greeting); state.greeting = null;
         }
+        if (state.replyPending.length + framed.length > 65536) { this.#reset(state, 'provider reply queue overflow'); return; }
+        if (!state.replyPending.length && framed.length) state.replyPendingAt = this.now();
         state.replyPending = Buffer.concat([state.replyPending, framed]);
         while (state.replyPending.length >= 2) {
           const length = state.replyPending.readUInt16BE(0);
           if (!length || length > 4096) { this.#reset(state, 'invalid provider Newcamd frame'); return; }
           if (state.replyPending.length < length + 2) break;
-          state.replyFrames++; state.replyPending = state.replyPending.subarray(length + 2);
+          const complete = Buffer.from(state.replyPending.subarray(0, length + 2));
+          if (local.writableLength + complete.length > 65536) { this.#reset(state, 'local reply queue overflow'); return; }
+          state.replyFrames++; this.stats.replyFramesReceived++; state.replyPending = state.replyPending.subarray(length + 2);
+          state.replyPendingAt = state.replyPending.length ? this.now() : null;
+          // The pinned OSCam peer incorrectly assumes recv() returns the full
+          // header/body. Do not deliberately forward WAN fragmentation to it.
+          // A complete local write still is not a TCP message-boundary promise.
+          local.write(complete);
         }
-        if (framed.length) local.write(framed);
+        this.#armReply(state);
       });
-    }, Math.max(0, this.nextConnectAt - this.now()));
+    };
+    state.connectTimer = this.setTimer(connect, Math.max(0, this.#connectionDue() - this.now()));
     state.connectTimer?.unref?.();
+  }
+  #armReply(state) {
+    if (state.replyTimer !== null) this.clearTimer(state.replyTimer);
+    state.replyTimer = null;
+    if (state.closed || this.active !== state || state.replyPendingAt === null) return;
+    state.replyTimer = this.setTimer(() => {
+      state.replyTimer = null;
+      if (state.closed || this.active !== state || state.replyPendingAt === null) return;
+      if (this.now() - state.replyPendingAt >= this.replyTimeoutMs) this.#reset(state, 'incomplete provider reply timed out');
+      else this.#armReply(state);
+    }, Math.max(0, state.replyPendingAt + this.replyTimeoutMs - this.now()));
+    state.replyTimer?.unref?.();
   }
   #arm(state) {
     if (state.closed || this.active !== state) return;
     const oldest = state.queue[0]?.createdAt ?? state.pendingAt;
     if (oldest === null || oldest === undefined) return;
     const expiry = oldest + this.maxQueueMs + 1;
-    const at = state.connected && state.queue.length ? Math.min(expiry, Math.max(this.now(), this.nextSendAt)) : expiry;
+    const at = state.connected && !state.writeBlocked && state.queue.length ? Math.min(expiry, Math.max(this.now(), this.nextSendAt)) : expiry;
     if (state.timer !== null && state.timerAt <= at) return;
     if (state.timer !== null) this.clearTimer(state.timer);
     state.timerAt = at;
@@ -203,11 +284,13 @@ export class ProviderGuard {
     if (oldest !== null && oldest !== undefined && now - oldest > this.maxQueueMs) {
       this.stats.expiredConnections++; this.#reset(state, 'stale request queue'); return;
     }
-    if (state.connected && state.queue.length && now >= this.nextSendAt) {
+    if (state.connected && !state.writeBlocked && state.queue.length && now >= this.nextSendAt) {
       if (state.upstream.writableLength > 65536) { this.#reset(state, 'provider write queue overflow'); return; }
       const item = state.queue.shift(); state.bytes -= item.frame.length;
       this.nextSendAt = now + this.frameIntervalMs;
-      state.upstream.write(item.frame); state.clientFrames++; this.stats.framesSent++;
+      try { state.writeBlocked = state.upstream.write(item.frame) === false; }
+      catch { this.#reset(state, 'provider write failed'); return; }
+      state.clientFrames++; this.stats.framesSent++;
       this.#trimRecent(now); this.recentFrames.push(now);
       this.stats.peakFramesPerSecond = Math.max(this.stats.peakFramesPerSecond, this.recentFrames.length);
       if (this.lastFrameAt !== null) this.stats.minimumFrameIntervalMs = Math.min(this.stats.minimumFrameIntervalMs ?? Infinity, now - this.lastFrameAt);

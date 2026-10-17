@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "Run this installer as root." >&2
@@ -16,6 +16,9 @@ for patch_name in "${patch_names[@]}"; do
 done
 patch_set_digest="$(printf '%s\n' "${patch_digests[@]}" | sha256sum | cut -d ' ' -f 1)"
 oscam_revision="39e78a4688b30abaab62b5c9e13672b4e34bfca0"
+oscam_patch="$installer_dir/patches/oscam-newcamd-stream-io.patch"
+[[ -f "$oscam_patch" ]] || { echo "Missing OSCam stream I/O patch." >&2; exit 1; }
+oscam_patch_digest="$(sha256sum "$oscam_patch" | cut -d ' ' -f 1)"
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates git libdvbcsa-dev libssl-dev pkg-config
 install -d -o root -g root -m 0755 /usr/local/src
@@ -43,9 +46,13 @@ cc -O2 -DUSE_LIBDVBCSA=1 '-DDLIB="native-cas-test"' -ffunction-sections -fdata-s
 "$source_dir/native-csa-concurrency-test"
 cc -O2 -DUSE_FFDECSA=1 '-DDLIB="native-cas-test"' -ffunction-sections -fdata-sections -I "$source_dir" "$installer_dir/test/native-csa-concurrency.c" "$source_dir/csa.c" "$source_dir/FFdecsa/FFdecsa.o" "$source_dir/libtsfuncs/libtsfuncs.a" "$source_dir/libfuncs/libfuncs.a" -Wl,--gc-sections -ldvbcsa -lpthread -lcrypto -o "$source_dir/native-ffdecsa-concurrency-test"
 "$source_dir/native-ffdecsa-concurrency-test"
-oscam_source_dir="$(mktemp -d "/usr/local/src/oscam-astra-${oscam_revision:0:12}-XXXXXX")"
+oscam_source_dir="$(mktemp -d "/usr/local/src/oscam-astra-${oscam_revision:0:12}-${oscam_patch_digest:0:12}-XXXXXX")"
 git clone --no-checkout https://git.streamboard.tv/common/oscam.git "$oscam_source_dir"
 git -C "$oscam_source_dir" checkout --detach "$oscam_revision"
+git -C "$oscam_source_dir" apply --check "$oscam_patch"
+git -C "$oscam_source_dir" apply "$oscam_patch"
+cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pthread -I "$oscam_source_dir" "$installer_dir/test/native-oscam-io.c" -o "$oscam_source_dir/native-oscam-io-test"
+"$oscam_source_dir/native-oscam-io-test"
 (
   cd "$oscam_source_dir"
   ./config.sh --disable all --enable MODULE_NEWCAMD READER_NAGRA READER_NAGRA_MERLIN READER_IRDETO READER_CONAX READER_CRYPTOWORKS READER_SECA READER_VIACCESS READER_VIDEOGUARD READER_DRE READER_TONGFANG READER_BULCRYPT READER_GRIFFIN READER_DGCRYPT
@@ -59,16 +66,19 @@ git -C "$oscam_source_dir" checkout --detach "$oscam_revision"
 binary_stage="$(mktemp /usr/local/bin/.tsdecrypt-astra-XXXXXX)"
 install -o root -g root -m 0755 "$source_dir/tsdecrypt" "$binary_stage"
 "$binary_stage" --version
-install -d -o root -g root -m 0755 /usr/local/share/licenses/tsdecrypt
-install -o root -g root -m 0644 "$source_dir/COPYING" /usr/local/share/licenses/tsdecrypt/COPYING
+install -d -o root -g root -m 0755 /usr/local/share/licenses
+tsdecrypt_license_stage="$(mktemp -d /usr/local/share/licenses/.tsdecrypt-astra-stage-XXXXXX)"
+oscam_license_stage="$(mktemp -d /usr/local/share/licenses/.oscam-astra-stage-XXXXXX)"
+chmod 0755 "$tsdecrypt_license_stage" "$oscam_license_stage"
+install -o root -g root -m 0644 "$source_dir/COPYING" "$tsdecrypt_license_stage/COPYING"
 for patch_name in "${patch_names[@]}"; do
-  install -o root -g root -m 0644 "$installer_dir/patches/$patch_name" "/usr/local/share/licenses/tsdecrypt/$patch_name"
+  install -o root -g root -m 0644 "$installer_dir/patches/$patch_name" "$tsdecrypt_license_stage/$patch_name"
 done
 # Retain historical marker filenames for old installation tooling; runtime
 # trust is the policy version plus the actual executable SHA-256, not existence.
-install -o root -g root -m 0644 "$installer_dir/patches/tsdecrypt-emm-pid.patch" /usr/local/share/licenses/tsdecrypt/astra-emm-pid.patch
-install -o root -g root -m 0644 "$installer_dir/patches/tsdecrypt-ecm-protection.patch" /usr/local/share/licenses/tsdecrypt/astra-ecm-protection.patch
-manifest_stage="$(mktemp /usr/local/share/licenses/tsdecrypt/.astra-native-cas-XXXXXX)"
+install -o root -g root -m 0644 "$installer_dir/patches/tsdecrypt-emm-pid.patch" "$tsdecrypt_license_stage/astra-emm-pid.patch"
+install -o root -g root -m 0644 "$installer_dir/patches/tsdecrypt-ecm-protection.patch" "$tsdecrypt_license_stage/astra-ecm-protection.patch"
+manifest_stage="$tsdecrypt_license_stage/astra-native-cas.json"
 binary_digest="$(sha256sum "$binary_stage" | cut -d ' ' -f 1)"
 printf '{"policyVersion":3,"sourceRevision":"%s","binarySha256":"%s","patchSetSha256":"%s","sourceDirectory":"%s","buildTarget":"ffdecsa","patches":{"ecm":"%s","streamIO":"%s","controlWords":"%s","pesValidation":"%s"}}\n' \
   "$revision" "$binary_digest" "$patch_set_digest" "$source_dir" "${patch_digests[1]}" "${patch_digests[2]}" "${patch_digests[3]}" "${patch_digests[4]}" > "$manifest_stage"
@@ -77,42 +87,53 @@ chmod 0644 "$manifest_stage"
 
 oscam_stage="$(mktemp /usr/local/bin/.oscam-astra-XXXXXX)"
 install -o root -g root -m 0755 "$oscam_source_dir/Distribution/oscam" "$oscam_stage"
-install -d -o root -g root -m 0755 /usr/local/share/licenses/oscam
-install -o root -g root -m 0644 "$oscam_source_dir/COPYING" /usr/local/share/licenses/oscam/COPYING
+install -o root -g root -m 0644 "$oscam_source_dir/COPYING" "$oscam_license_stage/COPYING"
+install -o root -g root -m 0644 "$oscam_patch" "$oscam_license_stage/oscam-newcamd-stream-io.patch"
+oscam_binary_digest="$(sha256sum "$oscam_stage" | cut -d ' ' -f 1)"
+printf '{"policyVersion":1,"sourceRevision":"%s","binarySha256":"%s","patchSha256":"%s","sourceDirectory":"%s"}\n' \
+  "$oscam_revision" "$oscam_binary_digest" "$oscam_patch_digest" "$oscam_source_dir" > "$oscam_license_stage/astra-native-oscam.json"
+chmod 0644 "$oscam_license_stage/astra-native-oscam.json"
 
 # Both builds and all checks completed before either executable is published.
 # Preserve previous executable/manifest pairs for transactional error recovery.
-rollback_dir="$(mktemp -d /usr/local/share/licenses/tsdecrypt/.native-retained-XXXXXX)"
+rollback_dir="$(mktemp -d /usr/local/share/licenses/.astra-native-retained-XXXXXX)"
+install -d -m 0700 "$rollback_dir/licenses"
 for binary_name in tsdecrypt oscam; do
   if [[ -f "/usr/local/bin/$binary_name" ]]; then
     cp -p "/usr/local/bin/$binary_name" "$rollback_dir/$binary_name"
   fi
+  if [[ -e "/usr/local/share/licenses/$binary_name" ]]; then
+    cp -a "/usr/local/share/licenses/$binary_name" "$rollback_dir/licenses/$binary_name"
+  fi
 done
-if [[ -f /usr/local/share/licenses/tsdecrypt/astra-native-cas.json ]]; then
-  cp -p /usr/local/share/licenses/tsdecrypt/astra-native-cas.json "$rollback_dir/astra-native-cas.json"
-fi
 tsdecrypt_published=0
 oscam_published=0
-manifest_published=0
+licenses_attempted=0
 rollback_native_install() {
-  install_result=${1:-1}
+  local install_result=${1:-1} name restore_stage rollback_failed=0
   trap - ERR INT TERM
   set +e
   if [[ $tsdecrypt_published == 1 ]]; then
-    mv -f /usr/local/bin/tsdecrypt "$rollback_dir/failed-tsdecrypt"
-    if [[ -f "$rollback_dir/tsdecrypt" ]]; then mv -f "$rollback_dir/tsdecrypt" /usr/local/bin/tsdecrypt; fi
-  fi
-  if [[ $oscam_published == 1 ]]; then
-    mv -f /usr/local/bin/oscam "$rollback_dir/failed-oscam"
-    if [[ -f "$rollback_dir/oscam" ]]; then mv -f "$rollback_dir/oscam" /usr/local/bin/oscam; fi
-  fi
-  if [[ $manifest_published == 1 ]]; then
-    mv -f /usr/local/share/licenses/tsdecrypt/astra-native-cas.json "$rollback_dir/failed-manifest.json"
-    if [[ -f "$rollback_dir/astra-native-cas.json" ]]; then
-      mv -f "$rollback_dir/astra-native-cas.json" /usr/local/share/licenses/tsdecrypt/astra-native-cas.json
+    if [[ -e /usr/local/bin/tsdecrypt ]]; then mv -f /usr/local/bin/tsdecrypt "$rollback_dir/failed-tsdecrypt" || rollback_failed=1; fi
+    if [[ -f "$rollback_dir/tsdecrypt" ]]; then
+      restore_stage="$(mktemp /usr/local/bin/.astra-restore-tsdecrypt-XXXXXX)" && cp -p "$rollback_dir/tsdecrypt" "$restore_stage" && mv -f "$restore_stage" /usr/local/bin/tsdecrypt || rollback_failed=1
     fi
   fi
-  echo "Native installation failed; previous binaries restored. Diagnostics: $rollback_dir" >&2
+  if [[ $oscam_published == 1 ]]; then
+    if [[ -e /usr/local/bin/oscam ]]; then mv -f /usr/local/bin/oscam "$rollback_dir/failed-oscam" || rollback_failed=1; fi
+    if [[ -f "$rollback_dir/oscam" ]]; then
+      restore_stage="$(mktemp /usr/local/bin/.astra-restore-oscam-XXXXXX)" && cp -p "$rollback_dir/oscam" "$restore_stage" && mv -f "$restore_stage" /usr/local/bin/oscam || rollback_failed=1
+    fi
+  fi
+  if [[ $licenses_attempted == 1 ]]; then
+    for name in tsdecrypt oscam; do
+      if [[ -e "/usr/local/share/licenses/$name" ]]; then mv "/usr/local/share/licenses/$name" "$rollback_dir/failed-$name-license" || rollback_failed=1; fi
+      if [[ -d "$rollback_dir/licenses/$name" ]]; then
+        restore_stage="$(mktemp -d "/usr/local/share/licenses/.astra-restore-$name-XXXXXX")" && cp -a "$rollback_dir/licenses/$name/." "$restore_stage/" && chmod --reference="$rollback_dir/licenses/$name" "$restore_stage" && mv "$restore_stage" "/usr/local/share/licenses/$name" || rollback_failed=1
+      fi
+    done
+  fi
+  echo "Native installation failed; previous binary/license/manifest pairs restored; rollback failures=$rollback_failed. Diagnostics: $rollback_dir" >&2
   exit "$install_result"
 }
 trap 'rollback_native_install $?' ERR
@@ -122,8 +143,12 @@ tsdecrypt_published=1
 mv -f "$binary_stage" /usr/local/bin/tsdecrypt
 oscam_published=1
 mv -f "$oscam_stage" /usr/local/bin/oscam
-manifest_published=1
-mv -f "$manifest_stage" /usr/local/share/licenses/tsdecrypt/astra-native-cas.json
+licenses_attempted=1
+for binary_name in tsdecrypt oscam; do
+  if [[ -e "/usr/local/share/licenses/$binary_name" ]]; then mv "/usr/local/share/licenses/$binary_name" "$rollback_dir/published-old-$binary_name-license"; fi
+done
+mv "$tsdecrypt_license_stage" /usr/local/share/licenses/tsdecrypt
+mv "$oscam_license_stage" /usr/local/share/licenses/oscam
 trap - ERR INT TERM
 echo "Native CAS policy 3 installed. Corresponding source: $source_dir and $oscam_source_dir"
 echo "Previous native binaries retained in $rollback_dir"

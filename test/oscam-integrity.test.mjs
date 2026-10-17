@@ -1,0 +1,33 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { protectedOscamBuild, OSCAM_SOURCE_REVISION } from '../src/oscam-integrity.mjs';
+
+test('OSCam trust requires matching installed hash, source and receive policy', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'astra-oscam-integrity-'));
+  try {
+    const binary = join(directory, 'oscam'); const manifest = join(directory, 'manifest.json');
+    const body = Buffer.from('disposable fixture executable');
+    const hash = createHash('sha256').update(body).digest('hex');
+    writeFileSync(binary, body, { mode: 0o755 });
+    assert.equal(protectedOscamBuild(binary, manifest), false);
+    const data = { policyVersion: 1, sourceRevision: OSCAM_SOURCE_REVISION, binarySha256: hash };
+    writeFileSync(manifest, JSON.stringify(data));
+    assert.equal(protectedOscamBuild(binary, manifest), true);
+    chmodSync(binary, 0o644);
+    assert.equal(protectedOscamBuild(binary, manifest), false);
+    chmodSync(binary, 0o755);
+    writeFileSync(binary, 'replacement executable');
+    assert.equal(protectedOscamBuild(binary, manifest), false);
+    writeFileSync(binary, body);
+    writeFileSync(manifest, JSON.stringify({ ...data, policyVersion: 0 }));
+    assert.equal(protectedOscamBuild(binary, manifest), false);
+    writeFileSync(manifest, JSON.stringify({ ...data, sourceRevision: 'unverified' }));
+    assert.equal(protectedOscamBuild(binary, manifest), false);
+    writeFileSync(manifest, 'not JSON');
+    assert.equal(protectedOscamBuild(binary, manifest), false);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
