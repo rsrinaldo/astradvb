@@ -62,7 +62,7 @@ async function streamDecode(encrypted, fragmented, slowConsumer, requireBackpres
       if (writes === 1 && options.firstAVDeadlineMs) {
         let deadline;
         try {
-          await Promise.race([firstAV, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error('Unanchored private PES blocked A/V before EOF')), options.firstAVDeadlineMs); })]);
+          await Promise.race([firstAV, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error(options.firstAVLabel || 'Unanchored private PES blocked A/V before EOF')), options.firstAVDeadlineMs); })]);
         } finally { clearTimeout(deadline); }
       }
       if (fragmented && writes % 3 === 0) await immediate();
@@ -99,6 +99,20 @@ function sparsePrivatePES(plain) {
     } else parts.push(packet);
   }
   assert.ok(inserted); return Buffer.concat(parts);
+}
+
+function retiredHeaderlessVideoPrefix(plain) {
+  const parts=[];let inserted=false;
+  for(let at=0;at<plain.length;at+=188){
+    const packet=plain.subarray(at,at+188);parts.push(packet);
+    if(!inserted && (((packet[1]&31)<<8)|packet[2])===4096){
+      // Deliberate CC gap before the original first video CC=0 retires a
+      // headerless run. This synthetic tail is not reference A/V content.
+      const tail=Buffer.alloc(188,0x77);tail.set([0x47,1,0,0x17]);
+      parts.push(tail);inserted=true;
+    }
+  }
+  assert.ok(inserted);return Buffer.concat(parts);
 }
 
 function continuationGap(bytes) {
@@ -147,6 +161,10 @@ test('real native CSA preserves all A/V packets with fragmented stdin and slow o
     const expected = avPackets(plain);
     const expectedHash = createHash('sha256').update(expected).digest('hex');
     assert.ok(expected.length > 188 * 100);
+    const retired = checked(encryptor, [], { input: retiredHeaderlessVideoPrefix(plain) }).stdout;
+    const retiredOutput = avPackets(await streamDecode(retired, false, false, false, { firstAVDeadlineMs: 1500, firstAVLabel: 'Retired headerless video blocked A/V before EOF' }));
+    assert.equal(retiredOutput.length, expected.length, 'Retired headerless tail must not lose valid A/V');
+    assert.equal(createHash('sha256').update(retiredOutput).digest('hex'), expectedHash, 'Every original A/V byte must survive retired-run cleanup');
     const sparse = checked(encryptor, ['--with-private'], { input: sparsePrivatePES(plain) }).stdout;
     const sparseOutput = avPackets(await streamDecode(sparse, false, false, false, { firstAVDeadlineMs: 1500 }));
     assert.equal(sparseOutput.length, expected.length, 'Sparse private PES must not lose A/V');

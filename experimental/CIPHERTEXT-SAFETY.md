@@ -1,4 +1,11 @@
-# Native ciphertext safety — design baseline and policy 7
+# Native ciphertext safety — design baseline and policy 8
+
+Policy 8 retires unconfirmed headerless runs immediately if their PID owner has
+already moved elsewhere. Such runs cannot receive future header evidence.
+They remain fail-closed and are counted as orphan discards. Runs that have an
+anchor, or are still owned by the PID, keep the original late-key recovery
+window; no certificate, key inference, queue order or memory bound is relaxed.
+This prevents waiting two seconds for an impossible anchor, not packet recovery.
 
 Policy 7 adds one scoped exception to retaining undecidable media in the shared
 FIFO: unanchored encrypted subtitle/teletext continuations are discarded
@@ -14,11 +21,12 @@ can be lost, and anchored missing-key holds are not removed. See the release
 verification for new tests; the policy-6/v7 evidence below is historical and
 does not verify this changed artifact.
 
-The policy-5/v7 review below is the historical safety baseline. Current normal
-policy 6 retains that contract and adds bounded READY-prefix cohort gathering
+The policy-5/v7 review below is the historical safety baseline. Policy 6
+retained that contract and added bounded READY-prefix cohort gathering
 with strict ordered emission and revision-cached waiting-anchor probes. It does
-not add a media buffer or relax key evidence/retention. The current patch hash
-and measured performance/safety gates are in `../VERIFICATION-0.8.46.md`; the
+not add a media buffer or relax key evidence/retention. Its patch hash and
+measured performance/safety gates are in `../VERIFICATION-0.8.46.md`; current
+policy-8 verification is in `../VERIFICATION-0.8.49.md`. The
 v7 hash below identifies the prior reviewed baseline, not the current artifact.
 
 This design note describes `patches/tsdecrypt-ciphertext-safety.patch`, included

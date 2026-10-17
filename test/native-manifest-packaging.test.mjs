@@ -18,14 +18,14 @@ const expectedPatches = { ecm: digests[1], streamIO: digests[2], controlWords: d
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
 function verify(value, sourceDirectory) {
-  assert.equal(value.policyVersion, 7, 'Production packaging must require the optimized policy 7 decoder');
+  assert.equal(value.policyVersion, 8, 'Production packaging must require the optimized policy 8 decoder');
   assert.equal(value.sourceRevision, sourceRevision); assert.equal(value.binarySha256, hash(binary));
   assert.equal(value.patchSetSha256, hash(digests.join('\n') + '\n'), 'Patch-set digest must include all seven normal patches in application order');
   assert.deepEqual(value.patches, expectedPatches); assert.equal(value.buildTarget, 'ffdecsa');
   assert.equal(value.sourceDirectory, sourceDirectory); assert.notEqual(value.experimental, true);
 }
 
-test('actual Docker native manifest generator records policy 7 and the exact normal patch set', () => {
+test('actual Docker native manifest generator records policy 8 and the exact normal patch set', () => {
   const docker = readFileSync(new URL('Dockerfile', root), 'utf8');
   const programs = [...docker.matchAll(/node -e '([^']*astra-native-cas\.json[^']*)'/g)];
   assert.equal(programs.length, 1, 'Extract exactly the native CAS manifest generator, never a Docker RUN instruction');
@@ -48,7 +48,7 @@ test('actual Docker native manifest generator records policy 7 and the exact nor
   verify(captured, '/usr/local/src/tsdecrypt');
 });
 
-test('actual native installer printf writes the same policy 7 manifest with normal safety provenance', () => {
+test('actual native installer printf writes the same policy 8 manifest with normal safety provenance', () => {
   const installer = readFileSync(new URL('install-cas.sh', root), 'utf8');
   const marker = 'manifest_stage="$tsdecrypt_license_stage/astra-native-cas.json"';
   const start = installer.indexOf("printf '", installer.indexOf(marker));
@@ -57,7 +57,7 @@ test('actual native installer printf writes the same policy 7 manifest with norm
   const command = installer.slice(start, end + endMarker.length);
   assert.ok(command.startsWith("printf '{\"policyVersion\":"));
   assert.doesNotMatch(command, /`|\$\(|;|&&|\|\|/, 'Only the extracted printf may execute');
-  const directory = mkdtempSync(join(tmpdir(), 'astra-manifest-policy7-'));
+  const directory = mkdtempSync(join(tmpdir(), 'astra-manifest-policy8-'));
   try {
     const manifest = join(directory, 'manifest.json'), sourceDirectory = join(directory, 'retained-source');
     const script = `set -euo pipefail\nrevision=${quote(sourceRevision)}\nbinary_digest=${quote(hash(binary))}\npatch_set_digest=${quote(hash(digests.join('\n') + '\n'))}\nsource_dir=${quote(sourceDirectory)}\nmanifest_stage=${quote(manifest)}\npatch_digests=(${digests.map(quote).join(' ')})\n${command}\n`;

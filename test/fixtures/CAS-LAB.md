@@ -75,7 +75,16 @@ with no output pauses and exactly one true semantic ECM identity. A PMT version
 or unrelated descriptor update must not force an unnecessary key refetch or
 leave the existing channel keyless.
 
-## Normal policy 7 ciphertext safety
+## Normal policy 8 ciphertext safety
+
+Policy 8 adds retired-headerless-run progress: only an unconfirmed run with no
+anchor and no remaining PID owner retires immediately. Anchored late-key work
+remains recoverable. The strict helper reproduces both cases. The real native
+fixture inserts an encrypted video continuation before the first valid PES,
+then forces a synthetic CC gap so that run becomes unreachable. Original A/V
+must appear before the old two-second hold/EOF and retain its exact byte order;
+the injected undecidable prefix must not be emitted as clear. This synthetic
+gap is part of the fixture, not evidence of real input packet loss.
 
 Policy 7 additionally refuses shared-FIFO ownership to unanchored encrypted
 continuations explicitly marked by valid subtitle/teletext descriptors. Private
@@ -90,7 +99,7 @@ with stdin still open, and then checks every ordered A/V byte. An old-binary
 failure is a reproduction, not a passed release gate.
 
 The helper is embedded in `patches/tsdecrypt-ciphertext-safety.patch`, the seventh
-normal native patch in the installer/Docker policy 7 bundle. It retains the
+normal native patch in the installer/Docker policy 8 bundle. It retains the
 policy-5 safety contract while gathering immutable-key cohorts across the
 bounded READY prefix and caching unchanged waiting-anchor evidence. Exact FIFO,
 uncertainty boundaries, candidate pins, terminal failures and the existing

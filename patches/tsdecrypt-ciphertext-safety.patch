@@ -319,9 +319,9 @@ index 0887e15..b124029 100644
 +	if (!ts->ciphertext || (!force && now - ts->ciphertext_report_ms < 5000)) return;
 +	ts->ciphertext_report_ms = now;
 +	struct astra_ct_stats *s = &ts->ciphertext->stats;
-+	ts_LOGf("CT | heldBytes=%" PRIu64 " peakBytes=%" PRIu64 " dropped=%" PRIu64 " timeout=%" PRIu64 " capacity=%" PRIu64 " prefix=%" PRIu64 " recovered=%" PRIu64 " allocated=%" PRIu64 " ancillary=%" PRIu64 "\n",
++	ts_LOGf("CT | heldBytes=%" PRIu64 " peakBytes=%" PRIu64 " dropped=%" PRIu64 " timeout=%" PRIu64 " capacity=%" PRIu64 " prefix=%" PRIu64 " recovered=%" PRIu64 " allocated=%" PRIu64 " ancillary=%" PRIu64 " orphan=%" PRIu64 "\n",
 +		s->current_held_bytes, s->peak_held_bytes, s->packets_dropped, s->timeout_drops,
-+		s->capacity_drops, s->prefix_drops, s->recovered_holds, s->allocated_bytes, s->ancillary_drops);
++		s->capacity_drops, s->prefix_drops, s->recovered_holds, s->allocated_bytes, s->ancillary_drops, s->orphan_drops);
 +}
 +static int ciphertext_slot(struct ts *ts, const struct ciphertext_slot *slot, uint64_t now) {
 +	if (!ciphertext_ensure(ts)) return 0;
@@ -649,8 +649,8 @@ new file mode 100644
 index 0000000..e8fc54b
 --- /dev/null
 +++ b/astra-ciphertext-safety.h
-@@ -0,0 +1,506 @@
-+/* Normal native decoder safety (policy 7). READY-prefix SIMD cohorts preserve
+@@ -0,0 +1,513 @@
++/* Normal native decoder safety (policy 8). READY-prefix SIMD cohorts preserve
 + * original TS order and adaptive retention bounds without fixed input delay.
 + * Copyright AstraDVB contributors, GPL-2.0-only.
 + *
@@ -705,7 +705,7 @@ index 0000000..e8fc54b
 +struct astra_ct_stats {
 +    uint64_t packets_in, packets_out, packets_dropped;
 +    uint64_t held_packets, recovered_holds, timeout_drops, capacity_drops;
-+    uint64_t context_drops, prefix_drops, candidate_overflows, run_overflows, ambiguous_probes, ancillary_drops;
++    uint64_t context_drops, prefix_drops, candidate_overflows, run_overflows, ambiguous_probes, ancillary_drops, orphan_drops;
 +    uint64_t current_held_bytes, peak_held_bytes, allocated_bytes;
 +};
 +struct astra_ct_key {
@@ -797,6 +797,7 @@ index 0000000..e8fc54b
 +    if (reason == 2) s->stats.capacity_drops++;
 +    if (reason == 3) s->stats.context_drops++;
 +    if (reason == 4) s->stats.prefix_drops++;
++    if (reason == 6) s->stats.orphan_drops++;
 +    astra_ct_run_release(s, p->run);
 +    s->head = (s->head + 1) % s->capacity; s->count--;
 +    if (!s->count) s->head = 0;
@@ -991,6 +992,12 @@ index 0000000..e8fc54b
 +        struct astra_ct_packet *p = &s->queue[s->head];
 +        struct astra_ct_run *r = p->run == ASTRA_CT_NONE ? NULL : &s->runs[p->run];
 +        if (r && (!r->present || r->serial != p->run_serial)) { s->output_failed = 1; return 0; }
++        /* A replaced run with no PES anchor cannot gain one from future
++         * input: that PID now appends to a different run. More CWs cannot
++         * certify it. Retire only this unreachable ciphertext immediately;
++         * anchored or still-owned unknown runs retain ordinary late-key waits. */
++        if (r && !r->confirmed && !r->failed && !r->anchor_count &&
++            s->pids[r->pid].run != p->run) r->failed = 6;
 +        if (r && !r->confirmed && !r->failed && !finishing && now_ms - p->received_ms < s->wait_ms) break;
 +        if (r && !r->confirmed) {
 +            unsigned int reason = r->failed ? r->failed : 1;

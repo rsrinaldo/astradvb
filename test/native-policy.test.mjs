@@ -8,12 +8,12 @@ import { NATIVE_CAS_POLICY_VERSION, NATIVE_CAS_SOURCE_REVISION, protectedNativeB
 
 // This is the promotion gate, not an experimental opt-in or native executable.
 // No fixture is executed and no real native installation paths are accessed.
-const policy = 7;
-const body = Buffer.from('disposable policy-seven executable fixture');
+const policy = 8;
+const body = Buffer.from('disposable policy-eight executable fixture');
 const hash = value => createHash('sha256').update(value).digest('hex');
 
 function fixture(t) {
-  const directory = mkdtempSync(join(tmpdir(), 'astra-native-policy7-'));
+  const directory = mkdtempSync(join(tmpdir(), 'astra-native-policy8-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const binary = join(directory, 'tsdecrypt'), manifest = join(directory, 'manifest.json');
   const value = { policyVersion: policy, sourceRevision: NATIVE_CAS_SOURCE_REVISION, binarySha256: hash(body),
@@ -26,23 +26,23 @@ function fixture(t) {
   return { directory, binary, manifest, value, publish, stamp, verify: options => protectedNativeBuild(binary, manifest, options) };
 }
 
-test('normal native CAS promotion requires optimized bundle policy 7', () => {
+test('normal native CAS promotion requires optimized bundle policy 8', () => {
   assert.equal(NATIVE_CAS_POLICY_VERSION, policy, 'Do not accept the pre-optimization decoder under the new bundle policy');
   assert.equal(NATIVE_CAS_SOURCE_REVISION, 'f4876e84cf1866645f84b93f830af67193c85f69');
 });
 
-test('policy 7 accepts a proper executable/hash/source manifest and rejects every older bundle', t => {
+test('policy 8 accepts a proper executable/hash/source manifest and rejects every older bundle', t => {
   const f = fixture(t);
   assert.equal(f.verify(), true);
   f.publish({ ...f.value, experimental: false }); assert.equal(f.verify(), true);
-  for (const policyVersion of [0, 1, 2, 3, 4, 5, 6, 8, '7']) {
+  for (const policyVersion of [0, 1, 2, 3, 4, 5, 6, 7, 9, '8']) {
     f.publish({ ...f.value, policyVersion });
     assert.equal(f.verify(), false, `Unexpected policy accepted: ${policyVersion}`);
     assert.equal(f.verify({ allowExperimental: true }), false, 'Lab opt-in must not waive the bundle policy');
   }
 });
 
-test('policy 7 requires normal ciphertext-safety and patch-set provenance hashes', t => {
+test('policy 8 requires normal ciphertext-safety and patch-set provenance hashes', t => {
   const f = fixture(t);
   for (const patches of [undefined, null, {}, [], { ciphertextSafety: '' }, { ciphertextSafety: 'b'.repeat(63) }, { ciphertextSafety: 'B'.repeat(64) }, { ciphertextSafety: 'not-a-hash' }]) {
     f.publish({ ...f.value, patches }); assert.equal(f.verify(), false);
@@ -53,7 +53,7 @@ test('policy 7 requires normal ciphertext-safety and patch-set provenance hashes
   f.publish(); assert.equal(f.verify(), true);
 });
 
-test('policy 7 rejects non-executable/non-file inputs and an altered native binary', t => {
+test('policy 8 rejects non-executable/non-file inputs and an altered native binary', t => {
   const f = fixture(t);
   chmodSync(f.binary, 0o644); f.stamp(f.binary); assert.equal(f.verify(), false);
   chmodSync(f.binary, 0o755); f.stamp(f.binary); assert.equal(f.verify(), true);
@@ -68,7 +68,7 @@ test('policy 7 rejects non-executable/non-file inputs and an altered native bina
   writeFileSync(f.manifest, '{broken'); assert.equal(f.verify(), false);
 });
 
-test('experimental verification is explicit and cannot populate the production policy 7 cache', t => {
+test('experimental verification is explicit and cannot populate the production policy 8 cache', t => {
   const f = fixture(t); f.publish({ ...f.value, experimental: true });
   assert.equal(f.verify(), false);
   assert.equal(f.verify({ allowExperimental: true }), true);

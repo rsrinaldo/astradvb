@@ -46,6 +46,19 @@ node src/server.mjs
 
 Open `http://server-address:8000/` and sign in as `admin`. Read the unique initial password from `data/initial-admin-password`, then change it in **Settings → Administrator account**. All example streams are disabled.
 
+## Retired headerless-run safety (v0.8.49)
+
+Native policy 8 also retires an unconfirmed, headerless run immediately once its
+PID owner has moved to a different run. Such work can never receive a future
+PES header and cannot become certifiable merely by waiting for more keys. This
+removes another unnecessary two-second A/V hold. Discards are counted as
+`decoder.ciphertext.orphan`, separately from actual key deadlines and ancillary
+tails. Anchored runs and still-owned runs retain bounded late-key recovery.
+No unsafe prefix is emitted and no provider request, queue or buffer is added.
+This does not recover undecidable prefix packets or promise zero loss. Upgrade
+the application and verified policy-8 binary/manifest together; policy-7 builds
+are rejected. See [v0.8.49 verification](VERIFICATION-0.8.49.md).
+
 ## Sparse private-PES safety (v0.8.48)
 
 Native bundle policy 7 prevents encrypted subtitle/teletext continuations

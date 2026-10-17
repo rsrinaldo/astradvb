@@ -182,7 +182,9 @@ static void bounds_and_output_failure(void) {
     assert(!astra_ciphertext_create(ASTRA_CT_MAX_BYTES + 1, 2000, decrypt, emit, &oracle));
     assert(!astra_ciphertext_create(bytes, 2001, decrypt, emit, &oracle));
     struct astra_ciphertext *s = start(bytes, 2000);
-    for (unsigned int i = 0; i < 1000; i++) push(s, 256, i, 0, i & 1, i & 1, 1, i & 255);
+    // Keep an owned, anchored missing-key head: retired headerless runs now
+    // leave promptly and cannot legitimately be used to force capacity loss.
+    for (unsigned int i = 0; i < 1000; i++) push(s, 256, i, i == 0, 0, 1, 1, i & 255);
     assert(s->capacity == 32); assert(s->count <= 32); assert(s->stats.allocated_bytes <= bytes); assert(s->stats.capacity_drops > 0);
     assert(oracle.emitted == 0 && oracle.bad == 0); assert(astra_ciphertext_finish(s, 2)); assert(s->count == 0); astra_ciphertext_destroy(s);
     s = start(bytes, 2000); publish(s, 0, 1, 0); oracle.fail_emit = 1;
@@ -623,7 +625,40 @@ static void unanchored_private_pes_cannot_block_av(void) {
     assert(!astra_ct_ancillary_descriptors(descriptors,14));
 }
 
+static void unreachable_headerless_runs_retire_without_a_timer(void) {
+    struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 2000);
+    publish(s, 0, 1, 0); publish(s, 1, 2, 0);
+    push(s, 256, 0, 1, 0, 1, 0, 1);
+    push(s, 256, 1, 0, 1, 2, 10, 2); // Current unanchored parity run can still gain a PUSI.
+    assert(s->count == 1 && oracle.emitted == 1);
+    publish(s, 1, 3, 20); // A new distinct candidate splits that uncertified run.
+    push(s, 256, 2, 0, 1, 2, 21, 3);
+    push(s, 256, 3, 1, 1, 2, 22, 4); // Only the new run receives this valid anchor.
+    assert(s->count == 0 && oracle.emitted == 2 && oracle.bad == 0 &&
+        "a retired headerless run cannot gain a future anchor and must not hold certified A/V until timeout");
+    assert(s->stats.timeout_drops == 0 && s->stats.packets_dropped == 2);
+    assert(s->stats.orphan_drops == 1 && s->stats.prefix_drops == 1);
+    exact_owned_references(s); safe_tail(s, 23, 2);
+
+    // An orphan WITH an anchor may still gain a genuinely late key. Do not
+    // turn this progress fix into eager packet loss or stale-key inference.
+    s = start(ASTRA_CT_MAX_BYTES, 2000); publish(s, 0, 1, 0);
+    push(s, 256, 0, 1, 0, 2, 0, 1);
+    publish(s, 0, 3, 10); push(s, 256, 1, 0, 0, 2, 11, 2);
+    assert(oracle.emitted == 0 && s->count == 2);
+    publish(s, 0, 2, 100); assert(astra_ciphertext_pump(s, 100, 0));
+    assert(oracle.emitted == 1 && oracle.bad == 0 && s->count == 1);
+    assert(s->stats.orphan_drops == 0 && "retired anchored work must remain recoverable by a late key");
+    push(s, 256, 2, 1, 0, 2, 101, 3);
+    assert(oracle.emitted == 2 && oracle.bad == 0 && s->stats.timeout_drops == 0);
+    exact_owned_references(s); safe_tail(s, 102, 2);
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--orphan-regression")) {
+        unreachable_headerless_runs_retire_without_a_timer();
+        puts("PASS: retired headerless runs retire immediately; anchored late-key recovery remains safe"); return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--ancillary-regression")) {
         unanchored_private_pes_cannot_block_av();
         puts("PASS: unanchored private PES cannot stall A/V; complete/split anchors and late-key recovery remain safe"); return 0;
@@ -644,6 +679,7 @@ int main(int argc, char **argv) {
     idle_certificate_gc_preserves_queued_ownership();
     unknown_only_candidate_eviction(); valid_unknown_candidate_eviction(); late_new_candidate_and_exact_retention_references();
     unanchored_private_pes_cannot_block_av();
+    unreachable_headerless_runs_retire_without_a_timer();
     ready_prefix_gathers_across_clear_and_other_keys(); unresolved_prefix_blocks_ready_tail(); gathered_wrap_stops_at_uncertain_boundary_and_drains_eof(); gathered_batch_failures_are_terminal(); completed_anchor_probe_cache_and_fresh_evidence();
     puts("PASS: strict ordered ciphertext safety, early-future ambiguity, PID-cycle gaps, delayed/missing keys, exact healthy continuations and bounded EOF ownership");
     return 0;
