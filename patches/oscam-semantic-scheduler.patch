@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..ab1486a
 --- /dev/null
 +++ b/astra-semantic-scheduler.h
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,251 @@
 +#ifndef ASTRA_SEMANTIC_SCHEDULER_H
 +#define ASTRA_SEMANTIC_SCHEDULER_H
 +
@@ -13,7 +13,7 @@ index 0000000..ab1486a
 + * deadline plus absence of matched complete ECM reply progress permits reset. */
 +#include <stdint.h>
 +#include <stddef.h>
-+#define ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 2
++#define ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 3
 +
 +enum astra_semantic_state { ASTRA_EMPTY, ASTRA_QUEUED, ASTRA_SENT, ASTRA_ALIAS };
 +struct astra_semantic_slot
@@ -142,7 +142,15 @@ index 0000000..ab1486a
 +{
 +	uint64_t oldest = UINT64_MAX;
 +	for(size_t i = 0; i < q->capacity; ++i)
-+		{ if(q->slots[i].state == ASTRA_SENT && q->slots[i].deadline_ms < oldest) { oldest = q->slots[i].deadline_ms; } }
++	{
++		if(q->slots[i].state != ASTRA_SENT) { continue; }
++		/* Caller deadlines bound answers, not transport responsiveness. A
++		 * request dispatched near its caller deadline still needs a full
++		 * response interval before its silence can justify a shared reset. */
++		uint64_t sent = q->slots[i].sent_at_ms;
++		uint64_t due = sent > UINT64_MAX - interval_ms ? UINT64_MAX : sent + interval_ms;
++		if(due < oldest) { oldest = due; }
++	}
 +	if(oldest == UINT64_MAX) { return UINT64_MAX; }
 +	if(q->reply_progress)
 +	{
@@ -158,46 +166,35 @@ index 0000000..ab1486a
 +{
 +	uint64_t due = astra_semantic_no_progress_due(q, interval_ms);
 +	uint64_t lifetime = interval_ms > UINT64_MAX / 4 ? UINT64_MAX : interval_ms * 4;
-+	int demand = 0;
-+	for(size_t i = 0; i < q->capacity; ++i) { if(q->slots[i].state == ASTRA_QUEUED) { demand = 1; break; } }
 +	for(size_t i = 0; i < q->capacity; ++i)
 +	{
 +		struct astra_semantic_slot *s = &q->slots[i];
 +		if(s->state != ASTRA_SENT) { continue; }
 +		uint64_t hard = s->sent_at_ms > UINT64_MAX - lifetime ? UINT64_MAX : s->sent_at_ms + lifetime;
 +		if(hard < due) { due = hard; }
-+		if(demand)
-+		{
-+			unsigned expired = 0;
-+			for(size_t j = 0; j < q->capacity; ++j)
-+				{ if(q->slots[j].state == ASTRA_SENT && q->slots[j].deadline_ms <= s->deadline_ms) { expired++; } }
-+			if(expired >= 16 && s->deadline_ms < due) { due = s->deadline_ms; }
-+		}
 +	}
 +	return due;
 +}
 +
-+/* 1=no matched progress, 2=majority expired plus queued demand, 3=absolute
-+ * orphan lifetime. Only soft rules give already-readable replies <=250ms to
-+ * parse. Continuous junk cannot defeat this grace or the absolute lifetime. */
++/* 1=no matched progress, 3=absolute orphan lifetime. Reason 2 (expired
++ * majority) is retired: client timeouts/backlog do not prove a dead transport.
++ * Continuing matched replies preserve the connection, but cannot retain
++ * orphan IDs forever. Soft silence gives readable replies <=250ms to parse;
++ * continuous junk cannot defeat this grace or the absolute lifetime. */
 +static inline int astra_semantic_recovery_decision(struct astra_semantic_core *q, uint64_t now, uint64_t interval_ms, int readable)
 +{
-+	unsigned expired = 0;
-+	int demand = 0, reason = 0;
++	int reason = 0;
 +	uint64_t lifetime = interval_ms > UINT64_MAX / 4 ? UINT64_MAX : interval_ms * 4;
 +	for(size_t i = 0; i < q->capacity; ++i)
 +	{
 +		struct astra_semantic_slot *s = &q->slots[i];
-+		if(s->state == ASTRA_QUEUED && s->deadline_ms > now) { demand = 1; }
 +		if(s->state != ASTRA_SENT) { continue; }
-+		if(s->deadline_ms <= now) { expired++; }
 +		if(now >= s->sent_at_ms && now - s->sent_at_ms >= lifetime) { reason = 3; }
 +	}
 +	if(reason != 3)
 +	{
 +		uint64_t silence = astra_semantic_no_progress_due(q, interval_ms);
-+		if(expired >= 16 && demand) { reason = 2; }
-+		else if(silence != UINT64_MAX && now >= silence) { reason = 1; }
++		if(silence != UINT64_MAX && now >= silence) { reason = 1; }
 +	}
 +	if(!reason) { q->soft_defer_until_ms = 0; return 0; }
 +	if(reason != 3 && readable)

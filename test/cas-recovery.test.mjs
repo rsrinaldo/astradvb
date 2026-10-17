@@ -186,7 +186,7 @@ test('cached positive replies cannot reset transport recovery health', async t =
 
 test('an unverified OSCam binary cannot launch or recover a shared proxy', async t => {
   const s = await proxySetup(t); s.proxy.protectedBuild = () => false;
-  await assert.rejects(s.proxy.start([s.profile]), /verified OSCam semantic-recovery policy v2/);
+  await assert.rejects(s.proxy.start([s.profile]), /verified OSCam semantic-recovery policy v3/);
   assert.equal(s.children.length, 0); assert.equal(s.proxy.guards.size, 0);
 });
 

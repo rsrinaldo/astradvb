@@ -260,17 +260,21 @@ static void original_deadline_and_progress_boundaries(void)
 	struct astra_semantic_slot slots[4];
 	struct astra_semantic_core q;
 	astra_semantic_init(&q, slots, 4);
-	/* A queued request can already be old before dispatch. Before any reply,
-	 * use its original deadline, not dispatch+ctimeout. */
+	/* Caller expiry is not evidence of a dead transport. Preserve its original
+	 * answer deadline, but allow a full response interval after dispatch. */
 	int n = astra_semantic_enqueue(&q, 0, 8000, 1, 0);
 	astra_semantic_dispatch(&q, (size_t)n, 7000, 3);
-	assert(astra_semantic_recovery_due(&q, 8000) == 8000);
-	assert(astra_semantic_recovery_wait(&q, 7990, 8000, 3000) == 10);
+	assert(slots[n].deadline_ms == 8000);
+	assert(astra_semantic_recovery_due(&q, 8000) == 15000);
+	assert(astra_semantic_recovery_wait(&q, 7990, 8000, 3000) == 3000);
 	int alias = astra_semantic_enqueue(&q, 7000, 15000, 1, 1);
 	assert(!astra_semantic_note_reply(&q, (size_t)alias, 3, 7900));
 	assert(q.reply_progress == 0 && q.matched == 0);
 	/* Send failure/timeout/cache paths do not invoke note_reply. */
-	assert(astra_semantic_recovery_due(&q, 8000) == 8000);
+	assert(astra_semantic_recovery_due(&q, 8000) == 15000);
+	assert(astra_semantic_recovery_decision(&q, 8000, 8000, 0) == 0);
+	assert(astra_semantic_recovery_decision(&q, 14999, 8000, 0) == 0);
+	assert(astra_semantic_recovery_decision(&q, 15000, 8000, 0) == 1);
 	assert(astra_semantic_note_reply(&q, (size_t)n, 3, 7900));
 	assert(astra_semantic_recovery_due(&q, 8000) == 15900);
 	assert(astra_semantic_recovery_wait(&q, 15899, 8000, 3000) == 1);
@@ -304,22 +308,23 @@ static void partial_drop_pressure_retirement(void)
 		astra_semantic_release(&q, (size_t)n);
 		assert(q.sent == 31);
 	}
-	/* Continuing responses cannot mask permanent loss of almost all capacity
-	 * when live new work is waiting. Whole-transport retirement, not ID reuse. */
+	/* Regression: expired majority plus queued demand must not close a
+	 * transport that still completes matched requests. */
 	int active = astra_semantic_enqueue(&q, 7900, 15900, 101, 0);
 	id = astra_semantic_next_id(&q, id);
 	astra_semantic_dispatch(&q, (size_t)active, 7900, id);
 	assert(astra_semantic_enqueue(&q, 7900, 15900, 102, 0) >= 0);
 	assert(astra_semantic_no_progress_due(&q, 8000) == 15100);
-	assert(astra_semantic_recovery_due(&q, 8000) == 8000);
+	assert(astra_semantic_recovery_due(&q, 8000) == 15100);
 	assert(astra_semantic_recovery_decision(&q, 7999, 8000, 0) == 0);
-	assert(astra_semantic_recovery_decision(&q, 8000, 8000, 0) == 2);
-	q.last_reset_reason = 2; q.resets++;
+	assert(astra_semantic_recovery_decision(&q, 8000, 8000, 0) == 0);
+	assert(astra_semantic_recovery_decision(&q, 15100, 8000, 0) == 1);
+	q.last_reset_reason = 1; q.resets++;
 	astra_semantic_transport_closed(&q);
 	assert(q.sent == 0 && q.abandoned == 32 && q.generation == 2);
-	assert(q.last_reset_reason == 2);
+	assert(q.last_reset_reason == 1);
 	assert(astra_semantic_pick(&q, 8001, 1) == -1); /* nothing replayed */
-	/* Exactly half the cap, not merely any old request, activates pressure. */
+	/* Even 16 expired IDs do not override recent real reply progress. */
 	astra_semantic_init(&q, slots, 128);
 	for(unsigned i = 0; i < 17; ++i)
 	{
@@ -329,9 +334,10 @@ static void partial_drop_pressure_retirement(void)
 	assert(astra_semantic_note_reply(&q, 16, 19, 7990));
 	astra_semantic_release(&q, 16);
 	assert(astra_semantic_enqueue(&q, 7990, 20000, 200, 0) >= 0);
-	assert(astra_semantic_recovery_due(&q, 8000) == 9000);
+	assert(astra_semantic_recovery_due(&q, 8000) == 15990);
 	assert(astra_semantic_recovery_decision(&q, 8000, 8000, 0) == 0);
-	assert(astra_semantic_recovery_decision(&q, 9000, 8000, 0) == 2);
+	assert(astra_semantic_recovery_decision(&q, 9000, 8000, 0) == 0);
+	assert(astra_semantic_recovery_decision(&q, 15990, 8000, 0) == 1);
 }
 
 static void absolute_orphan_age_and_ready_reply_boundary(void)
@@ -381,8 +387,20 @@ static void absolute_orphan_age_and_ready_reply_boundary(void)
 	assert(astra_semantic_recovery_decision(&q, 32000, 8000, 1) == 3);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	if(argc == 2 && !strcmp(argv[1], "--dispatch-deadline"))
+	{
+		original_deadline_and_progress_boundaries();
+		puts("PASS: caller deadlines do not truncate transport response time");
+		return 0;
+	}
+	if(argc == 2 && !strcmp(argv[1], "--expired-majority"))
+	{
+		partial_drop_pressure_retirement();
+		puts("PASS: expired majority cannot reset real matched progress");
+		return 0;
+	}
 	pacing_and_latency();
 	all_dropped_backpressure();
 	fairness_aliases_deadlines();
@@ -392,6 +410,6 @@ int main(void)
 	original_deadline_and_progress_boundaries();
 	partial_drop_pressure_retirement();
 	absolute_orphan_age_and_ready_reply_boundary();
-	puts("PASS: semantic pacing, bounded silence/majority/orphan recovery, ready-reply boundary, fresh generations, negative/late progress and IDs");
+	puts("PASS: semantic pacing, bounded silence/orphan recovery, progress-safe backlog, dispatch response interval, ready-reply boundary and IDs");
 	return 0;
 }

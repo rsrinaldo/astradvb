@@ -1,8 +1,8 @@
-# OSCam semantic policy v2
+# OSCam semantic policy v3
 
 The normal release patch is `patches/oscam-semantic-scheduler.patch`, enabled
 only on guarded Newcamd readers with `astra_ecm_scheduler = 1`. The manifest
-records policyVersion2, semanticPolicyVersion2 and both patch hashes. It uses
+records policyVersion3, semanticPolicyVersion3 and both patch hashes. It uses
 128 bounded local storage slots, not 128 simultaneous provider requests.
 
 ## Dispatch and identity
@@ -19,11 +19,15 @@ the original client times out. Sent work is never replayed after retirement.
 Only complete parsed ECM replies matching a retained SENT ID advance progress;
 positive, negative and late matched replies all count. Login/card data, cache,
 partial bytes, zero/unmatched IDs and stale-generation replies do not count.
-The soft silence deadline is the greater of the oldest original SENT deadline
-and last matched progress plus cfg.ctimeout (8s in the normal configuration).
+The soft silence deadline is the greater of the oldest SENT dispatch time
+plus cfg.ctimeout and last matched progress plus cfg.ctimeout (8s normally).
+Original caller deadlines still bound delivery of answers and expiry of queued
+work; they cannot truncate the transport's response interval after a late send.
 
-At least16 expired SENT entries plus live queued demand retire a partially
-stuck transport despite progress elsewhere. Any unanswered SENT exchange has
+Policy v3 removes the expired-majority reset: overdue caller requests and live
+queued demand are not evidence of a dead connection while replies progress.
+This also removes the unnecessary quadratic majority-deadline scan.
+Any unanswered SENT exchange has
 a hard age of4*cfg.ctimeout from dispatch (32s normally). An already-readable
 reply gets at most250ms soft grace; junk cannot postpone recovery forever,
 and hard age is never extended. One missing request with healthy replies for
@@ -46,7 +50,8 @@ closed callers and fresh-generation recovery.
 Numeric-only status/reset lines are emitted at most every5s while active or
 changed, plus reset events. They include queued/alias/sent/peak/dispatched/
 matched/coalesced/expired/rejected/reset/abandoned/close counts and oldest age.
-resetReason is0 initially,1 silence,2 expired-slot pressure,3 hard orphan age.
+resetReason is0 initially,1 silence,3 hard orphan age. Historical reason2 was
+expired-slot pressure and is no longer emitted.
 No credentials, ECM/CW payloads, request digests or remote endpoints are logged.
 
 ## Required release gates
@@ -54,7 +59,8 @@ No credentials, ECM/CW payloads, request digests or remote endpoints are logged.
 Actual Linux tests use a fake provider in a private network namespace, never
 the commercial line. Gates include85 simultaneous delayed correct keys,
 85 silent callers followed by bounded reconnect and a fresh successful epoch,
-partial loss with continuing progress, hard orphan age, matched negative/late
+an expired-majority backlog with continuing replies and no resets, permanent
+partial loss with bounded silence/orphan recovery, hard orphan age, matched negative/late
 progress, unmatched-ID noise, read stalls, parent GC and account restart budgets.
 Media tests retain exact A/V bytes, packet order, continuity and EOF tail checks.
 

@@ -14,7 +14,7 @@ test('OSCam trust requires matching installed hash, source and receive policy', 
     const hash = createHash('sha256').update(body).digest('hex');
     writeFileSync(binary, body, { mode: 0o755 });
     assert.equal(protectedOscamBuild(binary, manifest), false);
-    const data = { policyVersion: 2, semanticPolicyVersion: 2, semanticSchedulerSha256: 'a'.repeat(64), sourceRevision: OSCAM_SOURCE_REVISION, binarySha256: hash };
+    const data = { policyVersion: 3, semanticPolicyVersion: 3, semanticSchedulerSha256: 'a'.repeat(64), sourceRevision: OSCAM_SOURCE_REVISION, binarySha256: hash };
     writeFileSync(manifest, JSON.stringify(data));
     assert.equal(protectedOscamBuild(binary, manifest), true);
     writeFileSync(manifest, JSON.stringify({ ...data, experimental: true }));
@@ -34,7 +34,9 @@ test('OSCam trust requires matching installed hash, source and receive policy', 
     assert.equal(protectedOscamBuild(binary, manifest), false);
     writeFileSync(manifest, JSON.stringify({ ...data, sourceRevision: 'unverified' }));
     assert.equal(protectedOscamBuild(binary, manifest), false);
-    writeFileSync(manifest, JSON.stringify({ ...data, semanticPolicyVersion: 1 }));
+    writeFileSync(manifest, JSON.stringify({ ...data, policyVersion: 2, semanticPolicyVersion: 2 }));
+    assert.equal(protectedOscamBuild(binary, manifest), false, 'Policy-v2 recovery must be rebuilt for this release');
+    writeFileSync(manifest, JSON.stringify({ ...data, semanticPolicyVersion: 2 }));
     assert.equal(protectedOscamBuild(binary, manifest), false);
     writeFileSync(manifest, JSON.stringify({ ...data, semanticSchedulerSha256: '' }));
     assert.equal(protectedOscamBuild(binary, manifest), false);

@@ -242,7 +242,7 @@ export class CASProxyManager extends EventEmitter {
 
   async launch(generation) {
     if (this.stopping || generation !== this.generation) return;
-    if (!this.protectedBuild(this.binary)) throw new Error('Install the verified OSCam semantic-recovery policy v2 build with install-cas.sh before enabling CAS');
+    if (!this.protectedBuild(this.binary)) throw new Error('Install the verified OSCam semantic-recovery policy v3 build with install-cas.sh before enabling CAS');
     const profiles = this.profiles; const startedAt = this.now(); let ready = false; let logBuffer = '';
     this.semanticMetrics.clear();
     const child = this.spawnChild(this.binary, ['-p', '128', '--config-dir', this.runtimeDir, '--temp-dir', this.runtimeDir, '--pidfile', join(this.runtimeDir, 'oscam.pid')], { stdio: ['ignore', 'pipe', 'ignore'] });

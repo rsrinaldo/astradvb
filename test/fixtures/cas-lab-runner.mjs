@@ -102,8 +102,8 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
   if (semanticScheduler) {
     assert.ok(process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, 'Semantic dispatch requires its explicit lab manifest');
     const manifest = JSON.parse(await readFile(process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, 'utf8'));
-    assert.equal(manifest.policyVersion, 2, 'Semantic dispatch requires the policy2 reader');
-    assert.equal(manifest.semanticPolicyVersion, 2);
+    assert.equal(manifest.policyVersion, 3, 'Semantic dispatch requires the policy3 reader');
+    assert.equal(manifest.semanticPolicyVersion, 3);
     assert.notEqual(manifest.experimental, true, 'Release tests must use the normal protected reader');
     assert.match(manifest.semanticSchedulerSha256 || '', /^[a-f0-9]{64}$/, 'Semantic dispatch requires its normal patch digest');
   }
@@ -397,6 +397,54 @@ export async function runSemanticClientGC(lab) {
   } finally { for (const client of abandoned) client.close(); progress.close(); }
 }
 
+export async function runSemanticSlowBacklog(lab) {
+  const clients = [], requests = [];
+  let timer = null, submitted = 0, correct = 0;
+  const began = performance.now();
+  try {
+    for (let index = 0; index < 16; index++) {
+      const client = await lab.client(); clients.push(client);
+      const request = client.requestECM({ channelId: index + 1, epoch: 5800 });
+      request.catch(() => {}); requests.push(request);
+    }
+    await waitFor(() => lab.snapshot().provider.requests >= 16, 5000);
+    const progress = await lab.client(); clients.push(progress);
+    const submit = () => {
+      if (submitted >= 28) return;
+      const epoch = 5810 + submitted++;
+      const request = progress.requestECM({ channelId: 80, epoch }).then(reply => {
+        correctSyntheticReply(reply, 80, epoch, lab.transportMode); correct++; return reply;
+      });
+      request.catch(() => {}); requests.push(request);
+    };
+    submit(); timer = setInterval(submit, 500);
+    const backlog = [];
+    for (let index = 0; index < 40; index++) { const client = await lab.client(); clients.push(client); backlog.push(client); }
+    const due = began + 6500;
+    if (performance.now() < due) await sleep(due - performance.now());
+    for (let index = 0; index < backlog.length; index++) {
+      const request = backlog[index].requestECM({ channelId: index + 20, epoch: 5850 }).then(reply => {
+        correctSyntheticReply(reply, index + 20, 5850, lab.transportMode); return reply;
+      });
+      request.catch(() => {}); requests.push(request);
+    }
+    await waitFor(() => lab.snapshot().provider.replies >= 16 + 40 + 20, 18000);
+    clearInterval(timer); timer = null;
+    const results = await Promise.all(requests);
+    await waitFor(() => lab.snapshot().oscam.semanticScheduler.latest?.matched >= requests.length, 6000);
+    const after = semanticEvidence(lab);
+    assert.ok(results.slice(0, 16).every(reply => !reply.ok), 'Late words must not be applied beyond original caller deadlines');
+    assert.ok(correct >= 20, 'Real matched progress must continue throughout the expired-majority backlog');
+    assert.equal(after.guard.connections, 1); assert.equal(after.guard.connectionResets, 0);
+    assert.ok(after.semanticScheduler.maxQueued > 0, 'The regression requires actual queued demand');
+    assert.ok(after.provider.semantic.peakInFlight <= 32);
+    assert.equal(after.provider.semantic.duplicateRequests, 0);
+    assert.equal(after.semanticScheduler.latest.sent, 0);
+    return { scenario: 'semantic-slow-expired-majority-backlog', lateRequests: 16, backlogRequests: 40,
+      progressReplies: correct, elapsedMs: Math.round(performance.now() - began), automaticClientRetries: 0, ...after };
+  } finally { clearInterval(timer); for (const client of clients) client.close(); }
+}
+
 export async function runSemanticPartialRecovery(lab) {
   const clients = [], requests = [], began = performance.now();
   try {
@@ -416,7 +464,7 @@ export async function runSemanticPartialRecovery(lab) {
       });
       request.catch(() => {}); requests.push(request);
     }
-    await waitFor(() => { const value = lab.snapshot(); return value.guard.connections >= 2 && value.guard.readerReady; }, 18000);
+    await waitFor(() => { const value = lab.snapshot(); return value.guard.connections >= 2 && value.guard.readerReady; }, 35000);
     const retiredElapsedMs = performance.now() - began;
     const initial = await Promise.all(requests);
     assert.ok(initial.slice(0, 31).every(reply => !reply.ok), 'Permanently missing words cannot become fabricated successful replies');
@@ -429,7 +477,8 @@ export async function runSemanticPartialRecovery(lab) {
     assert.equal(after.provider.dropped, 31);
     assert.ok(initial.slice(31).filter(reply => reply.ok).length >= 5, 'Other valid replies must actually keep progressing before partial-generation retirement');
     assert.ok(after.semanticScheduler.maxQueued >= 1, 'Partial recovery must be exercised under live queued demand');
-    assert.ok(retiredElapsedMs < 18000, 'Severely degraded live capacity cannot wait for the32-second absolute fallback');
+    assert.ok(retiredElapsedMs < 35000, 'Permanent unanswered identities must still have bounded silence/orphan recovery');
+    assert.notEqual(after.semanticScheduler.latest.resetReason, 2, 'Expired majority alone cannot close a progressing transport');
     return { scenario: 'semantic-partial-capacity-recovery', missingRequests: 31, queuedFreshRequests: healthy.length,
       positiveRepliesBeforeRecovery: initial.slice(31).filter(reply => reply.ok).length,
       retiredElapsedMs: Math.round(retiredElapsedMs), freshCorrectReplies: 1, automaticClientRetries: 0, ...after };

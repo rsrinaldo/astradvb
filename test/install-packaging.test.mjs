@@ -11,11 +11,11 @@ const install = readFileSync(new URL('../install.sh', import.meta.url), 'utf8');
 const casInstall = readFileSync(new URL('../install-cas.sh', import.meta.url), 'utf8');
 const docker = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
 
-test('application and changed dashboard asset caches identify release 0.8.49', () => {
+test('application and changed dashboard asset caches identify release 0.8.50', () => {
   const packageInfo = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
-  assert.equal(packageInfo.version, '0.8.49');
-  assert.match(html, /\/styles\.css\?v=0\.8\.49/); assert.match(html, /\/app\.js\?v=0\.8\.49/);
+  assert.equal(packageInfo.version, '0.8.50');
+  assert.match(html, /\/styles\.css\?v=0\.8\.50/); assert.match(html, /\/app\.js\?v=0\.8\.50/);
 });
 
 test('installers and Docker RUN commands parse without executing installation or a container build', () => {
@@ -81,7 +81,7 @@ test('system and container installations require a verified policy-8 executable 
   assert.match(install, /protectedOscamBuild\("\/usr\/local\/bin\/oscam", "\/usr\/local\/share\/licenses\/oscam\/astra-native-oscam\.json"\)/);
   assert.match(install, /oscam_verified \|\| \{[^\n]*rollback_install 1;/);
   assert.match(docker, /oscam-newcamd-stream-io\.patch/);
-  assert.match(docker, /policyVersion:2/); assert.match(docker, /semanticPolicyVersion:2/); assert.match(docker, /protectedOscamBuild\(\)/);
+  assert.match(docker, /policyVersion:3/); assert.match(docker, /semanticPolicyVersion:3/); assert.match(docker, /protectedOscamBuild\(\)/);
 });
 
 test('policy-8 packaging runs portable safety and real scalar CSA probe gates before native publication', () => {

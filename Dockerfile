@@ -43,7 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
   && install -D -m 0644 COPYING /usr/local/share/licenses/oscam/COPYING \
   && install -m 0644 /tmp/astra-oscam-patches/oscam-newcamd-stream-io.patch /usr/local/share/licenses/oscam/ \
   && install -m 0644 /tmp/astra-oscam-patches/oscam-semantic-scheduler.patch /usr/local/share/licenses/oscam/ \
-  && node -e 'const fs=require("node:fs"),crypto=require("node:crypto");const hash=path=>crypto.createHash("sha256").update(fs.readFileSync(path)).digest("hex");fs.writeFileSync("/usr/local/share/licenses/oscam/astra-native-oscam.json",JSON.stringify({policyVersion:2,semanticPolicyVersion:2,sourceRevision:"39e78a4688b30abaab62b5c9e13672b4e34bfca0",binarySha256:hash("/usr/local/bin/oscam"),patchSha256:hash("/tmp/astra-oscam-patches/oscam-newcamd-stream-io.patch"),semanticSchedulerSha256:hash("/tmp/astra-oscam-patches/oscam-semantic-scheduler.patch"),sourceDirectory:"/usr/local/src/oscam"})+"\n",{mode:0o644});' \
+  && node -e 'const fs=require("node:fs"),crypto=require("node:crypto");const hash=path=>crypto.createHash("sha256").update(fs.readFileSync(path)).digest("hex");fs.writeFileSync("/usr/local/share/licenses/oscam/astra-native-oscam.json",JSON.stringify({policyVersion:3,semanticPolicyVersion:3,sourceRevision:"39e78a4688b30abaab62b5c9e13672b4e34bfca0",binarySha256:hash("/usr/local/bin/oscam"),patchSha256:hash("/tmp/astra-oscam-patches/oscam-newcamd-stream-io.patch"),semanticSchedulerSha256:hash("/tmp/astra-oscam-patches/oscam-semantic-scheduler.patch"),sourceDirectory:"/usr/local/src/oscam"})+"\n",{mode:0o644});' \
   && rm -rf /var/lib/apt/lists/*
 RUN groupadd --system astra && useradd --system --gid astra --groups video --home /opt/astra astra
 WORKDIR /opt/astra
