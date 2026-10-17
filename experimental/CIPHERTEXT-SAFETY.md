@@ -1,4 +1,18 @@
-# Native ciphertext safety — design baseline and policy 6
+# Native ciphertext safety — design baseline and policy 7
+
+Policy 7 adds one scoped exception to retaining undecidable media in the shared
+FIFO: unanchored encrypted subtitle/teletext continuations are discarded
+before admission. They cannot supply PES evidence, so waiting for another CW
+cannot validate them. No ciphertext is emitted, and no extra queue/copy is
+allocated. Only valid type-0x06 DVB subtitle/teletext descriptors opt in;
+unknown private PES, AC-3 audio, malformed/conflicting descriptor lists do not.
+A later PUSI or an already begun split anchor follows ordinary
+bounded validation/recovery. These discards have a separate ancillary counter.
+Marked ancillary transitions do not drive the shared A/V phase revision; primary
+A/V transitions, gaps, context and key evidence rules remain. Ancillary tails
+can be lost, and anchored missing-key holds are not removed. See the release
+verification for new tests; the policy-6/v7 evidence below is historical and
+does not verify this changed artifact.
 
 The policy-5/v7 review below is the historical safety baseline. Current normal
 policy 6 retains that contract and adds bounded READY-prefix cohort gathering

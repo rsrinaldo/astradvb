@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
-export const NATIVE_CAS_POLICY_VERSION = 6;
+export const NATIVE_CAS_POLICY_VERSION = 7;
 export const NATIVE_CAS_SOURCE_REVISION = 'f4876e84cf1866645f84b93f830af67193c85f69';
 const nativeVerification = new Map();
 
@@ -10,13 +10,13 @@ const nativeVerification = new Map();
 // native log line (which could contain CAMD credentials) into the API/history.
 export function parseCiphertextStatus(line, sampledAt = Date.now()) {
   if (typeof line !== 'string' || line.length > 16384 || !Number.isSafeInteger(sampledAt) || sampledAt < 0) return null;
-  const match = line.match(/(?:^|\s)CT \| heldBytes=(\d+) peakBytes=(\d+) dropped=(\d+) timeout=(\d+) capacity=(\d+) prefix=(\d+) recovered=(\d+) allocated=(\d+)\s*$/);
+  const match = line.match(/(?:^|\s)CT \| heldBytes=(\d+) peakBytes=(\d+) dropped=(\d+) timeout=(\d+) capacity=(\d+) prefix=(\d+) recovered=(\d+) allocated=(\d+)(?: ancillary=(\d+))?\s*$/);
   if (!match) return null;
-  const values = match.slice(1).map(Number);
+  const values = match.slice(1).map(value => value === undefined ? 0 : Number(value));
   if (!values.every(value => Number.isSafeInteger(value) && value >= 0)) return null;
-  const [heldBytes, peakBytes, dropped, timeout, capacity, prefix, recovered, allocated] = values;
-  if (allocated > 8 * 1024 * 1024 || heldBytes > allocated || peakBytes > allocated || heldBytes > peakBytes || timeout + capacity + prefix > dropped) return null;
-  return { heldBytes, peakBytes, dropped, timeout, capacity, prefix, recovered, allocated, sampledAt };
+  const [heldBytes, peakBytes, dropped, timeout, capacity, prefix, recovered, allocated, ancillary] = values;
+  if (allocated > 8 * 1024 * 1024 || heldBytes > allocated || peakBytes > allocated || heldBytes > peakBytes || timeout + capacity + prefix + ancillary > dropped) return null;
+  return { heldBytes, peakBytes, dropped, timeout, capacity, prefix, recovered, allocated, ancillary, sampledAt };
 }
 
 // A leftover patch marker does not prove which executable is running. Verify
@@ -91,7 +91,7 @@ export class SoftcamBridge {
   start() {
     if (this.child || this.cancelStart || this.retryTimer) return;
     if (!this.connection) throw new Error(`Shared CAS connection for profile ${this.stream.cam.profile} is unavailable`);
-    if (!this.protectedBuild()) throw new Error('Install the verified native CAS policy v6 build with install-cas.sh before enabling CAS');
+    if (!this.protectedBuild()) throw new Error('Install the verified native CAS policy v7 build with install-cas.sh before enabling CAS');
     this.stopped = false; this.queueStart();
   }
 

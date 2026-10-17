@@ -563,7 +563,71 @@ static void completed_anchor_probe_cache_and_fresh_evidence(void) {
     assert(oracle.scalar_calls > initial && oracle.emitted == 1 && oracle.bad == 0 && "new context/run identity cannot inherit cached rejection from old media");
     exact_owned_references(s); safe_tail(s, 2, 1);
 }
+static void unanchored_private_pes_cannot_block_av(void) {
+    struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 2000);
+    astra_ciphertext_pid(s, 3000, ASTRA_CT_PRIVATE_ANCILLARY);
+    publish(s, 0, 1, 0); publish(s, 1, 2, 0);
+    push(s, 256, 0, 1, 0, 1, 0, 1);
+    assert(oracle.emitted == 1);
+    // A sparse private PES joins on a continuation. No amount of extra ECMs
+    // supplies its missing header; it must not take ownership of the A/V FIFO.
+    push(s, 3000, 0, 0, 0, 1, 10, 2);
+    assert(s->count == 0 && "unanchored private PES must not block the channel FIFO");
+    push(s, 256, 1, 0, 0, 1, 20, 3);
+    assert(oracle.emitted == 2 && oracle.bad == 0);
+    for (unsigned int i = 1; i <= 40; i++) {
+        push(s, 3000, i, 0, i & 1, (i & 1) ? 2 : 1, 20 + i, i);
+        push(s, 256, i + 1, 0, 0, 1, 20 + i, i + 2);
+        assert(!s->count && oracle.emitted == i + 2 && oracle.bad == 0);
+    }
+    assert(s->stats.timeout_drops == 0 && s->stats.capacity_drops == 0);
+    // A complete private-PES header immediately restores that component.
+    uint8_t clear[188]; packet(clear, 3000, 9, 1, 0x77); clear[7] = 0xbd;
+    push_bytes(s, clear, 0, 1, 100);
+    assert(!s->count && oracle.emitted == 43 && oracle.bad == 0);
+    exact_owned_references(s); safe_tail(s, 101, 43);
+
+    // A real split private-PES header is evidence, not an unanchored tail.
+    // Preserve all fragments and the existing bounded late-key recovery.
+    s = start(ASTRA_CT_MAX_BYTES, 2000); astra_ciphertext_pid(s, 3000, ASTRA_CT_PRIVATE_ANCILLARY);
+    publish(s, 0, 1, 0);
+    static const uint8_t pes[19] = {0, 0, 1, 0xbd, 0, 0, 0x80, 0xc0, 10, 0x31, 0, 1, 0, 1, 0x11, 0, 1, 0, 1};
+    for (unsigned int i = 0; i < sizeof(pes); i++) {
+        packet(clear, 3000, i, i == 0, 0xff);
+        clear[3] |= 0x20; clear[4] = 182; clear[5] = 0; clear[187] = pes[i];
+        push_bytes(s, clear, 0, 2, i);
+        assert(oracle.emitted == 0 && s->stats.packets_dropped == 0);
+    }
+    publish(s, 0, 2, 100); assert(astra_ciphertext_pump(s, 100, 0));
+    assert(oracle.emitted == sizeof(pes) && oracle.bad == 0); exact(s, 101);
+
+    // Unknown private PES (including private AC-3 audio) does not opt in.
+    s = start(ASTRA_CT_MAX_BYTES, 2000); astra_ciphertext_pid(s, 3000, 0x06);
+    publish(s, 0, 1, 0); push(s, 3000, 0, 0, 0, 1, 0, 1);
+    assert(s->count == 1 && s->stats.ancillary_drops == 0);
+    assert(astra_ciphertext_finish(s, 1)); astra_ciphertext_destroy(s);
+
+    const uint8_t subtitle[] = {0x59,8,'e','n','g',0x10,0,1,0,1};
+    const uint8_t teletext[] = {0x56,5,'e','n','g',0x10,1};
+    assert(astra_ct_ancillary_descriptors(subtitle, sizeof(subtitle)));
+    assert(astra_ct_ancillary_descriptors(teletext, sizeof(teletext)));
+    for (size_t i = 0; i < sizeof(subtitle); i++) assert(!astra_ct_ancillary_descriptors(subtitle, i));
+    uint8_t descriptors[14]; memcpy(descriptors, subtitle, sizeof(subtitle));
+    descriptors[10]=0x6a; descriptors[11]=0;
+    assert(!astra_ct_ancillary_descriptors(descriptors,12));
+    descriptors[10]=0x05; assert(!astra_ct_ancillary_descriptors(descriptors,12));
+    descriptors[10]=0x7a; assert(!astra_ct_ancillary_descriptors(descriptors,12));
+    descriptors[10]=0x7f; assert(!astra_ct_ancillary_descriptors(descriptors,12));
+    descriptors[10]=0x52; descriptors[11]=1; descriptors[12]=1;
+    assert(astra_ct_ancillary_descriptors(descriptors,13));
+    assert(!astra_ct_ancillary_descriptors(descriptors,14));
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--ancillary-regression")) {
+        unanchored_private_pes_cannot_block_av();
+        puts("PASS: unanchored private PES cannot stall A/V; complete/split anchors and late-key recovery remain safe"); return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--batch-regression")) {
         ready_prefix_gathers_across_clear_and_other_keys(); unresolved_prefix_blocks_ready_tail(); gathered_wrap_stops_at_uncertain_boundary_and_drains_eof(); gathered_batch_failures_are_terminal();
         puts("PASS: bounded gathered batches preserve strict FIFO and terminal failure ownership"); return 0;
@@ -579,6 +643,7 @@ int main(int argc, char **argv) {
     expired_reply_and_ambiguity_eviction(); malformed_selected_and_clear_transition(); complete_ecm_identity(); idle_component_pid_churn();
     idle_certificate_gc_preserves_queued_ownership();
     unknown_only_candidate_eviction(); valid_unknown_candidate_eviction(); late_new_candidate_and_exact_retention_references();
+    unanchored_private_pes_cannot_block_av();
     ready_prefix_gathers_across_clear_and_other_keys(); unresolved_prefix_blocks_ready_tail(); gathered_wrap_stops_at_uncertain_boundary_and_drains_eof(); gathered_batch_failures_are_terminal(); completed_anchor_probe_cache_and_fresh_evidence();
     puts("PASS: strict ordered ciphertext safety, early-future ambiguity, PID-cycle gaps, delayed/missing keys, exact healthy continuations and bounded EOF ownership");
     return 0;

@@ -8,6 +8,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { setImmediate as immediate, setTimeout as sleep } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
+import { mpegCRC32 } from '../src/mpeg-crc.mjs';
+import { TransportStreamFramer } from '../src/mpegts.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const nativeBinary = process.env.ASTRA_TEST_TSDECRYPT;
@@ -36,6 +38,8 @@ async function streamDecode(encrypted, fragmented, slowConsumer, requireBackpres
   const child = spawn(nativeBinary, ['--const-cw', options.word || TEST_CW, '--input-buffer', String(bufferMs), '--ecm-no-log', '--no-output-filter', '--no-output-on-error', '--output-eit-pass', '--output-tdt-pass'], { stdio: ['pipe', 'pipe', 'pipe'] });
   const exited = once(child, 'close');
   const chunks = [], errors = []; let backpressureEvents = 0;
+  let firstAVResolve; const firstAV = new Promise(resolve => { firstAVResolve = resolve; });
+  const outputFramer = options.firstAVDeadlineMs ? new TransportStreamFramer() : null;
   child.stderr.on('data', bytes => errors.push(bytes));
   child.stdin.on('error', () => {});
   const watchdog = setTimeout(() => child.kill('SIGKILL'), 20000);
@@ -43,6 +47,7 @@ async function streamDecode(encrypted, fragmented, slowConsumer, requireBackpres
     if (slowConsumer) await sleep(250);
     for await (const bytes of child.stdout) {
       chunks.push(Buffer.from(bytes));
+      if (outputFramer && avPackets(outputFramer.push(bytes)).length) firstAVResolve();
       if (slowConsumer) await sleep(Math.max(1, Math.ceil(50 * bytes.length / 65536)));
     }
   })();
@@ -54,6 +59,12 @@ async function streamDecode(encrypted, fragmented, slowConsumer, requireBackpres
       const end = Math.min(encrypted.length, cursor + sizes[writes++ % sizes.length], options.inputGapAt && cursor < options.inputGapAt ? options.inputGapAt : Infinity);
       if (!child.stdin.write(encrypted.subarray(cursor, end))) { backpressureEvents++; await once(child.stdin, 'drain'); }
       cursor = end;
+      if (writes === 1 && options.firstAVDeadlineMs) {
+        let deadline;
+        try {
+          await Promise.race([firstAV, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error('Unanchored private PES blocked A/V before EOF')), options.firstAVDeadlineMs); })]);
+        } finally { clearTimeout(deadline); }
+      }
       if (fragmented && writes % 3 === 0) await immediate();
     }
     child.stdin.end();
@@ -63,6 +74,31 @@ async function streamDecode(encrypted, fragmented, slowConsumer, requireBackpres
     if (requireBackpressure) assert.ok(backpressureEvents > 0, 'Large slow-output fixture must exert producer backpressure');
     return Buffer.concat(chunks);
   } finally { clearTimeout(watchdog); if (child.exitCode === null) child.kill('SIGKILL'); }
+}
+
+function sparsePrivatePES(plain) {
+  const parts = []; let inserted = false;
+  for (let at = 0; at < plain.length; at += 188) {
+    const packet = Buffer.from(plain.subarray(at, at + 188));
+    const pid = ((packet[1] & 31) << 8) | packet[2];
+    if (pid === 4096) {
+      const payload = packet[3] & 0x20 ? 5 + packet[4] : 4;
+      const start = payload + 1 + packet[payload];
+      const length = 3 + ((packet[start + 1] & 15) << 8) + packet[start + 2];
+      const ancillary = Buffer.from([6, 0xe1, 2, 0xf0, 10, 0x59, 8, 0x65, 0x6e, 0x67, 0x10, 0, 1, 0, 1]);
+      assert.ok(packet[1] & 0x40); assert.ok(start + length + ancillary.length <= 188);
+      const section = Buffer.concat([packet.subarray(start, start + length - 4), ancillary, Buffer.alloc(4)]);
+      section[1] = (section[1] & 0xf0) | ((section.length - 3) >> 8); section[2] = (section.length - 3) & 255;
+      section.writeUInt32BE(mpegCRC32(section.subarray(0, -4)), section.length - 4);
+      packet.fill(255, start); section.copy(packet, start);
+      parts.push(packet);
+      if (!inserted) {
+        // Private-PES tail with no PUSI/header, before the first valid A/V.
+        const tail = Buffer.alloc(188, 0x77); tail.set([0x47, 1, 2, 0x10]); parts.push(tail); inserted = true;
+      }
+    } else parts.push(packet);
+  }
+  assert.ok(inserted); return Buffer.concat(parts);
 }
 
 function continuationGap(bytes) {
@@ -111,6 +147,10 @@ test('real native CSA preserves all A/V packets with fragmented stdin and slow o
     const expected = avPackets(plain);
     const expectedHash = createHash('sha256').update(expected).digest('hex');
     assert.ok(expected.length > 188 * 100);
+    const sparse = checked(encryptor, ['--with-private'], { input: sparsePrivatePES(plain) }).stdout;
+    const sparseOutput = avPackets(await streamDecode(sparse, false, false, false, { firstAVDeadlineMs: 1500 }));
+    assert.equal(sparseOutput.length, expected.length, 'Sparse private PES must not lose A/V');
+    assert.equal(createHash('sha256').update(sparseOutput).digest('hex'), expectedHash, 'Sparse private PES must preserve every ordered A/V byte');
     for (const [fragmented, slowConsumer] of [[false, false], [true, false], [true, true]]) {
       const output = await streamDecode(encrypted, fragmented, slowConsumer);
       const actual = avPackets(output);

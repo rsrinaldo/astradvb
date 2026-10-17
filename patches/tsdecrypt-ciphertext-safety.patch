@@ -59,12 +59,13 @@ index 27804cb..ed032fa 100644
  };
  
  #define MAX_FILTERS     16
-@@ -298,6 +307,18 @@ struct ts {
+@@ -298,6 +307,19 @@ struct ts {
  
  	bool				allow_encrypted_output;
  	struct astra_pes_validation pes_validation;
 +	_Atomic uint32_t ciphertext_context;
 +	uint16_t ciphertext_service, ciphertext_pmt, ciphertext_caid, ciphertext_ecm;
++	uint8_t ciphertext_ancillary[8192]; /* input-thread PMT descriptor classification */
 +	pthread_mutex_t ciphertext_words_lock;
 +	struct ciphertext_word_event ciphertext_words[64];
 +	unsigned int ciphertext_word_count;
@@ -176,7 +177,17 @@ diff --git a/tables.c b/tables.c
 index e89ba98..d552b23 100644
 --- a/tables.c
 +++ b/tables.c
-@@ -424,7 +424,10 @@ static void __process_ecm(struct ts *ts, uint16_t pid, uint8_t *ts_packet) {
+@@ -193,6 +193,9 @@ void process_pmt(struct ts *ts, uint16_t pid, uint8_t *ts_packet) {
+ 	astra_pes_update_begin(&ts->pes_validation);
++	memset(ts->ciphertext_ancillary, 0, sizeof(ts->ciphertext_ancillary));
+ 	for (i = 0; i < ts->pmt->streams_num; i++) {
+ 		struct ts_pmt_stream *stream = ts->pmt->streams[i];
+ 		astra_pes_update_pid(&ts->pes_validation, stream->pid, stream->stream_type);
++		if (stream->stream_type == 0x06 && stream->pid < 8192)
++			ts->ciphertext_ancillary[stream->pid] = astra_ct_ancillary_descriptors(stream->ES_info, stream->ES_info_size);
+ 	}
+ 	astra_pes_update_end(&ts->pes_validation);
+@@ -424,7 +427,10 @@ static void __process_ecm(struct ts *ts, uint16_t pid, uint8_t *ts_packet) {
  		return;
  	}
  
@@ -308,9 +319,9 @@ index 0887e15..b124029 100644
 +	if (!ts->ciphertext || (!force && now - ts->ciphertext_report_ms < 5000)) return;
 +	ts->ciphertext_report_ms = now;
 +	struct astra_ct_stats *s = &ts->ciphertext->stats;
-+	ts_LOGf("CT | heldBytes=%" PRIu64 " peakBytes=%" PRIu64 " dropped=%" PRIu64 " timeout=%" PRIu64 " capacity=%" PRIu64 " prefix=%" PRIu64 " recovered=%" PRIu64 " allocated=%" PRIu64 "\n",
++	ts_LOGf("CT | heldBytes=%" PRIu64 " peakBytes=%" PRIu64 " dropped=%" PRIu64 " timeout=%" PRIu64 " capacity=%" PRIu64 " prefix=%" PRIu64 " recovered=%" PRIu64 " allocated=%" PRIu64 " ancillary=%" PRIu64 "\n",
 +		s->current_held_bytes, s->peak_held_bytes, s->packets_dropped, s->timeout_drops,
-+		s->capacity_drops, s->prefix_drops, s->recovered_holds, s->allocated_bytes);
++		s->capacity_drops, s->prefix_drops, s->recovered_holds, s->allocated_bytes, s->ancillary_drops);
 +}
 +static int ciphertext_slot(struct ts *ts, const struct ciphertext_slot *slot, uint64_t now) {
 +	if (!ciphertext_ensure(ts)) return 0;
@@ -559,7 +570,7 @@ index 0887e15..b124029 100644
  		process_ecm(ts, pid, ts_packet);
  
  		detect_discontinuity(ts, ts_packet);
-@@ -442,25 +453,33 @@ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len) {
+@@ -442,25 +453,34 @@ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len) {
  			ts_packet = ts->genpat->section_header->packet_data;
  			ts->genpat_cc = (ts->genpat_cc + 1) & 0x0f;
  		}
@@ -570,6 +581,7 @@ index 0887e15..b124029 100644
 +		pthread_mutex_lock(&ts->pes_validation.lock);
 +		slot.type = ts->pes_validation.expected[pid];
 +		pthread_mutex_unlock(&ts->pes_validation.lock);
++		if (slot.type == 0x06 && ts->ciphertext_ancillary[pid]) slot.type = ASTRA_CT_PRIVATE_ANCILLARY;
  
  		if (ts->threaded) {
  			// Add to decode buffer. The decoder thread will handle it
@@ -596,7 +608,7 @@ index 0887e15..b124029 100644
  							usleep(1000);
  						list_del(ts->input_buffer, &lc);
  						free(p);
-@@ -470,21 +489,26 @@ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len) {
+@@ -470,21 +490,26 @@ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len) {
  				}
  			}
  		} else {
@@ -637,8 +649,8 @@ new file mode 100644
 index 0000000..e8fc54b
 --- /dev/null
 +++ b/astra-ciphertext-safety.h
-@@ -0,0 +1,474 @@
-+/* Normal native decoder safety (policy 6). READY-prefix SIMD cohorts preserve
+@@ -0,0 +1,506 @@
++/* Normal native decoder safety (policy 7). READY-prefix SIMD cohorts preserve
 + * original TS order and adaptive retention bounds without fixed input delay.
 + * Copyright AstraDVB contributors, GPL-2.0-only.
 + *
@@ -662,6 +674,24 @@ index 0000000..e8fc54b
 +#define ASTRA_CT_MAX_BYTES (8u * 1024u * 1024u)
 +#define ASTRA_CT_MAX_WAIT_MS 2000u
 +#define ASTRA_CT_BATCH_PACKETS 70u
++#define ASTRA_CT_PRIVATE_ANCILLARY 0x86u /* internal marker; never an on-wire stream type */
++
++/* Type 0x06 alone is NOT ancillary: AC-3 and other private audio use it.
++ * Only a complete, well-formed DVB subtitle/teletext descriptor list opts in.
++ * Audio/registration/extension or malformed metadata keeps legacy behavior. */
++static inline int astra_ct_ancillary_descriptors(const uint8_t *data, size_t size) {
++    int ancillary = 0;
++    if (!data || !size) return 0;
++    while (size) {
++        if (size < 2 || data[1] > size - 2) return 0;
++        unsigned int tag = data[0], length = data[1];
++        if (tag == 0x05 || tag == 0x6a || tag == 0x7a || tag == 0x7b || tag == 0x7c || tag == 0x7f) return 0;
++        if (tag == 0x59) { if (!length || length % 8) return 0; ancillary = 1; }
++        if (tag == 0x56) { if (!length || length % 5) return 0; ancillary = 1; }
++        data += 2 + length; size -= 2 + length;
++    }
++    return ancillary;
++}
 +
 +/* This helper is used at the ECM call site only. section_data_len includes
 + * all three bytes omitted by the pinned library's section_length comparison. */
@@ -675,7 +705,7 @@ index 0000000..e8fc54b
 +struct astra_ct_stats {
 +    uint64_t packets_in, packets_out, packets_dropped;
 +    uint64_t held_packets, recovered_holds, timeout_drops, capacity_drops;
-+    uint64_t context_drops, prefix_drops, candidate_overflows, run_overflows, ambiguous_probes;
++    uint64_t context_drops, prefix_drops, candidate_overflows, run_overflows, ambiguous_probes, ancillary_drops;
 +    uint64_t current_held_bytes, peak_held_bytes, allocated_bytes;
 +};
 +struct astra_ct_key {
@@ -696,7 +726,7 @@ index 0000000..e8fc54b
 +};
 +struct astra_ct_pid {
 +    uint16_t run;
-+    uint8_t type, seen, parity, cc;
++    uint8_t type, seen, parity, cc, ancillary;
 +    uint64_t seen_ms, word_revision, transition_revision;
 +};
 +struct astra_ct_packet {
@@ -795,9 +825,9 @@ index 0000000..e8fc54b
 +    for (unsigned int i = 0; i < ASTRA_CT_RUN_COUNT; i++) if (s->runs[i].present && !s->runs[i].confirmed) s->runs[i].failed = 3;
 +    for (unsigned int i = 0; i < ASTRA_CT_PID_COUNT; i++) {
 +        astra_ct_run_release(s, s->pids[i].run);
-+        uint8_t type = s->pids[i].type;
++        uint8_t type = s->pids[i].type, ancillary = s->pids[i].ancillary;
 +        memset(&s->pids[i], 0, sizeof(s->pids[i]));
-+        s->pids[i].run = ASTRA_CT_NONE; s->pids[i].type = type;
++        s->pids[i].run = ASTRA_CT_NONE; s->pids[i].type = type; s->pids[i].ancillary = ancillary;
 +    }
 +    s->context = context; s->phase_seen = 0; s->candidate_blocked = 0;
 +    s->word_revision[0]++; s->word_revision[1]++; s->transition_revision++;
@@ -805,11 +835,13 @@ index 0000000..e8fc54b
 +}
 +static inline void astra_ciphertext_pid(struct astra_ciphertext *s, unsigned int pid, uint8_t type) {
 +    if (pid >= ASTRA_CT_PID_COUNT) return;
++    uint8_t ancillary = type == ASTRA_CT_PRIVATE_ANCILLARY;
++    if (ancillary) type = 0x06;
 +    if (!astra_pes_stream_type(type)) type = 0;
-+    if (s->pids[pid].type == type) return;
++    if (s->pids[pid].type == type && s->pids[pid].ancillary == ancillary) return;
 +    astra_ct_run_release(s, s->pids[pid].run);
 +    memset(&s->pids[pid], 0, sizeof(s->pids[pid]));
-+    s->pids[pid].run = ASTRA_CT_NONE; s->pids[pid].type = type;
++    s->pids[pid].run = ASTRA_CT_NONE; s->pids[pid].type = type; s->pids[pid].ancillary = ancillary;
 +}
 +static inline int astra_ciphertext_word(struct astra_ciphertext *s, uint32_t context,
 +        unsigned int parity, const uint8_t word[8], uint64_t now_ms) {
@@ -1052,10 +1084,12 @@ index 0000000..e8fc54b
 +        s->stats.packets_in++; s->stats.packets_dropped++; return 1;
 +    }
 +    if (p->type && tsc > 1 && offset < 188 && !(packet[1] & 0x80)) {
-+        if (p->seen && parity != p->parity && (!s->phase_seen || s->phase != parity)) {
++        /* Sparse private PES is not an A/V phase clock. An unanchored tail
++         * must neither block the FIFO nor invalidate another PID's run. */
++        if (!p->ancillary && p->seen && parity != p->parity && (!s->phase_seen || s->phase != parity)) {
 +            s->phase_seen = 1; s->phase = parity; s->transition_revision++;
 +        }
-+        if (!s->phase_seen) { s->phase_seen = 1; s->phase = parity; }
++        if (!p->ancillary && !s->phase_seen) { s->phase_seen = 1; s->phase = parity; }
 +        unsigned int cc = packet[3] & 15;
 +        int discontinuity = ((packet[3] & 0x20) && packet[4] && (packet[5] & 0x80));
 +        /* A future half can be published while old same-parity media is
@@ -1084,6 +1118,16 @@ index 0000000..e8fc54b
 +    } else if (p->type && offset < 188 && p->seen) {
 +        /* A clear/encrypted transition must not inherit an old certificate. */
 +        astra_ct_run_release(s, p->run); p->run = ASTRA_CT_NONE; p->seen = 0;
++    }
++    /* A private-PES continuation without an anchor cannot be validated by
++     * waiting for more keys. Do not admit it to the shared ordered FIFO.
++     * Keep the bounded run owner so a later PUSI can recover normally. Once
++     * an anchor has begun, including a split prefix, ordinary bounded key
++     * validation/recovery remains unchanged. Never emit uncertain bytes. */
++    if (id != ASTRA_CT_NONE && p->ancillary && !(packet[1] & 0x40) &&
++        !s->runs[id].confirmed && !s->runs[id].anchor_count) {
++        s->stats.packets_in++; s->stats.packets_dropped++;
++        s->stats.ancillary_drops++; return 1;
 +    }
 +    struct astra_ct_packet *q = &s->queue[(s->head + s->count) % s->capacity];
 +    memcpy(q->bytes, packet, 188); q->run = id; q->run_serial = id == ASTRA_CT_NONE ? 0 : s->runs[id].serial;

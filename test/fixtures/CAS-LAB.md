@@ -75,10 +75,22 @@ with no output pauses and exactly one true semantic ECM identity. A PMT version
 or unrelated descriptor update must not force an unnecessary key refetch or
 leave the existing channel keyless.
 
-## Normal policy 6 ciphertext safety
+## Normal policy 7 ciphertext safety
+
+Policy 7 additionally refuses shared-FIFO ownership to unanchored encrypted
+continuations explicitly marked by valid subtitle/teletext descriptors. Private
+AC-3 audio, unknown private PES and malformed/conflicting descriptor lists keep
+their original behavior. Marked ancillary parity does not invalidate A/V runs.
+Immediate ancillary discards are counted separately from key timeouts; neither
+ciphertext output nor an extra buffer is allowed. New regressions check A/V
+progress without waiting two seconds, valid/split private PES, late keys and
+descriptor exclusion. The actual native media fixture inserts a subtitle PMT
+entry and real-CSA continuation before A/V, requires output within 1.5 seconds
+with stdin still open, and then checks every ordered A/V byte. An old-binary
+failure is a reproduction, not a passed release gate.
 
 The helper is embedded in `patches/tsdecrypt-ciphertext-safety.patch`, the seventh
-normal native patch in the installer/Docker policy 6 bundle. It retains the
+normal native patch in the installer/Docker policy 7 bundle. It retains the
 policy-5 safety contract while gathering immutable-key cohorts across the
 bounded READY prefix and caching unchanged waiting-anchor evidence. Exact FIFO,
 uncertainty boundaries, candidate pins, terminal failures and the existing

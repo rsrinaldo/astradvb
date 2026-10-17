@@ -46,6 +46,27 @@ node src/server.mjs
 
 Open `http://server-address:8000/` and sign in as `admin`. Read the unique initial password from `data/initial-admin-password`, then change it in **Settings → Administrator account**. All example streams are disabled.
 
+## Sparse private-PES safety (v0.8.48)
+
+Native bundle policy 7 prevents encrypted subtitle/teletext continuations
+without a PES header from holding the shared output queue for two seconds.
+Only type-0x06 components with valid DVB subtitle/teletext descriptors opt in;
+audio, unknown private data, malformed or conflicting descriptors do not.
+These uncertain ancillary packets are discarded immediately and counted as
+`decoder.ciphertext.ancillary`, separately from key-validation timeouts. A later
+PES start restores normal validation. Complete/split headers and late-key
+recovery retain the existing bounded safety behavior. Marked ancillary
+parity changes do not act as an audio/video phase clock. Healthy A/V remains
+ordered; no uncertain ciphertext is emitted. Missing ancillary tails can still
+mean lost subtitle/private data; this does not promise lossless ancillary output
+or eliminate every possible decoder timeout. The shared reader, ECM pacing,
+reconnect budgets, two-second/8-MiB envelope and SIMD batching are unchanged.
+
+Upgrade using the installation guide: the application and verified policy-7
+native binary/manifest must be installed together. A policy-6 native executable
+is deliberately rejected by the new application. See
+[v0.8.48 verification](VERIFICATION-0.8.48.md).
+
 ## Resource efficiency and correctness (v0.8.47)
 
 This release retains the v0.8.46 native decoder/policy-6 build, shared provider scheduling and all CAS budgets. It removes per-packet HLS temporary objects, coalesces unchanged metadata ranges, and writes rewritten worker metadata directly into one shared allocation. PAT-only media passes through without a transport copy. Analyzer/framer remainders own only their small tails rather than pinning a whole input allocation.
