@@ -1,0 +1,626 @@
+diff --git a/astra-key-epochs.h b/astra-key-epochs.h
+new file mode 100644
+index 0000000..5d38f4c
+--- /dev/null
++++ b/astra-key-epochs.h
+@@ -0,0 +1,134 @@
++/* AstraDVB, GPL-2.0-only. Input-ordered, bounded ownership of CSA key epochs.
++ * Contract: changed keys are announced by changed ECM content before use,
++ * and matching provider replies contain the correct words. An acknowledged
++ * unchanged full pair may be reused while no newer ECM identity exists.
++ * This cannot detect an omitted entire ECM epoch or authenticate a wrong CW.
++ */
++#ifndef ASTRA_KEY_EPOCHS_H
++#define ASTRA_KEY_EPOCHS_H
++#include <assert.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define ASTRA_EPOCH_PIDS 8192
++#define ASTRA_EPOCH_ECM_BYTES 400
++static inline int astra_epoch_ecm_equal(const uint8_t *first, unsigned int first_length, const uint8_t *second, unsigned int second_length) {
++    return first_length == second_length && (!first_length || memcmp(first, second, first_length) == 0);
++}
++struct astra_key_epoch {
++    uint64_t generation;
++    unsigned int refs;
++    uint8_t ready, conflicted, cw[16];
++    struct astra_key_epoch *next;
++};
++struct astra_key_epochs {
++    pthread_mutex_t lock;
++    struct astra_key_epoch *pool, *free, *latest, *table[2], *active[ASTRA_EPOCH_PIDS];
++    uint64_t last_bound[ASTRA_EPOCH_PIDS][2], generation;
++    uint8_t active_parity[ASTRA_EPOCH_PIDS], last_ecm[2][ASTRA_EPOCH_ECM_BYTES];
++    unsigned int last_length[2], capacity, used, peak;
++    uint16_t caid, service_id, ecm_pid;
++    uint64_t exhausted, unavailable, conflicts;
++};
++static inline void astra_epoch_unref_locked(struct astra_key_epochs *state, struct astra_key_epoch *epoch) {
++    if (!epoch) return;
++    assert(epoch->refs);
++    if (--epoch->refs == 0) { memset(epoch->cw, 0, sizeof(epoch->cw)); epoch->ready = 0; epoch->next = state->free; state->free = epoch; state->used--; }
++}
++static inline int astra_epochs_init(struct astra_key_epochs *state, unsigned int capacity) {
++    memset(state, 0, sizeof(*state));
++    if (!capacity || pthread_mutex_init(&state->lock, NULL) != 0) return 0;
++    state->pool = calloc(capacity, sizeof(*state->pool));
++    if (!state->pool) { pthread_mutex_destroy(&state->lock); return 0; }
++    state->capacity = capacity; memset(state->active_parity, 0xff, sizeof(state->active_parity));
++    for (unsigned int i = 0; i < capacity; i++) { state->pool[i].next = state->free; state->free = &state->pool[i]; }
++    return 1;
++}
++static inline void astra_epochs_reset_locked(struct astra_key_epochs *state) {
++    for (unsigned int pid = 0; pid < ASTRA_EPOCH_PIDS; pid++) { astra_epoch_unref_locked(state, state->active[pid]); state->active[pid] = NULL; }
++    for (unsigned int table = 0; table < 2; table++) { astra_epoch_unref_locked(state, state->table[table]); state->table[table] = NULL; state->last_length[table] = 0; }
++    state->latest = NULL;
++    memset(state->last_bound, 0, sizeof(state->last_bound)); memset(state->active_parity, 0xff, sizeof(state->active_parity));
++}
++static inline void astra_epochs_destroy(struct astra_key_epochs *state) {
++    /* All worker threads are joined before data_free. Outstanding input-delay
++     * records can be discarded here without touching their borrowed pointers. */
++    free(state->pool); state->pool = NULL; pthread_mutex_destroy(&state->lock);
++}
++static inline void astra_epochs_context(struct astra_key_epochs *state, uint16_t caid, uint16_t service_id, uint16_t ecm_pid) {
++    pthread_mutex_lock(&state->lock);
++    if (state->caid != caid || state->service_id != service_id || state->ecm_pid != ecm_pid) {
++        astra_epochs_reset_locked(state); state->caid = caid; state->service_id = service_id; state->ecm_pid = ecm_pid;
++    }
++    pthread_mutex_unlock(&state->lock);
++}
++static inline void astra_epoch_release(struct astra_key_epochs *state, struct astra_key_epoch *epoch) {
++    if (!epoch) return;
++    pthread_mutex_lock(&state->lock); astra_epoch_unref_locked(state, epoch); pthread_mutex_unlock(&state->lock);
++}
++/* Called at complete ECM input order, before the matching TS packet is queued.
++ * The returned reference belongs to the caller/request, including retries. */
++static inline struct astra_key_epoch *astra_epoch_observe(struct astra_key_epochs *state, uint16_t caid, uint16_t service_id, uint16_t ecm_pid, const uint8_t *ecm, unsigned int length) {
++    if (length < 3 || length > ASTRA_EPOCH_ECM_BYTES || (ecm[0] != 0x80 && ecm[0] != 0x81)) return NULL;
++    /* Table IDs are identity-cache slots only, never CSA key parity. */
++    unsigned int table = ecm[0] & 1; pthread_mutex_lock(&state->lock);
++    if (state->caid != caid || state->service_id != service_id || state->ecm_pid != ecm_pid) {
++        astra_epochs_reset_locked(state); state->caid = caid; state->service_id = service_id; state->ecm_pid = ecm_pid;
++    }
++    struct astra_key_epoch *epoch = state->table[table];
++    if (!epoch || !astra_epoch_ecm_equal(state->last_ecm[table], state->last_length[table], ecm, length)) {
++        epoch = state->free;
++        if (!epoch) { state->exhausted++; state->latest = NULL; pthread_mutex_unlock(&state->lock); return NULL; }
++        state->free = epoch->next; memset(epoch, 0, sizeof(*epoch)); epoch->generation = ++state->generation; epoch->refs = 1;
++        state->used++; if (state->used > state->peak) state->peak = state->used;
++        astra_epoch_unref_locked(state, state->table[table]); state->table[table] = epoch; state->latest = epoch;
++        memcpy(state->last_ecm[table], ecm, length); state->last_length[table] = length;
++    }
++    epoch->refs++; pthread_mutex_unlock(&state->lock); return epoch;
++}
++/* Per-PID parity history prevents a prefetched future same-parity ECM from
++ * changing packets still using the previous rotation. The returned packet ref
++ * remains pinned through decode, ring wrap, backpressure and EOF draining. */
++static inline struct astra_key_epoch *astra_epoch_packet(struct astra_key_epochs *state, uint16_t pid, unsigned int parity) {
++    if (pid >= ASTRA_EPOCH_PIDS || parity > 1) return NULL;
++    pthread_mutex_lock(&state->lock);
++    if (state->active_parity[pid] != parity) {
++        astra_epoch_unref_locked(state, state->active[pid]); state->active[pid] = NULL; state->active_parity[pid] = parity;
++    }
++    struct astra_key_epoch *epoch = state->active[pid], *latest = state->latest;
++    unsigned int bit = 1u << parity;
++    int reuse = latest && latest->generation == state->last_bound[pid][parity] &&
++        (latest->ready & bit) && !(latest->conflicted & bit);
++    if (!epoch && latest && (latest->generation > state->last_bound[pid][parity] || reuse)) {
++        epoch = state->active[pid] = latest; epoch->refs++; state->last_bound[pid][parity] = epoch->generation;
++    }
++    if (epoch) epoch->refs++; else state->unavailable++;
++    pthread_mutex_unlock(&state->lock); return epoch;
++}
++/* Preserve both independently positioned words. ECM table ID does not select
++ * CSA parity. A zero half remains unavailable, never inherited blindly. */
++static inline void astra_epoch_publish(struct astra_key_epochs *state, struct astra_key_epoch *epoch, const uint8_t pair[16]) {
++    static const uint8_t zero[8] = {0}; if (!epoch) return;
++    pthread_mutex_lock(&state->lock);
++    for (unsigned int parity = 0; parity < 2; parity++) if (memcmp(pair + parity * 8, zero, 8)) {
++        unsigned int bit = 1u << parity;
++        if (epoch->conflicted & bit) continue;
++        if ((epoch->ready & bit) && memcmp(epoch->cw + parity * 8, pair + parity * 8, 8)) {
++            /* Conflicting replies cannot mutate a schedule already pinned by
++             * older packets. Withhold this ambiguous half, not future ECMs. */
++            epoch->conflicted |= bit; epoch->ready &= ~bit; state->conflicts++; continue;
++        }
++        if (!(epoch->ready & bit)) memcpy(epoch->cw + parity * 8, pair + parity * 8, 8);
++        epoch->ready |= bit;
++    }
++    pthread_mutex_unlock(&state->lock);
++}
++static inline int astra_epoch_word(struct astra_key_epochs *state, struct astra_key_epoch *epoch, unsigned int parity, uint8_t word[8]) {
++    if (!epoch) return 0;
++    pthread_mutex_lock(&state->lock); int ready = parity < 2 && (epoch->ready & (1u << parity));
++    if (ready) memcpy(word, epoch->cw + parity * 8, 8); else state->unavailable++;
++    pthread_mutex_unlock(&state->lock); return ready;
++}
++#endif
+diff --git a/camd.c b/camd.c
+index b07c11c..1d6d8f4 100644
+--- a/camd.c
++++ b/camd.c
+@@ -109,7 +109,7 @@ void camd_set_cw(struct ts *ts, uint8_t *new_cw, int check_validity) {
+ 	csa_set_cw(c->key->csakey, new_cw, check_validity);
+ }
+ 
+-static int camd_recv_cw(struct ts *ts) {
++static int camd_recv_cw(struct ts *ts, struct camd_msg *msg) {
+ 	struct camd *c = &ts->camd;
+ 	struct timeval tv1, tv2, last_ts_keyset;
+ 	uint16_t ca_id = 0;
+@@ -155,8 +155,10 @@ static int camd_recv_cw(struct ts *ts) {
+ 	}
+ 	// At first ts_keyset is not initialized
+ 	last_ts_keyset = c->key->ts_keyset;
+-	if (valid_cw)
++	if (valid_cw) {
++		astra_epoch_publish(&ts->epochs, msg->epoch, c->key->cw);
+ 		camd_set_cw(ts, c->key->cw, 1);
++	}
+ 	/* Do not publish the first valid key before its schedules are installed. */
+ 	c->key->is_valid_cw = valid_cw;
+ 
+@@ -184,7 +186,7 @@ static int camd_send_ecm(struct ts *ts, struct camd_msg *msg) {
+ 		return ret;
+ 	}
+ 
+-	ret = camd_recv_cw(ts);
++	ret = camd_recv_cw(ts, msg);
+ 	if (ret < 1) {
+ 		time_t now = time(NULL);
+ 		ts->is_cw_error = 1;
+@@ -265,6 +267,7 @@ struct camd_msg *camd_msg_alloc(enum msg_type msg_type, uint16_t ca_id, uint16_t
+ void camd_msg_free(struct camd_msg **pmsg) {
+ 	struct camd_msg *m = *pmsg;
+ 	if (m) {
++		if (m->epoch && m->ts) astra_epoch_release(&m->ts->epochs, m->epoch);
+ 		FREE(*pmsg);
+ 	}
+ }
+diff --git a/csa.c b/csa.c
+index 0ca49f8..37415bd 100644
+--- a/csa.c
++++ b/csa.c
+@@ -57,14 +57,14 @@ inline unsigned int csa_get_batch_size(void) {
+ 	return 0;
+ }
+ 
+-static void csa_set_even_cw_unlocked(csakey_t *csakey, uint8_t *even_cw) {
++static void csa_set_even_cw_unlocked(csakey_t *csakey, const uint8_t *even_cw) {
+ 	struct csakey *key = (struct csakey *)csakey;
+ 	dvbcsa_key_set(even_cw, key->s_csakey[0]);
+ 	dvbcsa_bs_key_set(even_cw, key->bs_csakey[0]);
+ 	ffdecsa_set_even_cw(key->ff_csakey, even_cw);
+ }
+ 
+-static void csa_set_odd_cw_unlocked(csakey_t *csakey, uint8_t *odd_cw) {
++static void csa_set_odd_cw_unlocked(csakey_t *csakey, const uint8_t *odd_cw) {
+ 	struct csakey *key = (struct csakey *)csakey;
+ 	dvbcsa_key_set(odd_cw, key->s_csakey[1]);
+ 	dvbcsa_bs_key_set(odd_cw, key->bs_csakey[1]);
+@@ -133,6 +133,35 @@ inline void csa_decrypt_multiple_ff(csakey_t *csakey, uint8_t **cluster) {
+ 	pthread_mutex_unlock(&key->lock);
+ }
+ 
++void csa_decrypt_single_packet_with_cw(csakey_t *csakey, uint8_t *packet, const uint8_t cw[8]) {
++	struct csakey *key = (struct csakey *)csakey;
++	unsigned int parity = ts_packet_get_scrambled(packet) - 2;
++	pthread_mutex_lock(&key->lock);
++	if (parity == 0) csa_set_even_cw_unlocked(csakey, cw); else csa_set_odd_cw_unlocked(csakey, cw);
++	if (use_dvbcsa) {
++		unsigned int offset = ts_packet_get_payload_offset(packet);
++		ts_packet_set_not_scrambled(packet);
++		dvbcsa_decrypt(key->s_csakey[parity], packet + offset, 188 - offset);
++	}
++	if (use_ffdecsa) { uint8_t *cluster[3] = {packet, packet + 188, NULL}; ffdecsa_decrypt_packets(key->ff_csakey, cluster); }
++	pthread_mutex_unlock(&key->lock);
++}
++void csa_decrypt_multiple_even_with_cw(csakey_t *csakey, struct csa_batch *batch, const uint8_t cw[8]) {
++	struct csakey *key = (struct csakey *)csakey; pthread_mutex_lock(&key->lock);
++	csa_set_even_cw_unlocked(csakey, cw); dvbcsa_bs_decrypt(key->bs_csakey[0], (struct dvbcsa_bs_batch_s *)batch, 184);
++	pthread_mutex_unlock(&key->lock);
++}
++void csa_decrypt_multiple_odd_with_cw(csakey_t *csakey, struct csa_batch *batch, const uint8_t cw[8]) {
++	struct csakey *key = (struct csakey *)csakey; pthread_mutex_lock(&key->lock);
++	csa_set_odd_cw_unlocked(csakey, cw); dvbcsa_bs_decrypt(key->bs_csakey[1], (struct dvbcsa_bs_batch_s *)batch, 184);
++	pthread_mutex_unlock(&key->lock);
++}
++void csa_decrypt_multiple_ff_with_cw(csakey_t *csakey, uint8_t **cluster, unsigned int parity, const uint8_t cw[8]) {
++	struct csakey *key = (struct csakey *)csakey; pthread_mutex_lock(&key->lock);
++	if (parity == 0) csa_set_even_cw_unlocked(csakey, cw); else csa_set_odd_cw_unlocked(csakey, cw);
++	ffdecsa_decrypt_packets(key->ff_csakey, cluster); pthread_mutex_unlock(&key->lock);
++}
++
+ /* The following routine is taken from benchbitslice in libdvbcsa */
+ void dvbcsa_benchmark(void) {
+ 	struct timeval t0, t1;
+diff --git a/csa.h b/csa.h
+index dab657e..e0bfee3 100644
+--- a/csa.h
++++ b/csa.h
+@@ -89,6 +89,10 @@ void			csa_decrypt_multiple_even	(csakey_t *csakey, struct csa_batch *batch);
+ void			csa_decrypt_multiple_odd	(csakey_t *csakey, struct csa_batch *batch);
+ 
+ void			csa_decrypt_multiple_ff		(csakey_t *csakey, uint8_t **cluster);
++void csa_decrypt_single_packet_with_cw(csakey_t *csakey, uint8_t *packet, const uint8_t cw[8]);
++void csa_decrypt_multiple_even_with_cw(csakey_t *csakey, struct csa_batch *batch, const uint8_t cw[8]);
++void csa_decrypt_multiple_odd_with_cw(csakey_t *csakey, struct csa_batch *batch, const uint8_t cw[8]);
++void csa_decrypt_multiple_ff_with_cw(csakey_t *csakey, uint8_t **cluster, unsigned int parity, const uint8_t cw[8]);
+ 
+ void csa_benchmark(void);
+ 
+diff --git a/data.c b/data.c
+index d39e444..4afecd1 100644
+--- a/data.c
++++ b/data.c
+@@ -116,7 +116,12 @@ void data_init(struct ts *ts) {
+ 	ts->output.tos  = -1;
+ 	ts->output.v6_if_index = -1;
+ 
+-	ts->decode_buf  = cbuf_init((7 * csa_get_batch_size() * 188) * 16, "decode"); // ~658Kb
++	/* Same media packet capacity; owning epoch pointers are metadata only. */
++	unsigned int decode_packets = 7 * csa_get_batch_size() * 16;
++	if (!astra_epochs_init(&ts->epochs, MAX_PIDS + decode_packets + 2 * ECM_QUEUE_HARD_LIMIT + 4)) {
++		fprintf(stderr, "Cannot allocate bounded key epoch metadata\n"); exit(1);
++	}
++	ts->decode_buf  = cbuf_init(decode_packets * sizeof(struct decode_record), "decode");
+ 	ts->write_buf   = cbuf_init((7 * csa_get_batch_size() * 188) *  8, "write");  // ~324Kb
+ 
+ 	ts->input_buffer= list_new("input");
+@@ -129,6 +134,7 @@ void data_init(struct ts *ts) {
+ }
+ 
+ void data_free(struct ts *ts) {
++	astra_epochs_destroy(&ts->epochs);
+ 	astra_pes_destroy(&ts->pes_validation);
+ 	ts_pat_free(&ts->pat);
+ 	ts_pat_free(&ts->curpat);
+diff --git a/data.h b/data.h
+index 27804cb..6e5da81 100644
+--- a/data.h
++++ b/data.h
+@@ -20,6 +20,7 @@
+ #include <stdbool.h>
+ #include <stdatomic.h>
+ #include "astra-pes-validation.h"
++#include "astra-key-epochs.h"
+ 
+ // Prevent warnings about openssl functions. Apple may consider 'openssl'
+ // deprecated but changing perfectly working portable code just because they
+@@ -91,6 +92,7 @@ enum msg_type { EMM_MSG, ECM_MSG };
+ #include "ecm-protection.h"
+ 
+ struct camd_msg {
++	struct astra_key_epoch *epoch;
+ 	int64_t created_us;
+ 	enum msg_type	type;
+ 	uint16_t		ca_id;
+@@ -202,6 +204,12 @@ struct io {
+ struct packet_buf {
+ 	int64_t		time;
+ 	uint8_t		data[188];
++	struct astra_key_epoch *epoch;
++};
++
++struct decode_record {
++	uint8_t data[188];
++	struct astra_key_epoch *epoch;
+ };
+ 
+ #define MAX_FILTERS     16
+@@ -307,6 +315,7 @@ struct ts {
+ 
+ 	// CAMD handling
+ 	struct key			key;
++	struct astra_key_epochs epochs;
+ 	struct camd			camd;
+ 
+ 	// Config
+diff --git a/process.c b/process.c
+index 0887e15..0cae9fa 100644
+--- a/process.c
++++ b/process.c
+@@ -102,10 +102,13 @@ static void dump_ts_pack(struct ts *ts, uint16_t pid, uint8_t *ts_packet) {
+ 	else					show_ts_pack(ts, pid, "---", NULL, ts_packet);
+ }
+ 
+-static void decode_packet(struct ts *ts, uint8_t *ts_packet) {
++static void decode_packet(struct ts *ts, uint8_t *ts_packet, struct astra_key_epoch *epoch) {
+ 	int scramble_idx = ts_packet_get_scrambled(ts_packet);
+ 	if (scramble_idx > 1) {
+-		if (ts->key.is_valid_cw) {
++		uint8_t cw[8];
++		if (!ts->camd.constant_codeword) {
++			if (astra_epoch_word(&ts->epochs, epoch, scramble_idx - 2, cw)) csa_decrypt_single_packet_with_cw(ts->key.csakey, ts_packet, cw);
++		} else if (ts->key.is_valid_cw) {
+ 			csa_decrypt_single_packet(ts->key.csakey, ts_packet);
+ 		} else {
+ 			// Can't decrypt the packet just make it NULL packet
+@@ -115,6 +118,33 @@ static void decode_packet(struct ts *ts, uint8_t *ts_packet) {
+ 	}
+ }
+ 
++static void decode_even_batch(struct ts *ts, struct csa_batch *batch, uint8_t **ff, int count, const uint8_t cw[8]) {
++	if (!count) return;
++	if (use_dvbcsa) {
++		batch[count].data = NULL;
++		if (ts->camd.constant_codeword) csa_decrypt_multiple_even(ts->key.csakey, batch);
++		else csa_decrypt_multiple_even_with_cw(ts->key.csakey, batch, cw);
++	}
++	if (use_ffdecsa) {
++		ff[count * 2] = NULL;
++		if (ts->camd.constant_codeword) csa_decrypt_multiple_ff(ts->key.csakey, ff);
++		else csa_decrypt_multiple_ff_with_cw(ts->key.csakey, ff, 0, cw);
++	}
++}
++static void decode_odd_batch(struct ts *ts, struct csa_batch *batch, uint8_t **ff, int count, const uint8_t cw[8]) {
++	if (!count) return;
++	if (use_dvbcsa) {
++		batch[count].data = NULL;
++		if (ts->camd.constant_codeword) csa_decrypt_multiple_odd(ts->key.csakey, batch);
++		else csa_decrypt_multiple_odd_with_cw(ts->key.csakey, batch, cw);
++	}
++	if (use_ffdecsa) {
++		ff[count * 2] = NULL;
++		if (ts->camd.constant_codeword) csa_decrypt_multiple_ff(ts->key.csakey, ff);
++		else csa_decrypt_multiple_ff_with_cw(ts->key.csakey, ff, 1, cw);
++	}
++}
++
+ static void decode_buffer(struct ts *ts, uint8_t *data, int data_len) {
+ 	int i;
+ 	int batch_sz = csa_get_batch_size(); // Tested with 32 for libdvbcsa, 70 for FFdecsa (must be multiplied by 2)
+@@ -124,14 +154,17 @@ static void decode_buffer(struct ts *ts, uint8_t *data, int data_len) {
+ 	struct csa_batch odd_pcks [batch_sz + 1];
+ 	uint8_t *ff_even_pcks[batch_sz * 2 + 1];
+ 	uint8_t *ff_odd_pcks [batch_sz * 2 + 1];
++	struct decode_record *records = (struct decode_record *)data;
++	struct astra_key_epoch *even_epoch = NULL, *odd_epoch = NULL;
++	uint8_t even_cw[8] = {0}, odd_cw[8] = {0};
+ 
+ 	int scramble_idx_old = 0;
+ 
+ 	time_t now = time(NULL);
+ 
+ 	// Prepare batch structure
+-	for (i = 0; i < data_len / 188; i++) {
+-		uint8_t *ts_packet = data + (i * 188);
++	for (i = 0; i < data_len / (int)sizeof(*records); i++) {
++		uint8_t *ts_packet = records[i].data;
+ 
+ 		uint16_t pid = ts_packet_get_pid(ts_packet);
+ 		bool in_pidmap = pidmap_get(&ts->pidmap, pid);
+@@ -153,8 +186,17 @@ static void decode_buffer(struct ts *ts, uint8_t *data, int data_len) {
+ 			}
+ 		}
+ 		if (in_pidmap && is_scrambled) {
+-			if (ts->key.is_valid_cw) {
+-				int scramble_idx = ts_packet_get_scrambled(ts_packet);
++			int scramble_idx = ts_packet_get_scrambled(ts_packet); uint8_t cw[8];
++			int ready = ts->camd.constant_codeword ? ts->key.is_valid_cw : astra_epoch_word(&ts->epochs, records[i].epoch, scramble_idx - 2, cw);
++			if (ready) {
++				if (!ts->camd.constant_codeword && scramble_idx == 2) {
++					if (even_packets && (even_epoch != records[i].epoch || memcmp(even_cw, cw, 8))) { decode_even_batch(ts, even_pcks, ff_even_pcks, even_packets, even_cw); even_packets = 0; }
++					even_epoch = records[i].epoch; memcpy(even_cw, cw, 8);
++				}
++				if (!ts->camd.constant_codeword && scramble_idx == 3) {
++					if (odd_packets && (odd_epoch != records[i].epoch || memcmp(odd_cw, cw, 8))) { decode_odd_batch(ts, odd_pcks, ff_odd_pcks, odd_packets, odd_cw); odd_packets = 0; }
++					odd_epoch = records[i].epoch; memcpy(odd_cw, cw, 8);
++				}
+ 				if (!scramble_idx_old)
+ 					scramble_idx_old = scramble_idx;
+ 				if (use_dvbcsa) {
+@@ -193,37 +235,21 @@ static void decode_buffer(struct ts *ts, uint8_t *data, int data_len) {
+ 				}
+ 				scramble_idx_old = scramble_idx;
+ 			} else {
+-				if (ts->pid_filter)
++				/* An unavailable epoch must remain visibly scrambled so the
++				 * per-PID PES validator taints it before any continuation leaks. */
++				if (ts->pid_filter && ts->camd.constant_codeword)
+ 					ts_packet_set_pid(ts_packet, 0x1fff);
+ 			}
+ 		}
+ 	}
+ 
+ 	// Decode packets
+-	if (even_packets) {
+-		if (use_dvbcsa) {
+-			even_pcks[even_packets].data = NULL; // Last one...
+-			csa_decrypt_multiple_even(ts->key.csakey, even_pcks);
+-		}
+-		if (use_ffdecsa) {
+-			ff_even_pcks[even_packets * 2] = NULL;
+-			csa_decrypt_multiple_ff(ts->key.csakey, ff_even_pcks);
+-		}
+-	}
+-	if (odd_packets) {
+-		if (use_dvbcsa) {
+-			odd_pcks[odd_packets].data = NULL; // Last one...
+-			csa_decrypt_multiple_odd(ts->key.csakey, odd_pcks);
+-		}
+-		if (use_ffdecsa) {
+-			ff_odd_pcks[odd_packets * 2] = NULL;
+-			csa_decrypt_multiple_ff(ts->key.csakey, ff_odd_pcks);
+-		}
+-	}
++	decode_even_batch(ts, even_pcks, ff_even_pcks, even_packets, even_cw);
++	decode_odd_batch(ts, odd_pcks, ff_odd_pcks, odd_packets, odd_cw);
+ 
+ 	// Fill write buffer
+-	for (i=0; i<data_len; i += 188) {
+-		uint8_t *ts_packet = data + i;
++	for (i=0; i<data_len / (int)sizeof(*records); i++) {
++		uint8_t *ts_packet = records[i].data;
+ 
+ 		if (!ts->pid_filter) {
+ 			while (cbuf_fill(ts->write_buf, ts_packet, 188) != 0 && keep_running && !ts->write_stop)
+@@ -235,6 +261,7 @@ static void decode_buffer(struct ts *ts, uint8_t *data, int data_len) {
+ 					usleep(1000);
+ 			}
+ 		}
++		astra_epoch_release(&ts->epochs, records[i].epoch); records[i].epoch = NULL;
+ 	}
+ }
+ 
+@@ -242,7 +269,7 @@ void *decode_thread(void *_ts) {
+ 	struct ts *ts = _ts;
+ 	uint8_t *data;
+ 	int data_size;
+-	int req_size = 188 * csa_get_batch_size();
++	int req_size = sizeof(struct decode_record) * csa_get_batch_size();
+ 
+ 	set_thread_name("tsdec-decode");
+ 
+@@ -404,6 +431,27 @@ static void detect_discontinuity(struct ts *ts, uint8_t *ts_packet) {
+ 	pidmap_set_val(&ts->cc, pid, cur_cc);
+ }
+ 
++static int queue_decode_record(struct ts *ts, struct decode_record *record) {
++	for (;;) {
++		if (cbuf_fill(ts->decode_buf, (uint8_t *)record, sizeof(*record)) == 0) return 1;
++		if (!keep_running || ts->decode_stop) return 0;
++		usleep(1000);
++	}
++}
++
++void process_flush_input_buffer(struct ts *ts) {
++	/* Finite input cannot provide the later packet that normally matures this
++	 * list. Force its real tail into the existing ring before CAMD/decoder
++	 * shutdown; do not sleep the configured delay or manufacture padding. */
++	LNODE *node, *next;
++	list_for_each(ts->input_buffer, node, next) {
++		struct packet_buf *packet = node->data;
++		struct decode_record record; memcpy(record.data, packet->data, 188); record.epoch = packet->epoch;
++		if (!queue_decode_record(ts, &record)) astra_epoch_release(&ts->epochs, record.epoch);
++		list_del(ts->input_buffer, &node); free(packet);
++	}
++}
++
+ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len) {
+ 	ssize_t i;
+ 	int64_t now = get_time();
+@@ -423,6 +471,7 @@ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len) {
+ 		process_pmt(ts, pid, ts_packet);
+ 		process_sdt(ts, pid, ts_packet);
+ 		process_emm(ts, pid, ts_packet);
++		if (!ts->camd.constant_codeword) astra_epochs_context(&ts->epochs, ts->ecm_caid, ts->service_id, ts->ecm_pid);
+ 		process_ecm(ts, pid, ts_packet);
+ 
+ 		detect_discontinuity(ts, ts_packet);
+@@ -442,26 +491,30 @@ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len) {
+ 			ts_packet = ts->genpat->section_header->packet_data;
+ 			ts->genpat_cc = (ts->genpat_cc + 1) & 0x0f;
+ 		}
++		struct decode_record record; memcpy(record.data, ts_packet, 188); record.epoch = NULL;
++		int scrambled = ts_packet_get_scrambled(ts_packet);
++		if (!ts->camd.constant_codeword && scrambled > 1 && pidmap_get(&ts->pidmap, pid))
++			record.epoch = astra_epoch_packet(&ts->epochs, pid, scrambled - 2);
+ 
+ 		if (ts->threaded) {
+ 			// Add to decode buffer. The decoder thread will handle it
+ 			if (ts->input_buffer_time == 0) {
+ 				// No input buffer, move packets to decoding buffer
+-				while (cbuf_fill(ts->decode_buf, ts_packet, 188) != 0 && keep_running && !ts->decode_stop)
+-					usleep(1000);
++				if (!queue_decode_record(ts, &record)) astra_epoch_release(&ts->epochs, record.epoch);
+ 			} else {
+ 				// Handle input buffer
+ 				struct packet_buf *p = malloc(sizeof(struct packet_buf));
+ 				p->time = now + (ts->input_buffer_time * 1000); //buffer time is in ms, p->time is in us
+ 				memcpy(p->data, ts_packet, 188);
++				p->epoch = record.epoch;
+ 				list_add(ts->input_buffer, p);
+ 				// Move packets to decrypt buffer
+ 				LNODE *lc, *lctmp;
+ 				list_for_each(ts->input_buffer, lc, lctmp) {
+ 					p = lc->data;
+ 					if (p->time <= now) {
+-						while (cbuf_fill(ts->decode_buf, p->data, 188) != 0 && keep_running && !ts->decode_stop)
+-							usleep(1000);
++						struct decode_record delayed; memcpy(delayed.data, p->data, 188); delayed.epoch = p->epoch;
++						if (!queue_decode_record(ts, &delayed)) astra_epoch_release(&ts->epochs, delayed.epoch);
+ 						list_del(ts->input_buffer, &lc);
+ 						free(p);
+ 					} else {
+@@ -472,13 +525,14 @@ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len) {
+ 		} else {
+ 			int allowed_pid = pidmap_get(&ts->pidmap, pid);
+ 			if (allowed_pid) // PAT or allowed PIDs
+-				decode_packet(ts, ts_packet);
++				decode_packet(ts, ts_packet, record.epoch);
+ 			if (ts->pid_filter) {
+ 				if (allowed_pid) // PAT or allowed PIDs
+ 					output_write(ts, ts_packet, 188);
+ 			} else {
+ 				output_write(ts, ts_packet, 188);
+ 			}
++			astra_epoch_release(&ts->epochs, record.epoch);
+ 		}
+ 
+ 		ts_pack++;
+diff --git a/process.h b/process.h
+index fd4dab1..981b0b3 100644
+--- a/process.h
++++ b/process.h
+@@ -18,6 +18,7 @@
+ void *decode_thread(void *_ts);
+ void *write_thread(void *_ts);
+ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len);
++void process_flush_input_buffer(struct ts *ts);
+ void show_pid_report(struct ts *ts);
+ 
+ #endif
+diff --git a/tables.c b/tables.c
+index e89ba98..ca8e1c1 100644
+--- a/tables.c
++++ b/tables.c
+@@ -423,8 +423,13 @@ static void __process_ecm(struct ts *ts, uint16_t pid, uint8_t *ts_packet) {
+ 		ts_privsec_clear(ts->ecm);
+ 		return;
+ 	}
++	struct astra_key_epoch *epoch = astra_epoch_observe(&ts->epochs, ts->ecm_caid,
++		ts->service_id, pid, sec->section_data, sec->section_data_len);
+ 
+-	int duplicate = ts_privsec_is_same(ts->ecm, ts->last_ecm);
++	/* section_length excludes its three-byte header. Comparing that many
++	 * bytes from section_data accidentally omitted the last three ECM bytes. */
++	int duplicate = astra_epoch_ecm_equal(sec->section_data, sec->section_data_len,
++		ts->last_ecm->section_header->section_data, ts->last_ecm->section_header->section_data_len);
+ 	if (duplicate && !ts->is_cw_error)
+ 		ts->ecm_duplicate_count++;
+ 	if (!ts->ecm_change_time.tv_sec && !ts->ecm_change_time.tv_usec) // The first time
+@@ -447,7 +452,9 @@ static void __process_ecm(struct ts *ts, uint16_t pid, uint8_t *ts_packet) {
+ 		}
+ 		gettimeofday(&ts->ecm_change_time, NULL);
+ 		ts->is_cw_error = 0;
+-		camd_process_packet(ts, camd_msg_alloc(ECM_MSG, ts->ecm_caid, ts->service_id, sec->section_data, sec->section_data_len));
++		struct camd_msg *msg = camd_msg_alloc(ECM_MSG, ts->ecm_caid, ts->service_id, sec->section_data, sec->section_data_len);
++		if (msg) { msg->epoch = epoch; epoch = NULL; }
++		camd_process_packet(ts, msg);
+ 	} else if (ts->debug_level >= 3) {
+ 		ts_LOGf("ECM | SID 0x%04x CAID: 0x%04x PID 0x%04x Table: 0x%02x Length: %4d Data: -dup-\n",
+ 			ts->service_id,
+@@ -456,6 +463,7 @@ static void __process_ecm(struct ts *ts, uint16_t pid, uint8_t *ts_packet) {
+ 			sec->table_id,
+ 			sec->section_data_len);
+ 	}
++	astra_epoch_release(&ts->epochs, epoch);
+ 	ts_privsec_copy(ts->ecm, ts->last_ecm);
+ 	ts_privsec_clear(ts->ecm);
+ 
+diff --git a/tsdecrypt.c b/tsdecrypt.c
+index 5db0cde..3393831 100644
+--- a/tsdecrypt.c
++++ b/tsdecrypt.c
+@@ -1109,6 +1109,7 @@ int main(int argc, char **argv) {
+ 		}
+ 	} while (have_data && keep_running);
+ EXIT:
++	process_flush_input_buffer(&ts);
+ 	camd_stop(&ts);
+ 
+ 	// If pthread_join failes make sure we exit...

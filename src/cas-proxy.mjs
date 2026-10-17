@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
@@ -8,14 +8,57 @@ import { decryptSecret } from './secrets.mjs';
 import { parseNewcamdLine } from './softcam.mjs';
 import { ProviderGuard, providerGuardOptions } from './provider-guard.mjs';
 import { protectedOscamBuild } from './oscam-integrity.mjs';
+import { openProviderBudgetStore } from './provider-budget.mjs';
 
 const LOCAL_HOST = '127.0.0.1';
 const FIRST_LOCAL_PORT = 23000;
+const SEMANTIC_FIELDS = ['generation', 'queued', 'aliases', 'sent', 'peak', 'dispatched', 'matched', 'coalesced', 'expired', 'rejected', 'resets', 'abandoned', 'closes', 'oldestMs', 'resetReason'];
+
+export function parseSemanticStatus(line) {
+  if (typeof line !== 'string' || line.length > 16384) return null;
+  const marker = line.match(/astra semantic (status|reset): (.*)$/); if (!marker) return null;
+  const tokens = marker[2].trim().split(/\s+/), fields = ['port', ...SEMANTIC_FIELDS];
+  if (tokens.length !== fields.length) return null;
+  const value = {};
+  for (let i = 0; i < fields.length; i++) {
+    const match = tokens[i].match(new RegExp(`^${fields[i]}=(\\d+)$`));
+    if (!match || !Number.isSafeInteger(Number(match[1]))) return null;
+    value[fields[i]] = Number(match[1]);
+  }
+  if (value.port < 1 || value.port > 65535 || value.resetReason > 3) return null;
+  return value;
+}
 
 function safeCaid(value) {
   const caid = String(value || '').replace(/^0x/i, '').toUpperCase();
   if (!/^[0-9A-F]{4}$/.test(caid)) throw new Error('A four-digit hexadecimal CAID is required for a shared Newcamd profile');
   return caid;
+}
+
+// These opaque identities are local-only. A password rotation must not create
+// a fresh connection budget for the same provider account. DNS aliases are not
+// guessed equivalent: identity uses the configured canonical hostname/port.
+export function groupCasProfiles(profiles) {
+  const groups = []; const accounts = new Map(); const profileIds = new Set();
+  const secret = process.env.ASTRA_SECRET_KEY;
+  if (profiles.length && !secret) throw new Error('ASTRA_SECRET_KEY is required for CAS credentials');
+  for (const profile of profiles) {
+    if (profileIds.has(profile.id)) throw new Error('CAS profile IDs must be unique');
+    profileIds.add(profile.id);
+    const upstream = parseNewcamdLine(decryptSecret(profile.lineEncrypted));
+    const caid = safeCaid(profile.caid);
+    const host = upstream.host.toLowerCase().replace(/\.$/, '');
+    const accountId = createHmac('sha256', secret).update(JSON.stringify([host, upstream.port, upstream.username])).digest('hex');
+    const existing = accounts.get(accountId);
+    if (existing) {
+      if (existing.caid !== caid || existing.upstream.password !== upstream.password || existing.upstream.desKey !== upstream.desKey) throw new Error('Profiles sharing a Newcamd account must use the same CAID and credentials; use one shared profile or correct the conflicting profile');
+      existing.aliasIds.push(profile.id);
+    } else {
+      const group = { profile, accountId, caid, upstream, aliasIds: [profile.id] };
+      groups.push(group); accounts.set(accountId, group);
+    }
+  }
+  return groups;
 }
 
 export function buildOscamConfiguration(profiles, { firstPort = FIRST_LOCAL_PORT, random = randomBytes, guardedPorts = new Map() } = {}) {
@@ -50,6 +93,7 @@ export function buildOscamConfiguration(profiles, { firstPort = FIRST_LOCAL_PORT
       'inactivitytimeout = -1',
       'connectoninit = 1',
       'audisabled = 1',
+      ...(guardedPorts.has(profile.id) ? ['astra_ecm_scheduler = 1'] : []),
     ].join('\n'));
     accounts.push([
       '[account]',
@@ -108,7 +152,7 @@ function canConnect(port) {
 async function waitForPorts(ports, child, timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error(`Shared CAS proxy exited with code ${child.exitCode}`);
+    if (child.exitCode !== null || child.signalCode) throw new Error('Shared CAS proxy exited before becoming ready');
     if ((await Promise.all(ports.map(canConnect))).every(Boolean)) return;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
@@ -122,38 +166,62 @@ export class CASProxyManager extends EventEmitter {
     this.binary = options.binary || process.env.ASTRA_OSCAM || '/usr/local/bin/oscam';
     const configPath = resolve(process.env.ASTRA_CONFIG || './data/config.json');
     this.runtimeDir = options.runtimeDir || join(dirname(configPath), 'cas-proxy');
+    this.budgetDirectory = options.budgetDirectory || `${this.runtimeDir}-budgets`;
+    this.budgetStoreFactory = options.budgetStoreFactory || openProviderBudgetStore;
+    this.budgetStore = null;
     this.child = null;
     this.connections = new Map();
     this.signature = null;
     this.stopping = false;
     this.guards = new Map();
     this.guardedPorts = new Map();
+    this.semanticMetrics = new Map();
     this.metrics = { found: 0, rejected: 0, timeout: 0, maxResponseMs: 0 }; this.logBuffer = '';
     this.spawnChild = options.spawnChild || spawn; this.waitForPorts = options.waitForPorts || waitForPorts;
     this.protectedBuild = options.protectedBuild || protectedOscamBuild;
     this.guardFactory = options.guardFactory || ((options) => new ProviderGuard(options));
     this.setTimer = options.setTimer || setTimeout; this.clearTimer = options.clearTimer || clearTimeout; this.now = options.now || Date.now;
     this.recoveryTimer = null; this.recovering = false; this.recoveryAttempt = 0; this.generation = 0; this.ready = false;
+    this.lifecycleQueue = Promise.resolve(); this.lifecycleEpoch = 0; this.cancelLaunch = null;
   }
 
-  async start(profiles) {
+  start(profiles) {
+    const epoch = this.lifecycleEpoch;
+    const work = this.lifecycleQueue.catch(() => {}).then(() => epoch === this.lifecycleEpoch ? this.#start(profiles, epoch) : this.connections);
+    this.lifecycleQueue = work; return work;
+  }
+
+  async #start(profiles, epoch) {
     const signature = JSON.stringify(profiles.map(({ id, lineEncrypted, caid }) => ({ id, lineEncrypted, caid })).sort((a, b) => a.id.localeCompare(b.id)));
     if (signature === this.signature && this.child && this.child.exitCode === null && !this.child.killed) return this.connections;
     if (signature === this.signature && (this.recoveryTimer || this.recovering)) return this.connections;
-    if (!profiles.length) { await this.stop(); this.signature = signature; return this.connections; }
-    await this.stop();
+    if (!profiles.length) { await this.#stop(); if (epoch === this.lifecycleEpoch) this.signature = signature; return this.connections; }
+    // Validate/group before stopping a working proxy. Conflicting aliases must
+    // not open competing provider sessions or replace a healthy configuration.
+    const groups = groupCasProfiles(profiles);
+    const uniqueProfiles = groups.map(group => group.profile);
+    await this.#stop();
+    if (epoch !== this.lifecycleEpoch) return this.connections;
     const guardedPorts = new Map();
     try {
-      for (const profile of profiles) {
-        const upstream = parseNewcamdLine(decryptSecret(profile.lineEncrypted));
-        const guard = this.guardFactory({ ...upstream, ...providerGuardOptions(), onReset: reason => this.logger.warn('cas', `Provider connection reset for profile ${profile.name || profile.id}: ${reason}`) });
+      this.budgetStore = await this.budgetStoreFactory({ directory: this.budgetDirectory, onWarning: () => this.logger.warn('cas', 'Provider retry-budget storage unavailable; upstream connection attempts remain protected') });
+      if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
+      for (const { profile, upstream, accountId } of groups) {
+        const budget = await this.budgetStore.account(accountId);
+        if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
+        const guard = this.guardFactory({ ...upstream, ...providerGuardOptions(), budget, onReset: reason => this.logger.warn('cas', `Provider connection reset for profile ${profile.name || profile.id}: ${reason}`) });
         this.guards.set(profile.id, guard); guardedPorts.set(profile.id, await guard.start());
+        if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
       }
-      const generated = buildOscamConfiguration(profiles, { guardedPorts });
-      for (const [id, connection] of generated.connections) Object.defineProperties(connection, {
-        scheduleDecoderStart: { value: start => this.guards.get(id).scheduleDecoderStart(start) },
-        isAvailable: { value: () => this.ready },
-      });
+      const generated = buildOscamConfiguration(uniqueProfiles, { guardedPorts });
+      for (const group of groups) {
+        const id = group.profile.id; const connection = generated.connections.get(id);
+        Object.defineProperties(connection, {
+          scheduleDecoderStart: { value: start => this.guards.get(id).scheduleDecoderStart(start) },
+          isAvailable: { value: () => this.ready },
+        });
+        for (const alias of group.aliasIds) generated.connections.set(alias, connection);
+      }
       await rm(this.runtimeDir, { recursive: true, force: true });
       await mkdir(this.runtimeDir, { recursive: true, mode: 0o700 });
       await Promise.all([
@@ -161,23 +229,27 @@ export class CASProxyManager extends EventEmitter {
         writeFile(join(this.runtimeDir, 'oscam.server'), generated.server, { mode: 0o600 }),
         writeFile(join(this.runtimeDir, 'oscam.user'), generated.user, { mode: 0o600 }),
       ]);
+      if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
       this.stopping = false;
       this.metrics = { found: 0, rejected: 0, timeout: 0, maxResponseMs: 0 };
-      this.connections = generated.connections; this.guardedPorts = guardedPorts; this.signature = signature; this.generated = generated; this.profiles = profiles; this.recoveryAttempt = 0;
+      this.connections = generated.connections; this.guardedPorts = guardedPorts; this.signature = signature; this.generated = generated; this.profiles = uniqueProfiles; this.recoveryAttempt = 0;
       await this.launch(this.generation);
-    } catch (error) { await this.stop(); throw error; }
-    this.logger.info('cas', `Shared CAS proxy active: ${profiles.length} profile${profiles.length === 1 ? '' : 's'}, one upstream connection per profile`);
+      if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
+    } catch (error) { await this.#stop(); throw error; }
+    this.logger.info('cas', `Shared CAS proxy active: ${profiles.length} profile${profiles.length === 1 ? '' : 's'}, ${groups.length} shared upstream account${groups.length === 1 ? '' : 's'}`);
     return this.connections;
   }
 
   async launch(generation) {
     if (this.stopping || generation !== this.generation) return;
-    if (!this.protectedBuild(this.binary)) throw new Error('Install the verified OSCam stream-I/O policy v1 build with install-cas.sh before enabling CAS');
+    if (!this.protectedBuild(this.binary)) throw new Error('Install the verified OSCam semantic-recovery policy v2 build with install-cas.sh before enabling CAS');
     const profiles = this.profiles; const startedAt = this.now(); let ready = false; let logBuffer = '';
-    const child = this.spawnChild(this.binary, ['--config-dir', this.runtimeDir, '--temp-dir', this.runtimeDir, '--pidfile', join(this.runtimeDir, 'oscam.pid')], { stdio: ['ignore', 'pipe', 'ignore'] });
+    this.semanticMetrics.clear();
+    const child = this.spawnChild(this.binary, ['-p', '128', '--config-dir', this.runtimeDir, '--temp-dir', this.runtimeDir, '--pidfile', join(this.runtimeDir, 'oscam.pid')], { stdio: ['ignore', 'pipe', 'ignore'] });
     this.child = child;
     let rejectStartup;
     const failedStartup = new Promise((_, reject) => { rejectStartup = reject; });
+    let cancel; const canceled = new Promise(resolve => { cancel = resolve; }); this.cancelLaunch = cancel;
     const failed = (reason) => {
       if (this.child !== child || this.stopping || generation !== this.generation) return;
       this.child = null; this.setAvailable(false);
@@ -189,13 +261,18 @@ export class CASProxyManager extends EventEmitter {
       }
     };
     child.stdout.on('data', (chunk) => {
-      if (this.child !== child) return;
+      if (this.child !== child || this.stopping || generation !== this.generation) return;
       // Bound the unfinished line, not the whole read. Truncating a large
       // stdout chunk before splitting discarded valid reader-ready markers
       // (and ECM metrics) when many startup lines arrived together.
       const lines = String(chunk).split(/\r?\n/);
       lines[0] = logBuffer + lines[0]; logBuffer = lines.pop().slice(-16384);
       for (const line of lines) {
+        const semantic = parseSemanticStatus(line);
+        if (semantic) {
+          const { port, ...values } = semantic;
+          for (const [id, guardedPort] of this.guardedPorts) if (guardedPort === port) this.semanticMetrics.set(id, { ...values, sampledAt: this.now() });
+        }
         // OSCam emits this only after LOGIN_ACK and a validated CARD_DATA
         // response. Listening ports alone do not mean an upstream reader is
         // authenticated. Do not retain or publish the raw line (it has IDs).
@@ -224,14 +301,14 @@ export class CASProxyManager extends EventEmitter {
     child.once('error', () => failed('Shared CAS proxy could not start'));
     child.once('exit', (code, signal) => failed(`Shared CAS proxy stopped unexpectedly (${signal || code})`));
     try {
-      await Promise.race([this.waitForPorts(this.generated.ports, child), failedStartup]);
+      await Promise.race([this.waitForPorts(this.generated.ports, child), failedStartup, canceled]);
       if (this.stopping || generation !== this.generation || this.child !== child) return;
       ready = true; this.setAvailable(true);
     } catch (error) {
       this.retireChild(child);
       if (this.child === child) this.child = null;
       throw error;
-    }
+    } finally { if (this.cancelLaunch === cancel) this.cancelLaunch = null; }
   }
 
   setAvailable(available) {
@@ -266,16 +343,30 @@ export class CASProxyManager extends EventEmitter {
     this.recoveryTimer?.unref?.();
   }
 
-  async stop() {
+  stop() {
+    // Fence pending/queued starts synchronously, before their next await can
+    // publish a new reader or reopen the persistent budget after shutdown.
+    this.lifecycleEpoch++; this.stopping = true; this.setAvailable(false); this.cancelLaunch?.();
+    if (this.recoveryTimer) this.clearTimer(this.recoveryTimer);
+    this.recoveryTimer = null;
+    const work = this.lifecycleQueue.catch(() => {}).then(() => this.#stop());
+    this.lifecycleQueue = work; return work;
+  }
+
+  async #stop() {
     const child = this.child;
     this.stopping = true; this.generation++; this.setAvailable(false);
+    this.cancelLaunch?.();
     if (this.recoveryTimer) this.clearTimer(this.recoveryTimer);
     this.recoveryTimer = null; this.recovering = false;
     this.child = null;
     this.connections = new Map();
     this.guardedPorts = new Map();
+    this.semanticMetrics.clear();
     this.signature = null;
     await Promise.all([...this.guards.values()].map(guard => guard.stop())); this.guards.clear();
+    const budgetStore = this.budgetStore; this.budgetStore = null;
+    await budgetStore?.close();
     if (!child || child.exitCode !== null) return;
     child.kill('SIGTERM');
     let timeout;
@@ -285,5 +376,5 @@ export class CASProxyManager extends EventEmitter {
     ]); } finally { clearTimeout(timeout); }
     if (child.exitCode === null) child.kill('SIGKILL');
   }
-  guardMetrics() { return [...this.guards].map(([profile, guard]) => ({ profile, ...guard.snapshot() })); }
+  guardMetrics() { return [...this.guards].map(([profile, guard]) => ({ profile, ...guard.snapshot(), ...(this.semanticMetrics.has(profile) ? { semantic: { ...this.semanticMetrics.get(profile) } } : {}) })); }
 }

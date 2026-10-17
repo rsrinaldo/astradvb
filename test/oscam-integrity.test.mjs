@@ -14,9 +14,16 @@ test('OSCam trust requires matching installed hash, source and receive policy', 
     const hash = createHash('sha256').update(body).digest('hex');
     writeFileSync(binary, body, { mode: 0o755 });
     assert.equal(protectedOscamBuild(binary, manifest), false);
-    const data = { policyVersion: 1, sourceRevision: OSCAM_SOURCE_REVISION, binarySha256: hash };
+    const data = { policyVersion: 2, semanticPolicyVersion: 2, semanticSchedulerSha256: 'a'.repeat(64), sourceRevision: OSCAM_SOURCE_REVISION, binarySha256: hash };
     writeFileSync(manifest, JSON.stringify(data));
     assert.equal(protectedOscamBuild(binary, manifest), true);
+    writeFileSync(manifest, JSON.stringify({ ...data, experimental: true }));
+    assert.equal(protectedOscamBuild(binary, manifest), false, 'Production must reject experimental reader binaries');
+    assert.equal(protectedOscamBuild(binary, manifest, { allowExperimental: true }), true, 'Only explicit isolated-lab checks may opt in');
+    assert.equal(protectedOscamBuild(binary, manifest), false, 'Lab verification must not authorize production through its cache');
+    writeFileSync(manifest, JSON.stringify({ ...data, experimental: 'true' }));
+    assert.equal(protectedOscamBuild(binary, manifest, { allowExperimental: true }), false);
+    writeFileSync(manifest, JSON.stringify(data));
     chmodSync(binary, 0o644);
     assert.equal(protectedOscamBuild(binary, manifest), false);
     chmodSync(binary, 0o755);
@@ -26,6 +33,10 @@ test('OSCam trust requires matching installed hash, source and receive policy', 
     writeFileSync(manifest, JSON.stringify({ ...data, policyVersion: 0 }));
     assert.equal(protectedOscamBuild(binary, manifest), false);
     writeFileSync(manifest, JSON.stringify({ ...data, sourceRevision: 'unverified' }));
+    assert.equal(protectedOscamBuild(binary, manifest), false);
+    writeFileSync(manifest, JSON.stringify({ ...data, semanticPolicyVersion: 1 }));
+    assert.equal(protectedOscamBuild(binary, manifest), false);
+    writeFileSync(manifest, JSON.stringify({ ...data, semanticSchedulerSha256: '' }));
     assert.equal(protectedOscamBuild(binary, manifest), false);
     writeFileSync(manifest, 'not JSON');
     assert.equal(protectedOscamBuild(binary, manifest), false);

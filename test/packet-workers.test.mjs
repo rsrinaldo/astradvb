@@ -129,3 +129,23 @@ test('real packet workers collect UTF-8 broadcast EPG ahead of CAS even with no 
   assert.equal(handle.analyzer.snapshot().packets, 0); assert.equal(handle.inputAnalyzer.snapshot().packets, 1);
   assert.equal(handle.epg.snapshot(730)[0].title, 'Shqipëri Ç'); assert.ok(handle.epg.lastReceivedAt);
 });
+
+test('real worker PID freshness keeps PSI/audio-only output scrambled until the matching DVB media returns', async t => {
+  const pool = new PacketPool(new RingLogger(), { count: 1 });
+  const dvb = { run(_adapter, _service, { signal, onReady }) { onReady(); return new Promise(resolve => signal.addEventListener('abort', resolve, { once: true })); } };
+  const stream = new StreamWorker({ id: 'pid-freshness', name: 'PID freshness', enabled: true, inputs: [{ url: 'dvb://tuner?service=1' }], outputs: [], hls: false, cam: { enabled: true, profile: 'fixture' } }, { ...settings, inputTimeoutMs: 30000 }, new RingLogger(), [{ id: 'fixture', lineEncrypted: 'configured' }], [{ id: 'tuner', enabled: true }], dvb, new Map(), pool);
+  t.after(async () => { stream.stop(); await pool.stop(); });
+  stream.start(); let stops = 0;
+  const bridge = { status: 'descrambling', write() {}, stop() { stops++; } }; stream.cam = bridge; stream.casMode = 'descrambling';
+  const transport = (pid, scrambling = 0) => { const data = Buffer.alloc(188, 0xff); data.set([0x47, (pid >> 8) & 0x1f, pid & 255, 0x10 | scrambling]); return data; };
+  stream.push(transport(256, 0x80));
+  stream.dataPlane.push('output', Buffer.concat([transport(0), transport(257)])); await stream.dataPlane.flush();
+  const input = stream.inputAnalyzer.snapshot().pids.find(pid => pid.pid === 256);
+  assert.ok(input.lastScrambledPayloadAt > 0); assert.equal(input.lastClearPayloadAt, 0);
+  assert.equal(stream.snapshot().state, 'scrambled'); assert.equal(stream.snapshot().cas.status, 'waiting-for-keys');
+  assert.deepEqual(stream.snapshot().cas.payloadEvidence, { scope: 'dvb-service', missingPids: [256] });
+  stream.dataPlane.push('output', transport(256)); await stream.dataPlane.flush();
+  assert.ok(stream.analyzer.snapshot().pids.find(pid => pid.pid === 256).lastClearPayloadAt > 0);
+  assert.equal(stream.snapshot().state, 'running'); assert.equal(stream.snapshot().cas.status, 'descrambling');
+  assert.equal(stream.cam, bridge); assert.equal(stops, 0, 'A presentation update cannot restart the CAS process');
+});

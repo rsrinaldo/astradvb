@@ -58,6 +58,27 @@ test('transport errors and malformed adaptation fields are counted separately in
   assert.equal(result.pids.find(value => value.pid === 256).teiPackets, 1);
 });
 
+test('per-PID payload freshness distinguishes encrypted input from clear output without trusting bad TS', t => {
+  let at = 1000; t.mock.method(Date, 'now', () => at);
+  const analyzer = new MPEGTSAnalyzer();
+  const encrypted = packet(256, 0); encrypted[3] |= 0x80;
+  analyzer.push(encrypted);
+  let pid = analyzer.snapshot().pids.find(value => value.pid === 256);
+  assert.equal(pid.lastScrambledPayloadAt, 1000); assert.equal(pid.lastClearPayloadAt, 0);
+  at = 2000; analyzer.push(packet(256, 1));
+  pid = analyzer.snapshot().pids.find(value => value.pid === 256);
+  assert.equal(pid.lastScrambledPayloadAt, 1000); assert.equal(pid.lastClearPayloadAt, 2000);
+  const tei = packet(256, 2); tei[1] |= 0x80; tei[3] |= 0xc0;
+  const malformed = packet(256, 3); malformed[3] = 0x33; malformed[4] = 183;
+  const adaptationOnly = packet(256, 4); adaptationOnly[3] = 0xa4; adaptationOnly[4] = 183;
+  const reservedScrambling = packet(256, 5); reservedScrambling[3] |= 0x40;
+  at = 3000; analyzer.push(Buffer.concat([tei, malformed, adaptationOnly, reservedScrambling, packet(0x1fff, 0)]));
+  pid = analyzer.snapshot().pids.find(value => value.pid === 256);
+  assert.equal(pid.lastScrambledPayloadAt, 1000); assert.equal(pid.lastClearPayloadAt, 2000);
+  assert.equal(analyzer.snapshot().pids.find(value => value.pid === 0x1fff).lastClearPayloadAt, 0);
+  analyzer.reset(); assert.deepEqual(analyzer.snapshot().pids, []);
+});
+
 test('aligns data to whole 188-byte packets', () => {
   const data = Buffer.concat([Buffer.from([1, 2, 3]), packet(100, 0), packet(100, 1), Buffer.from([4])]);
   const aligned = alignTransportStream(data);

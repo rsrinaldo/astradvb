@@ -8,7 +8,7 @@ fi
 
 revision="f4876e84cf1866645f84b93f830af67193c85f69"
 installer_dir="$(cd "$(dirname "$0")" && pwd)"
-patch_names=(tsdecrypt-emm-pid.patch tsdecrypt-ecm-protection.patch tsdecrypt-stream-io.patch tsdecrypt-cw-threadsafe.patch tsdecrypt-pes-validation.patch)
+patch_names=(tsdecrypt-emm-pid.patch tsdecrypt-ecm-protection.patch tsdecrypt-stream-io.patch tsdecrypt-cw-threadsafe.patch tsdecrypt-pes-validation.patch tsdecrypt-newcamd-lifetime.patch tsdecrypt-ciphertext-safety.patch)
 patch_digests=()
 for patch_name in "${patch_names[@]}"; do
   [[ -f "$installer_dir/patches/$patch_name" ]] || { echo "Missing native patch: $patch_name" >&2; exit 1; }
@@ -19,6 +19,9 @@ oscam_revision="39e78a4688b30abaab62b5c9e13672b4e34bfca0"
 oscam_patch="$installer_dir/patches/oscam-newcamd-stream-io.patch"
 [[ -f "$oscam_patch" ]] || { echo "Missing OSCam stream I/O patch." >&2; exit 1; }
 oscam_patch_digest="$(sha256sum "$oscam_patch" | cut -d ' ' -f 1)"
+oscam_scheduler_patch="$installer_dir/patches/oscam-semantic-scheduler.patch"
+[[ -f "$oscam_scheduler_patch" ]] || { echo "Missing OSCam semantic recovery patch." >&2; exit 1; }
+oscam_scheduler_digest="$(sha256sum "$oscam_scheduler_patch" | cut -d ' ' -f 1)"
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates git libdvbcsa-dev libssl-dev pkg-config
 install -d -o root -g root -m 0755 /usr/local/src
@@ -35,10 +38,12 @@ for patch_name in "${patch_names[@]}"; do
   git -C "$source_dir" apply --check "$installer_dir/patches/$patch_name"
   git -C "$source_dir" apply "$installer_dir/patches/$patch_name"
 done
-for fixture in native-ecm-policy native-cas-io native-pes-validation; do
+for fixture in native-ecm-policy native-cas-io native-pes-validation native-ciphertext-safety; do
   cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pthread -I "$source_dir" "$installer_dir/test/$fixture.c" -o "$source_dir/$fixture-test"
   "$source_dir/$fixture-test"
 done
+cc -std=c11 -Wall -Wextra -Werror -O2 -I "$source_dir" "$installer_dir/test/native-ciphertext-probe.c" "$source_dir/astra-ciphertext-probe.c" -ldvbcsa -o "$source_dir/native-ciphertext-probe-test"
+"$source_dir/native-ciphertext-probe-test"
 cc -O2 -Wall -Wextra -Werror -I "$source_dir/libfuncs" "$installer_dir/test/native-cas-ring.c" "$source_dir/libfuncs/cbuf.c" -pthread -o "$source_dir/native-cas-ring-test"
 "$source_dir/native-cas-ring-test"
 make -C "$source_dir" clean all
@@ -46,13 +51,17 @@ cc -O2 -DUSE_LIBDVBCSA=1 '-DDLIB="native-cas-test"' -ffunction-sections -fdata-s
 "$source_dir/native-csa-concurrency-test"
 cc -O2 -DUSE_FFDECSA=1 '-DDLIB="native-cas-test"' -ffunction-sections -fdata-sections -I "$source_dir" "$installer_dir/test/native-csa-concurrency.c" "$source_dir/csa.c" "$source_dir/FFdecsa/FFdecsa.o" "$source_dir/libtsfuncs/libtsfuncs.a" "$source_dir/libfuncs/libfuncs.a" -Wl,--gc-sections -ldvbcsa -lpthread -lcrypto -o "$source_dir/native-ffdecsa-concurrency-test"
 "$source_dir/native-ffdecsa-concurrency-test"
-oscam_source_dir="$(mktemp -d "/usr/local/src/oscam-astra-${oscam_revision:0:12}-${oscam_patch_digest:0:12}-XXXXXX")"
+oscam_source_dir="$(mktemp -d "/usr/local/src/oscam-astra-${oscam_revision:0:12}-${oscam_scheduler_digest:0:12}-XXXXXX")"
 git clone --no-checkout https://git.streamboard.tv/common/oscam.git "$oscam_source_dir"
 git -C "$oscam_source_dir" checkout --detach "$oscam_revision"
 git -C "$oscam_source_dir" apply --check "$oscam_patch"
 git -C "$oscam_source_dir" apply "$oscam_patch"
+git -C "$oscam_source_dir" apply --check "$oscam_scheduler_patch"
+git -C "$oscam_source_dir" apply "$oscam_scheduler_patch"
 cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pthread -I "$oscam_source_dir" "$installer_dir/test/native-oscam-io.c" -o "$oscam_source_dir/native-oscam-io-test"
 "$oscam_source_dir/native-oscam-io-test"
+cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pthread -I "$oscam_source_dir" "$installer_dir/test/native-oscam-scheduler.c" -o "$oscam_source_dir/native-oscam-scheduler-test"
+"$oscam_source_dir/native-oscam-scheduler-test"
 (
   cd "$oscam_source_dir"
   ./config.sh --disable all --enable MODULE_NEWCAMD READER_NAGRA READER_NAGRA_MERLIN READER_IRDETO READER_CONAX READER_CRYPTOWORKS READER_SECA READER_VIACCESS READER_VIDEOGUARD READER_DRE READER_TONGFANG READER_BULCRYPT READER_GRIFFIN READER_DGCRYPT
@@ -80,8 +89,8 @@ install -o root -g root -m 0644 "$installer_dir/patches/tsdecrypt-emm-pid.patch"
 install -o root -g root -m 0644 "$installer_dir/patches/tsdecrypt-ecm-protection.patch" "$tsdecrypt_license_stage/astra-ecm-protection.patch"
 manifest_stage="$tsdecrypt_license_stage/astra-native-cas.json"
 binary_digest="$(sha256sum "$binary_stage" | cut -d ' ' -f 1)"
-printf '{"policyVersion":3,"sourceRevision":"%s","binarySha256":"%s","patchSetSha256":"%s","sourceDirectory":"%s","buildTarget":"ffdecsa","patches":{"ecm":"%s","streamIO":"%s","controlWords":"%s","pesValidation":"%s"}}\n' \
-  "$revision" "$binary_digest" "$patch_set_digest" "$source_dir" "${patch_digests[1]}" "${patch_digests[2]}" "${patch_digests[3]}" "${patch_digests[4]}" > "$manifest_stage"
+printf '{"policyVersion":5,"sourceRevision":"%s","binarySha256":"%s","patchSetSha256":"%s","sourceDirectory":"%s","buildTarget":"ffdecsa","patches":{"ecm":"%s","streamIO":"%s","controlWords":"%s","pesValidation":"%s","newcamdLifetime":"%s","ciphertextSafety":"%s"}}\n' \
+  "$revision" "$binary_digest" "$patch_set_digest" "$source_dir" "${patch_digests[1]}" "${patch_digests[2]}" "${patch_digests[3]}" "${patch_digests[4]}" "${patch_digests[5]}" "${patch_digests[6]}" > "$manifest_stage"
 chmod 0644 "$manifest_stage"
 
 
@@ -89,9 +98,10 @@ oscam_stage="$(mktemp /usr/local/bin/.oscam-astra-XXXXXX)"
 install -o root -g root -m 0755 "$oscam_source_dir/Distribution/oscam" "$oscam_stage"
 install -o root -g root -m 0644 "$oscam_source_dir/COPYING" "$oscam_license_stage/COPYING"
 install -o root -g root -m 0644 "$oscam_patch" "$oscam_license_stage/oscam-newcamd-stream-io.patch"
+install -o root -g root -m 0644 "$oscam_scheduler_patch" "$oscam_license_stage/oscam-semantic-scheduler.patch"
 oscam_binary_digest="$(sha256sum "$oscam_stage" | cut -d ' ' -f 1)"
-printf '{"policyVersion":1,"sourceRevision":"%s","binarySha256":"%s","patchSha256":"%s","sourceDirectory":"%s"}\n' \
-  "$oscam_revision" "$oscam_binary_digest" "$oscam_patch_digest" "$oscam_source_dir" > "$oscam_license_stage/astra-native-oscam.json"
+printf '{"policyVersion":2,"semanticPolicyVersion":2,"sourceRevision":"%s","binarySha256":"%s","patchSha256":"%s","semanticSchedulerSha256":"%s","sourceDirectory":"%s"}\n' \
+  "$oscam_revision" "$oscam_binary_digest" "$oscam_patch_digest" "$oscam_scheduler_digest" "$oscam_source_dir" > "$oscam_license_stage/astra-native-oscam.json"
 chmod 0644 "$oscam_license_stage/astra-native-oscam.json"
 
 # Both builds and all checks completed before either executable is published.
@@ -150,5 +160,5 @@ done
 mv "$tsdecrypt_license_stage" /usr/local/share/licenses/tsdecrypt
 mv "$oscam_license_stage" /usr/local/share/licenses/oscam
 trap - ERR INT TERM
-echo "Native CAS policy 3 installed. Corresponding source: $source_dir and $oscam_source_dir"
+echo "Native CAS policy 5 installed. Corresponding source: $source_dir and $oscam_source_dir"
 echo "Previous native binaries retained in $rollback_dir"

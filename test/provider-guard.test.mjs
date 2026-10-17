@@ -130,7 +130,12 @@ async function fakeTransport(t, options = {}) {
   };
   const socket = () => {
     const peer = new EventEmitter();
-    Object.assign(peer, { writableLength: 0, destroyed: false, writes: [], setTimeout() {}, write(data) { this.writes.push(Buffer.from(data)); return true; }, destroy() { if (!this.destroyed) { this.destroyed = true; this.emit('close'); } } });
+    Object.assign(peer, { writableLength: 0, destroyed: false, writes: [], paused: false, buffered: [], setTimeout() {}, write(data) { this.writes.push(Buffer.from(data)); return true; },
+      pause() { this.paused = true; return this; },
+      resume() { this.paused = false; for (const data of this.buffered.splice(0)) this.emit('data', data); return this; },
+      destroy() { if (!this.destroyed) { this.destroyed = true; this.buffered = []; this.emit('close'); } } });
+    const emit = peer.emit.bind(peer);
+    peer.emit = (event, ...args) => { if (event === 'data' && peer.paused) { peer.buffered.push(Buffer.from(args[0])); return true; } return emit(event, ...args); };
     return peer;
   };
   const guard = new ProviderGuard({ host: 'provider.test', port: 15000, now: () => time, setTimer, clearTimer,
@@ -210,8 +215,10 @@ test('partial frames expire and late events cannot reset or write to a replaceme
 test('an unconnected upstream expires queued frames and only one local session can wait', async t => {
   const s = await fakeTransport(t, { maxQueueMs: 100, createConnection() { const peer = new EventEmitter(); Object.assign(peer, { writableLength: 0, setTimeout() {}, destroy() {}, write() { throw new Error('must not write before connect'); } }); return peer; } });
   const local = s.accept(); local.emit('data', frame(1)); s.advance(0);
-  const duplicate = s.accept(); assert.equal(duplicate.destroyed, true); assert.equal(s.guard.snapshot().blockedConnections, 1);
+  const duplicate = s.accept(); assert.equal(duplicate.destroyed, false); assert.equal(s.guard.snapshot().waitingLocalHandoff, true);
+  const extra = s.accept(); assert.equal(extra.destroyed, true); assert.equal(s.guard.snapshot().blockedConnections, 1);
   s.advance(101); assert.equal(local.destroyed, true); assert.equal(s.guard.snapshot().expiredConnections, 1);
+  assert.equal(duplicate.destroyed, false); assert.equal(s.guard.snapshot().waitingLocalHandoff, false);
 });
 
 test('stopping cancels delayed reconnect and pending writes without contacting the provider', async t => {
@@ -429,4 +436,168 @@ test('retired partial-reply timers and stopped connection callbacks cannot affec
   const oldConnectTimer = [...s.scheduled.values()].find(timer => timer.at === 3200).fn;
   await s.guard.stop(); oldConnectTimer(); s.advance(100000);
   assert.equal(waiting.destroyed, true); assert.equal(s.guard.snapshot().connections, 2); assert.equal(s.scheduled.size, 0);
+});
+
+const microtasks = async () => { for (let index = 0; index < 12; index++) await Promise.resolve(); };
+function mockBudget(overrides = {}) {
+  let failures = 0, leases = 0, releases = 0, healthy = 0;
+  return { delayMs: () => 0, frameDelayMs: () => 0, takeFrame: () => true,
+    async reserveConnection() { leases++; let released = false; return { allowed: true, lease: { release() { if (!released) { released = true; releases++; } } } }; },
+    async recordFailure() { failures++; }, async recordHealthy() { failures = 0; healthy++; },
+    snapshot: () => ({ failureCount: failures, leases, releases, healthy }), ...overrides };
+}
+
+test('persistent admission must resolve successfully before a real provider connection is created', async t => {
+  let resolve, entered = 0; const pending = new Promise(done => { resolve = done; });
+  const budget = mockBudget({ reserveConnection() { entered++; return pending; } });
+  const s = await fakeTransport(t, { budget }); const local = s.accept(); s.advance(0); await microtasks();
+  assert.equal(entered, 1); assert.equal(s.connections.length, 0);
+  resolve({ allowed: true, lease: { release() {} } }); await microtasks(); s.advance(0);
+  assert.deepEqual(s.connections, [0]); assert.equal(local.destroyed, false);
+});
+
+test('denied or failed durable admission never connects and retries after a bounded storage delay', async t => {
+  let calls = 0;
+  const budget = mockBudget({ async reserveConnection() { calls++; if (calls === 1) return { allowed: false, retryAfterMs: 5000 }; if (calls === 2) throw new Error('PRIVATE storage details'); return { allowed: true, lease: { release() {} } }; } });
+  const s = await fakeTransport(t, { budget }); s.accept(); s.advance(0); await microtasks();
+  assert.equal(s.connections.length, 0); s.advance(4999); assert.equal(calls, 1);
+  s.advance(5000); await microtasks(); assert.equal(calls, 2); assert.equal(s.connections.length, 0);
+  s.advance(10000); await microtasks(); s.advance(10000); assert.equal(s.connections.length, 1);
+  assert.equal(JSON.stringify(s.guard.snapshot()).includes('PRIVATE'), false);
+});
+
+test('canceled and stopped in-flight reservations release their leases without opening provider sockets', async t => {
+  const completions = []; let released = 0;
+  const budget = mockBudget({ reserveConnection() { return new Promise(resolve => completions.push(resolve)); } });
+  const s = await fakeTransport(t, { budget }); const old = s.accept(); s.advance(0); await microtasks(); old.destroy();
+  const current = s.accept(); s.advance(0); await microtasks();
+  let stopped = false; const stop = s.guard.stop().then(() => { stopped = true; });
+  await microtasks(); assert.equal(stopped, false); assert.equal(current.destroyed, true);
+  for (const done of completions) done({ allowed: true, lease: { release() { released++; } } });
+  await stop; s.advance(100000); assert.equal(released, 2); assert.equal(s.connections.length, 0); assert.equal(s.scheduled.size, 0);
+});
+
+test('a live persistent lease releases exactly once and failures/health persist without negative-key cooldowns', async t => {
+  const budget = mockBudget(); const s = await fakeTransport(t, { budget });
+  const first = s.accept(); s.advance(0); await microtasks(); s.advance(0); first.destroy();
+  assert.equal(budget.snapshot().releases, 1); assert.equal(budget.snapshot().failureCount, 1);
+  const local = s.accept(); s.advance(1000); await microtasks(); s.advance(1000); s.authenticate(local);
+  for (let i = 0; i < 100; i++) s.guard.result(false); assert.equal(budget.snapshot().failureCount, 1);
+  for (const at of [1100, 16100, 31100]) { s.advance(at); s.upstreams.at(-1).emit('data', frame(9)); s.guard.result(true); }
+  assert.equal(budget.snapshot().healthy, 1); assert.equal(budget.snapshot().failureCount, 0);
+  assert.equal(local.destroyed, false); assert.equal(s.guard.snapshot().retryAfterMs, 0);
+  await s.guard.stop(); assert.equal(budget.snapshot().releases, 2);
+});
+
+test('shared account frame deadlines survive guard replacement and cannot catch up after a stall', async t => {
+  let now = 0, due = 0; const times = [];
+  const budget = mockBudget({ frameDelayMs: () => Math.max(0, due - now), takeFrame(interval) { if (now < due) return false; times.push(now); due = now + interval; return true; } });
+  const a = await fakeTransport(t, { budget }); const first = a.accept(); a.advance(0); await microtasks(); a.advance(0);
+  first.emit('data', frame(1)); a.advance(0); assert.deepEqual(times, [0]); await a.guard.stop();
+  const b = await fakeTransport(t, { budget }); const second = b.accept(); b.advance(0); await microtasks(); b.advance(0);
+  second.emit('data', Buffer.concat([frame(2), frame(3)])); b.advance(49); assert.equal(b.writes.length, 0);
+  now = 50; b.advance(50); assert.equal(b.writes.length, 1); now = 1000; b.stall(950); b.advance(1000);
+  assert.deepEqual(times, [0, 50, 1000]); assert.equal(b.writes.length, 2);
+});
+
+test('replacement accepted before old close waits without upstream work and inherits ordinary pacing/backoff', async t => {
+  const s = await fakeTransport(t, { maxQueueMs: 2000 });
+  const old = s.accept(); old.emit('data', frame(1)); s.advance(0);
+  const replacement = s.accept(); replacement.emit('data', frame(2));
+  assert.equal(replacement.paused, true); assert.equal(replacement.listenerCount('data'), 0);
+  assert.equal(s.guard.snapshot().waitingLocalHandoff, true);
+  assert.equal(s.guard.snapshot().localHandoffsWaited, 1);
+  s.advance(50); assert.deepEqual(s.connections, [0]); assert.equal(s.writes.length, 1);
+  assert.equal(old.destroyed, false, 'a contender must never evict a healthy current session');
+  old.emit('end'); // FIN is enough; the delayed close must not lose replacement.
+  assert.equal(old.destroyed, true); assert.equal(replacement.paused, false);
+  assert.equal(s.guard.snapshot().waitingLocalHandoff, false);
+  assert.equal(s.guard.snapshot().localHandoffsPromoted, 1);
+  assert.equal(s.guard.snapshot().connectionResets, 1);
+  old.emit('close'); s.upstreams[0].emit('error', new Error('retired'));
+  assert.equal(s.guard.snapshot().connectionResets, 1);
+  s.advance(1049); assert.equal(s.connections.length, 1);
+  s.advance(1050); assert.deepEqual(s.connections, [0, 1050]);
+  assert.deepEqual(s.writes.map(item => [item.at, ...item.data]), [[0, ...frame(1)], [1050, ...frame(2)]]);
+  assert.equal(s.guard.snapshot().blockedConnections, 0);
+});
+
+test('waiting handoff cannot reserve a durable account lease before old disposal', async t => {
+  const budget = mockBudget(); const s = await fakeTransport(t, { budget, maxQueueMs: 2000 });
+  const old = s.accept(); s.advance(0); await microtasks(); s.advance(0);
+  assert.equal(budget.snapshot().leases, 1);
+  const waiting = s.accept(); waiting.emit('data', frame(8)); await microtasks();
+  assert.equal(budget.snapshot().leases, 1); assert.equal(budget.snapshot().releases, 0);
+  assert.equal(s.connections.length, 1); assert.equal(s.guard.snapshot().queuedFrames, 0);
+  old.destroy(); assert.equal(budget.snapshot().releases, 1);
+  s.advance(999); await microtasks(); assert.equal(budget.snapshot().leases, 1);
+  s.advance(1000); await microtasks(); s.advance(1000);
+  assert.equal(budget.snapshot().leases, 2); assert.equal(budget.snapshot().releases, 1);
+  assert.deepEqual(s.connections, [0, 1000]);
+  assert.deepEqual(s.writes.map(value => value.data), [frame(8)]);
+  await s.guard.stop(); assert.equal(budget.snapshot().releases, 2);
+});
+
+test('one waiting contender is bounded to 1000ms and extras never replace the healthy old session', async t => {
+  const s = await fakeTransport(t); const old = s.accept(); s.advance(0);
+  const waiting = s.accept(); const expiredCallback = [...s.scheduled.values()].find(timer => timer.at === 1000).fn;
+  const extra = s.accept(); assert.equal(extra.destroyed, true);
+  assert.equal(s.guard.snapshot().blockedConnections, 1);
+  s.advance(999); assert.equal(waiting.destroyed, false); assert.equal(old.destroyed, false);
+  s.advance(1000); assert.equal(waiting.destroyed, true); assert.equal(old.destroyed, false);
+  assert.equal(s.guard.snapshot().localHandoffsExpired, 1); assert.equal(s.connections.length, 1);
+  for (const event of ['close', 'end']) assert.equal(waiting.listenerCount(event), 0);
+  assert.equal(waiting.listenerCount('error'), 1, 'only the stateless terminal-error sink remains');
+  waiting.emit('error', new Error('late expired socket error')); extra.emit('error', new Error('late rejected socket error'));
+  assert.equal(s.guard.snapshot().connectionResets, 0);
+  const fresh = s.accept(); old.destroy(); expiredCallback();
+  assert.equal(fresh.destroyed, false, 'a retired waiter timer cannot cancel its promoted successor');
+  s.advance(2000); assert.deepEqual(s.connections, [0, 2000]);
+});
+
+test('overdue waiting peer cannot promote even if event-loop delay lets old close run before its expiry callback', async t => {
+  const s = await fakeTransport(t); const old = s.accept(); s.advance(0);
+  const waiting = s.accept(); s.stall(1500); old.destroy();
+  assert.equal(waiting.destroyed, true); assert.equal(s.guard.snapshot().waitingLocalHandoff, false);
+  assert.equal(s.guard.snapshot().localHandoffsExpired, 1);
+  assert.equal(s.guard.snapshot().localHandoffsPromoted, 0);
+  s.advance(1500); assert.deepEqual(s.connections, [0]);
+});
+
+test('waiting peer close, FIN and error remove its timer/listeners and cannot cancel a later handoff', async t => {
+  const s = await fakeTransport(t); const old = s.accept(); s.advance(0);
+  let staleCancel;
+  for (const event of ['close', 'end', 'error']) {
+    const waiting = s.accept();
+    if (staleCancel) staleCancel();
+    assert.equal(waiting.destroyed, false);
+    staleCancel = waiting.listeners('close')[0];
+    waiting.emit(event, ...(event === 'error' ? [new Error('private error')] : []));
+    assert.equal(waiting.destroyed, true); assert.equal(s.guard.snapshot().waitingLocalHandoff, false);
+    for (const name of ['close', 'end', 'data']) assert.equal(waiting.listenerCount(name), 0);
+    assert.equal(waiting.listenerCount('error'), 1);
+    waiting.emit('error', new Error('late canceled socket error'));
+  }
+  assert.equal(old.destroyed, false); assert.equal(s.connections.length, 1);
+  assert.equal(s.guard.snapshot().localHandoffsPromoted, 0);
+  assert.equal(JSON.stringify(s.guard.snapshot()).includes('private error'), false);
+});
+
+test('pause and stop cancel a waiting handoff without a provider attempt or surviving timer', async t => {
+  const s = await fakeTransport(t); const old = s.accept(); s.advance(0);
+  const waiting = s.accept(); const lateTimer = [...s.scheduled.values()].find(timer => timer.at === 1000).fn;
+  s.guard.paused = true; old.destroy();
+  assert.equal(waiting.destroyed, true); assert.equal(s.guard.snapshot().waitingLocalHandoff, false);
+  assert.equal(s.guard.snapshot().localHandoffsPromoted, 0); assert.equal(s.connections.length, 1);
+  await s.guard.stop(); lateTimer(); s.advance(100000);
+  assert.equal(s.scheduled.size, 0); assert.equal(s.connections.length, 1);
+  for (const event of ['close', 'end', 'data']) assert.equal(waiting.listenerCount(event), 0);
+  assert.equal(waiting.listenerCount('error'), 1);
+  waiting.emit('error', new Error('late paused socket error'));
+  const stopped = await fakeTransport(t); stopped.accept(); stopped.advance(0);
+  const contender = stopped.accept(); await stopped.guard.stop(); stopped.advance(100000);
+  assert.equal(contender.destroyed, true); assert.equal(stopped.scheduled.size, 0);
+  assert.equal(stopped.connections.length, 1);
+  contender.emit('error', new Error('late stopped socket error'));
+  assert.equal(stopped.guard.snapshot().connectionResets, 0);
 });

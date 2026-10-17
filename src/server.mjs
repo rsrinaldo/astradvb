@@ -16,10 +16,13 @@ import { discoverDVBDevices, inspectDVBFrontend, mergeDVBAdapters } from './dvb.
 import { DVBProbeBroker } from './dvb-probe-broker.mjs';
 import { annotateDVBServices, existingDVBStreams } from './dvb-services.mjs';
 import { SystemResources } from './system-resources.mjs';
+import { NetworkStats } from './network-stats.mjs';
 import { DiagnosticSnapshot, mediaDiagnostics } from './diagnostics.mjs';
 import { HTTPDelivery } from './http-delivery.mjs';
 import { createMediaTCPAdapter } from './media-tcp.mjs';
 import { startMediaPolicy } from './media-policy.mjs';
+import { waitForShutdown } from './shutdown.mjs';
+import { CASRequestHistory } from './cas-history.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const packageInfo = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
@@ -43,6 +46,10 @@ const epgPublisher = new DailyEPGPublisher({ path: join(dirname(store.path), 'ep
 await epgPublisher.load();
 const resources = new SystemResources();
 await resources.sample();
+const network = new NetworkStats();
+await network.sample();
+// Sample outside media/CAS processing. Status requests only read the cache.
+const networkSampling = setInterval(() => { void network.sample(); }, 2000); networkSampling.unref();
 const startedAt = Date.now();
 const sessions = new RelaySessions();
 const sseClients = new Set();
@@ -123,6 +130,7 @@ function status() {
     casProxy: { ...manager.casProxy.metrics, providerGuards: manager.casProxy.guardMetrics?.() || [] },
     memory: process.memoryUsage(),
     resources: resources.value,
+    network: network.value,
     processing: manager.packetPool.status(),
     httpDelivery: deliverySnapshot(),
     epg: { ...manager.epgStatus(), publication: epgPublisher.status },
@@ -359,13 +367,29 @@ httpDelivery.configureServer(server);
 const heartbeat = setInterval(async () => { sessions.prune(); await resources.sample(); broadcast('status', status()); }, 2000);
 const epgMaintenance = setInterval(() => manager.maintainEPG(), 60000); epgMaintenance.unref();
 const epgPublication = setInterval(() => { void epgPublisher.tick(); }, 60000); epgPublication.unref();
-const diagnostics = new DiagnosticSnapshot(join(dirname(store.path), 'diagnostics.json'), () => mediaDiagnostics(manager, packageInfo.version), { onError: () => logger.warn('diagnostics', 'Local media diagnostics unavailable; streaming is unaffected') });
+const casHistoryPath = join(dirname(store.path), 'cas-request-history.json');
+const casHistory = new CASRequestHistory(); await casHistory.load(casHistoryPath);
+const casHistoryFile = new DiagnosticSnapshot(casHistoryPath, () => casHistory.snapshot(), { intervalMs: 60000, onError: () => logger.warn('diagnostics', 'Private CAS request history unavailable; streaming is unaffected') });
+const diagnostics = new DiagnosticSnapshot(join(dirname(store.path), 'diagnostics.json'), () => {
+  const snapshot = mediaDiagnostics(manager, packageInfo.version);
+  snapshot.network = network.value; snapshot.resources = resources.value;
+  if (casHistory.record(snapshot)) void casHistoryFile.tick(); return snapshot;
+}, { onError: () => logger.warn('diagnostics', 'Local media diagnostics unavailable; streaming is unaffected') });
 void diagnostics.tick();
 server.listen(store.value.server.port, store.value.server.host, () => logger.info('system', `Listening on ${store.value.server.host}:${store.value.server.port}`));
 
-function shutdown() {
-  clearInterval(heartbeat); clearInterval(epgMaintenance); clearInterval(epgPublication); void mediaPolicy.close(); httpDelivery.close(); tcpAdapter.close(); void diagnostics.stop(); void probeBroker.stop(); epgPublisher.stop(); manager.stop(); for (const client of sseClients) client.end();
-  server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 5000).unref();
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(heartbeat); clearInterval(epgMaintenance); clearInterval(epgPublication); clearInterval(networkSampling);
+  httpDelivery.close(); tcpAdapter.close(); epgPublisher.stop();
+  for (const client of sseClients) client.end();
+  const clean = await waitForShutdown([
+    () => mediaPolicy.close(), () => diagnostics.stop().then(async () => { await casHistoryFile.tick(); await casHistoryFile.stop(); }), () => probeBroker.stop(), () => manager.stop(),
+    () => new Promise(resolve => server.close(resolve)),
+  ]);
+  process.exit(clean ? 0 : 1);
 }
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
 

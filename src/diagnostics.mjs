@@ -9,6 +9,13 @@ const metrics = value => {
   return result;
 };
 
+const traffic = value => {
+  const result = {};
+  for (const key of ['inputBitrateKbps', 'outputBitrateKbps', 'bitrateWindowMs']) if (value[key] === null || Number.isFinite(value[key])) result[key] = value[key];
+  if (['dvb-service', 'source-transport'].includes(value.inputBitrateScope)) result.inputBitrateScope = value.inputBitrateScope;
+  return result;
+};
+
 // Privileged local observation only. Never serialize stream configuration,
 // input URLs, native argv, authentication sessions, ECM payloads or keys.
 export function mediaDiagnostics(manager, version) {
@@ -18,14 +25,16 @@ export function mediaDiagnostics(manager, version) {
     signalMonitor: manager.signalMonitor?.snapshot() || null,
     httpDelivery: manager.httpDelivery?.snapshot() || null,
     casProxy: { ...manager.casProxy.metrics, providerGuards: manager.casProxy.guardMetrics() },
-    streams: [...manager.workers.values()].map(worker => ({
+    streams: [...manager.workers.values()].map(worker => {
+      const snapshot = worker.snapshot();
+      return {
       id: worker.config.id, name: worker.config.name, enabled: worker.config.enabled,
-      state: worker.snapshot().state, casMode: worker.casMode,
+      state: snapshot.state, casMode: worker.casMode, traffic: traffic(snapshot),
       input: metrics(worker.inputAnalyzer.snapshot()), output: metrics(worker.analyzer.snapshot()),
       epg: { events: worker.epg?.events?.size || 0, updatedAt: worker.epg?.updatedAt || 0, lastReceivedAt: worker.epg?.lastReceivedAt || 0 },
       processing: worker.dataPlane?.status() || null,
       decoder: worker.cam ? { status: worker.cam.status, pid: worker.cam.child?.pid || null, pendingBytes: worker.cam.pendingBytes, inputQueueBytes: worker.cam.child?.stdin.writableLength || 0, ...worker.cam.diagnostics } : null,
-    })),
+    }; }),
   };
 }
 

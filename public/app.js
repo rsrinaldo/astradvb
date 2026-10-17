@@ -41,7 +41,8 @@ function render() {
   const epg = status.epg;
   const publication = epg?.publication;
   $('#epg-freshness').textContent = publication?.publishedAt ? `Daily EPG · ${number(publication.channelsWithEPG)}/${number(publication.channels)} channels with programmes · published ${new Date(publication.publishedAt).toLocaleString()} · ${publication.status === 'retrying' ? 'keeping the previous guide; retrying' : 'next publication'} ${new Date(publication.nextRefreshAt).toLocaleString()} · refresh your receiving system once daily (24 hours)` : 'Collecting the initial EPG guide (up to 5 minutes) · XML/JSON will then publish once daily (24 hours)';
-  const bitrate = state.streams.reduce((sum, stream) => sum + (stream.bitrateKbps || 0), 0);
+  const outputRates = state.streams.map(stream => stream.outputBitrateKbps).filter(Number.isFinite);
+  const bitrate = outputRates.reduce((sum, rate) => sum + rate, 0);
   const running = state.streams.filter((stream) => stream.state === 'running').length;
   const scrambled = state.streams.filter((stream) => stream.state === 'scrambled').length;
   const cards = groupAdapterCards();
@@ -49,12 +50,14 @@ function render() {
   const ram = status.resources?.memory;
   $('#metrics').innerHTML = [
     ['●', 'Running streams', `${running}/${state.streams.length}`, `${scrambled} scrambled · ${status.streams?.warning || 0} need attention`],
-    ['⌁', 'Aggregate bitrate', `${(bitrate / 1000).toFixed(1)} Mb/s`, 'Measured MPEG-TS payload'],
+    ['⌁', 'Stream output', outputRates.length ? `${(bitrate / 1000).toFixed(1)} Mb/s` : '—', 'Emitted transport, before client fan-out'],
+    ['↓', 'Host network IN (RX)', networkRate(status.network, 'rxMbps'), networkDetail(status.network, 'rxBytes')],
+    ['↑', 'Host network OUT (TX)', networkRate(status.network, 'txMbps'), networkDetail(status.network, 'txBytes')],
     ['◉', 'DVB hardware', `${cards.length} cards`, `${state.adapters.length} tuners available`],
     ['♙', 'HTTP sessions', `${state.sessions.length}`, `${state.sessions.filter(session => session.protocol === 'hls').length} HLS · ${state.sessions.filter(session => session.protocol !== 'hls').length} MPEG-TS`],
     ['◴', 'Server CPU', percent(cpu?.usagePercent), cpu?.cores ? `Across ${number(cpu.cores)} logical CPUs` : 'Waiting for a CPU sample', cpu?.usagePercent],
     ['▤', 'Server RAM', percent(ram?.usagePercent), Number.isFinite(ram?.usedBytes) && Number.isFinite(ram?.totalBytes) ? `${(ram.usedBytes / 1073741824).toFixed(1)} / ${(ram.totalBytes / 1073741824).toFixed(1)} GiB used` : 'Memory usage unavailable', ram?.usagePercent],
-  ].map(([icon, label, value, detail, usage]) => `<article class="metric"><span class="metric-icon">${icon}</span><div><label>${label}</label><strong>${value}</strong><small>${detail}</small>${Number.isFinite(usage) ? `<progress class="resource-meter${usage >= 90 ? ' critical' : usage >= 75 ? ' elevated' : ''}" max="100" value="${Math.min(100, Math.max(0, usage))}" aria-label="${label} usage"></progress>` : ''}</div></article>`).join('');
+  ].map(([icon, label, value, detail, usage]) => `<article class="metric"><span class="metric-icon">${icon}</span><div><label>${escapeHTML(label)}</label><strong>${escapeHTML(value)}</strong><small>${escapeHTML(detail)}</small>${Number.isFinite(usage) ? `<progress class="resource-meter${usage >= 90 ? ' critical' : usage >= 75 ? ' elevated' : ''}" max="100" value="${Math.min(100, Math.max(0, usage))}" aria-label="${escapeHTML(label)} usage"></progress>` : ''}</div></article>`).join('');
   renderAdapters(); renderStreams(); renderSessions(); renderLogs();
 }
 
@@ -131,7 +134,7 @@ function renderStreams() {
     .filter((stream) => `${stream.name} ${stream.id}`.toLowerCase().includes(state.query.toLowerCase()))
     .sort((a, b) => (rank[a.state] ?? 8) - (rank[b.state] ?? 8) || a.name.localeCompare(b.name, undefined, { numeric: true }));
   $('#stream-count').textContent = streams.length;
-  $('#streams').innerHTML = streams.length ? streams.map((stream) => `<article class="stream-card${state.selectedStreams.has(stream.id) ? ' selected' : ''}" data-stream="${escapeHTML(stream.id)}"><label class="stream-select" title="Select ${escapeHTML(stream.name)}"><input type="checkbox" aria-label="Select ${escapeHTML(stream.name)}" data-stream-select="${escapeHTML(stream.id)}"${state.selectedStreams.has(stream.id) ? ' checked' : ''} /><span>Select</span></label><button type="button" class="stream-main stream-edit" data-edit-stream="${escapeHTML(stream.id)}" aria-label="Edit ${escapeHTML(stream.name)}"><span class="stream-orb ${escapeHTML(stream.state)}">⌁</span><span class="stream-description"><strong>${escapeHTML(stream.name)}</strong><small>${stream.activeInput >= 0 ? `Input ${stream.activeInput + 1}` : 'No active input'} · ${(stream.clients || 0) + (hlsClients.get(stream.id) || 0)} clients</small></span></button><div class="stream-uptime" title="Continuous output uptime; resets after restart, failover, or an output interruption"><span>Uptime</span><time>${stream.startedAt ? duration(stream.uptimeSeconds) : '—'}</time></div><div class="stream-foot"><strong>${number(stream.bitrateKbps).toLocaleString()} <small>Kbit/s</small></strong><span class="state ${escapeHTML(stream.state)}">${escapeHTML(stream.state)}</span></div></article>`).join('') : '<div class="empty">No streams match the current view.</div>';
+  $('#streams').innerHTML = streams.length ? streams.map((stream) => `<article class="stream-card${state.selectedStreams.has(stream.id) ? ' selected' : ''}" data-stream="${escapeHTML(stream.id)}"><label class="stream-select" title="Select ${escapeHTML(stream.name)}"><input type="checkbox" aria-label="Select ${escapeHTML(stream.name)}" data-stream-select="${escapeHTML(stream.id)}"${state.selectedStreams.has(stream.id) ? ' checked' : ''} /><span>Select</span></label><button type="button" class="stream-main stream-edit" data-edit-stream="${escapeHTML(stream.id)}" aria-label="Edit ${escapeHTML(stream.name)}"><span class="stream-orb ${escapeHTML(stream.state)}">⌁</span><span class="stream-description"><strong>${escapeHTML(stream.name)}</strong><small>${stream.activeInput >= 0 ? `Input ${stream.activeInput + 1}` : 'No active input'} · ${(stream.clients || 0) + (hlsClients.get(stream.id) || 0)} clients</small></span></button><div class="stream-uptime" title="Continuous output uptime; resets after restart, failover, or an output interruption"><span>Uptime</span><time>${stream.startedAt ? duration(stream.uptimeSeconds) : '—'}</time></div><div class="stream-foot">${streamRatesMarkup(stream)}<span class="state ${escapeHTML(stream.state)}">${escapeHTML(stream.state)}</span></div></article>`).join('') : '<div class="empty">No streams match the current view.</div>';
   const visibleIds = streams.map((stream) => stream.id);
   const selectedVisible = visibleIds.filter((id) => state.selectedStreams.has(id)).length;
   const selectAll = $('#select-all-streams');
@@ -366,6 +369,18 @@ function streamName(id) { return state.streams.find((stream) => stream.id === id
 function lines(value) { return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean); }
 function number(value) { return Number.isFinite(Number(value)) ? Number(value) : 0; }
 function percent(value) { return Number.isFinite(value) ? `${value.toFixed(1)}%` : '—'; }
+function networkRate(network, field) { return network?.available && network.status === 'ready' && Number.isFinite(network[field]) ? `${network[field].toFixed(1)} Mb/s` : '—'; }
+function networkDetail(network, field) {
+  if (!network?.available) return network?.status === 'stale' ? 'Sample unavailable · previous totals retained' : 'Host NIC counters unavailable';
+  const bytes = typeof network[field] === 'string' && /^\d{1,24}$/.test(network[field]) ? Number(network[field]) : null;
+  const names = (network.interfaces || []).map(item => item.name).slice(0, 3).join(', ');
+  return `${network.status === 'ready' ? '' : 'Warming up · '}${bytes !== null ? `${(bytes / 1073741824).toFixed(1)} GiB ${field === 'rxBytes' ? 'received' : 'sent'}` : 'Totals unavailable'}${names ? ` · ${names}` : ''}`;
+}
+function streamRatesMarkup(stream) {
+  const rate = value => Number.isFinite(value) ? `${Math.max(0, Math.round(value)).toLocaleString()} <small>Kbit/s</small>` : '—';
+  const scope = stream.inputBitrateScope === 'dvb-service' ? 'Selected DVB service transport, including shared SI and CA packets' : 'Incoming source transport; may include multiple services in a multiplex';
+  return `<div class="stream-rates"><div title="${scope}; recent ${number(stream.bitrateWindowMs || 5000) / 1000}-second estimate"><small>Source IN</small><strong>${rate(stream.inputBitrateKbps)}</strong></div><div title="Emitted transport before client fan-out; not a guarantee of decodable video"><small>OUT</small><strong>${rate(stream.outputBitrateKbps)}</strong></div></div>`;
+}
 function duration(seconds) { seconds = Math.max(0, Math.floor(number(seconds))); const days = Math.floor(seconds / 86400); const clock = [Math.floor(seconds % 86400 / 3600), Math.floor(seconds % 3600 / 60), seconds % 60].map((part) => String(part).padStart(2, '0')).join(':'); return `${days ? `${days}d ` : ''}${clock}`; }
 function escapeHTML(value) { return String(value ?? '').replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]); }
 

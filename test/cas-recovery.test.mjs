@@ -116,9 +116,10 @@ async function proxySetup(t) {
   process.env.ASTRA_SECRET_KEY = '55'.repeat(32);
   const directory = await mkdtemp(join(tmpdir(), 'astra-cas-recovery-')); const timer = timers(); const children = []; const guards = [];
   const profile = { id: 'provider', name: 'Provider', caid: '0B00', lineEncrypted: encryptSecret('host.example.test 15000 user pass 0102030405060708091011121314') };
-  const proxy = new CASProxyManager(new RingLogger(), { ...timer, runtimeDir: directory, protectedBuild: () => true, spawnChild: () => { const child = fakeChild(); children.push(child); return child; }, waitForPorts: async () => {}, guardFactory: () => { const guard = { starts: 0, stops: 0, readerStates: [], results: [], async start() { this.starts++; return 31000 + guards.indexOf(this); }, async stop() { this.stops++; }, setReaderReady(ready) { this.readerStates.push(ready); }, scheduleDecoderStart() {}, result(success, metadata) { this.results.push({ success, metadata }); }, snapshot() { return {}; } }; guards.push(guard); return guard; } });
+  const stores = [];
+  const proxy = new CASProxyManager(new RingLogger(), { ...timer, runtimeDir: directory, protectedBuild: () => true, budgetStoreFactory: async () => { const store = { accounts: new Map(), closed: false, async account(id) { if (!this.accounts.has(id)) this.accounts.set(id, {}); return this.accounts.get(id); }, async close() { this.closed = true; } }; stores.push(store); return store; }, spawnChild: () => { const child = fakeChild(); children.push(child); return child; }, waitForPorts: async () => {}, guardFactory: () => { const guard = { starts: 0, stops: 0, readerStates: [], results: [], async start() { this.starts++; return 31000 + guards.indexOf(this); }, async stop() { this.stops++; }, setReaderReady(ready) { this.readerStates.push(ready); }, scheduleDecoderStart() {}, result(success, metadata) { this.results.push({ success, metadata }); }, snapshot() { return {}; } }; guards.push(guard); return guard; } });
   t.after(async () => { await proxy.stop(); await rm(directory, { recursive: true, force: true }); });
-  return { proxy, profile, children, guards, timer, directory };
+  return { proxy, profile, children, guards, timer, directory, stores };
 }
 
 test('shared proxy recovery retains local credentials, ports, guard and connection identity', async t => {
@@ -185,12 +186,12 @@ test('cached positive replies cannot reset transport recovery health', async t =
 
 test('an unverified OSCam binary cannot launch or recover a shared proxy', async t => {
   const s = await proxySetup(t); s.proxy.protectedBuild = () => false;
-  await assert.rejects(s.proxy.start([s.profile]), /verified OSCam stream-I\/O/);
+  await assert.rejects(s.proxy.start([s.profile]), /verified OSCam semantic-recovery policy v2/);
   assert.equal(s.children.length, 0); assert.equal(s.proxy.guards.size, 0);
 });
 
 test('native reader readiness maps only its generated loopback guard port to the correct profile', async t => {
-  const s = await proxySetup(t); await s.proxy.start([s.profile, { ...s.profile, id: 'second' }]);
+  const s = await proxySetup(t); await s.proxy.start([s.profile, { ...s.profile, id: 'second', lineEncrypted: encryptSecret('host.example.test 15000 different-user pass 0102030405060708091011121314') }]);
   s.children[0].stdout.write('00:00:00 12345678 p (newcamd) Newcamd Server: 127.0.0.1:31001 - UserID: 1\n');
   assert.deepEqual(s.guards[0].readerStates, []); assert.deepEqual(s.guards[1].readerStates, [true]);
   s.children[0].stdout.write('00:00:00 12345678 p (newcamd) Newcamd Server: provider.test:31000 - UserID: 1\n');
@@ -199,11 +200,43 @@ test('native reader readiness maps only its generated loopback guard port to the
   assert.deepEqual(s.guards[0].readerStates, [true]); assert.deepEqual(s.guards[1].readerStates, [true]);
 });
 
-test('invalid generated configuration closes every started provider guard', async t => {
+test('invalid profiles are rejected before any guard or budget storage is opened', async t => {
   const s = await proxySetup(t);
   await assert.rejects(s.proxy.start([{ ...s.profile, caid: 'invalid' }]), /four-digit hexadecimal CAID/);
-  assert.equal(s.guards.length, 1); assert.equal(s.guards[0].stops, 1); assert.equal(s.proxy.guards.size, 0);
+  assert.equal(s.guards.length, 0); assert.equal(s.stores.length, 0); assert.equal(s.proxy.guards.size, 0);
   assert.equal(s.proxy.connections.size, 0); assert.equal(s.proxy.child, null); assert.equal(s.children.length, 0);
+});
+
+test('equivalent profile aliases share one reader, connection and startup queue', async t => {
+  const s = await proxySetup(t); const connections = await s.proxy.start([s.profile, { ...s.profile, id: 'alias' }]);
+  assert.equal(s.guards.length, 1); assert.equal(s.stores[0].accounts.size, 1);
+  assert.equal(connections.get('provider'), connections.get('alias'));
+  assert.equal(s.proxy.profiles.length, 1); assert.equal(s.proxy.generated.ports.length, 1);
+  const config = await readFile(join(s.directory, 'oscam.server'), 'utf8');
+  assert.equal((config.match(/^\[reader\]$/gm) || []).length, 1);
+  const store = s.stores[0]; await s.proxy.stop(); assert.equal(store.closed, true);
+});
+
+test('conflicting account aliases cannot stop an already-working provider', async t => {
+  const s = await proxySetup(t); await s.proxy.start([s.profile]); const child = s.proxy.child;
+  await assert.rejects(s.proxy.start([s.profile, { ...s.profile, id: 'conflict', caid: '0500' }]), /same CAID and credentials/);
+  assert.equal(s.proxy.child, child); assert.equal(child.killed, false); assert.equal(s.guards[0].stops, 0);
+});
+
+test('duplicate profile IDs cannot replace guards or stop an already-working provider', async t => {
+  const s = await proxySetup(t); await s.proxy.start([s.profile]); const child = s.proxy.child;
+  const duplicate = { ...s.profile, lineEncrypted: encryptSecret('another.example.test 16000 another-user pass 0102030405060708091011121314') };
+  await assert.rejects(s.proxy.start([s.profile, duplicate]), /IDs must be unique/);
+  assert.equal(s.proxy.child, child); assert.equal(child.killed, false); assert.equal(s.guards.length, 1);
+  assert.equal(s.guards[0].stops, 0); assert.equal(s.stores.length, 1); assert.equal(s.proxy.guards.size, 1);
+});
+
+test('retry state lives outside the disposable OSCam config and survives proxy-child recovery', async t => {
+  const s = await proxySetup(t); await s.proxy.start([s.profile]);
+  assert.ok(!s.proxy.budgetDirectory.startsWith(s.proxy.runtimeDir + '/'));
+  const store = s.stores[0]; s.children[0].crash(1); await s.timer.fire(s.proxy.recoveryTimer);
+  assert.equal(s.stores.length, 1); assert.equal(store.closed, false);
+  await s.proxy.stop(); assert.equal(store.closed, true);
 });
 
 test('runtime configuration write failure closes provider guards before rejecting startup', async t => {
@@ -213,4 +246,46 @@ test('runtime configuration write failure closes provider guards before rejectin
   assert.equal(s.guards.length, 1); assert.equal(s.guards[0].stops, 1); assert.equal(s.proxy.guards.size, 0);
   assert.equal(s.proxy.connections.size, 0); assert.equal(s.proxy.child, null); assert.equal(s.children.length, 0);
   assert.equal(await readFile(blocker, 'utf8'), 'fixture');
+});
+
+function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
+const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+
+for (const boundary of ['store', 'account', 'guard']) {
+  test(`shutdown during deferred ${boundary} initialization cannot publish a replacement CAS proxy`, async t => {
+    const s = await proxySetup(t), reached = deferred(), release = deferred();
+    if (boundary === 'store') {
+      const original = s.proxy.budgetStoreFactory;
+      s.proxy.budgetStoreFactory = async options => { const store = await original(options); reached.resolve(); await release.promise; return store; };
+    } else if (boundary === 'account') {
+      const original = s.proxy.budgetStoreFactory;
+      s.proxy.budgetStoreFactory = async options => { const store = await original(options), account = store.account.bind(store); store.account = async id => { const result = await account(id); reached.resolve(); await release.promise; return result; }; return store; };
+    } else {
+      const original = s.proxy.guardFactory;
+      s.proxy.guardFactory = options => { const guard = original(options), start = guard.start.bind(guard); guard.start = async () => { const port = await start(); reached.resolve(); await release.promise; return port; }; return guard; };
+    }
+    const starting = s.proxy.start([s.profile]); await reached.promise;
+    let stopped = false; const stop = s.proxy.stop().then(() => { stopped = true; }); await flush(); assert.equal(stopped, false);
+    release.resolve(); await Promise.all([starting, stop]);
+    assert.equal(s.children.length, 0); assert.equal(s.proxy.guards.size, 0); assert.equal(s.proxy.child, null); assert.equal(s.proxy.connections.size, 0);
+    assert.equal(s.stores.every(store => store.closed), true);
+    assert.equal(s.guards.every(guard => guard.stops === 1), true);
+  });
+}
+
+test('shutdown cancels an unresolved port-readiness wait and ignores its late result', async t => {
+  const s = await proxySetup(t), reached = deferred(), late = deferred();
+  s.proxy.waitForPorts = async () => { reached.resolve(); await late.promise; };
+  const starting = s.proxy.start([s.profile]); await reached.promise;
+  await s.proxy.stop(); await starting;
+  assert.equal(s.children.length, 1); assert.equal(s.children[0].killed, true); assert.equal(s.stores[0].closed, true);
+  assert.equal(s.proxy.ready, false); assert.equal(s.proxy.child, null);
+  late.resolve(); await flush(); assert.equal(s.proxy.ready, false); assert.equal(s.proxy.child, null);
+});
+
+test('queued starts from before shutdown remain fenced while an explicit later restart is permitted', async t => {
+  const s = await proxySetup(t); const a = s.proxy.start([s.profile]), b = s.proxy.start([s.profile]);
+  const stop = s.proxy.stop(); await Promise.all([a, b, stop]);
+  assert.equal(s.children.length, 0); assert.equal(s.stores.length, 0);
+  await s.proxy.start([s.profile]); assert.equal(s.children.length, 1); assert.equal(s.proxy.ready, true);
 });

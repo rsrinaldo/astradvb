@@ -1,0 +1,1133 @@
+diff --git a/Makefile b/Makefile
+index f9e8579..e78137e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -46,7 +46,8 @@ FUNCS_LIB = $(FUNCS_DIR)/libfuncs.a
+ TS_DIR = libtsfuncs
+ TS_LIB = $(TS_DIR)/libtsfuncs.a
+ 
+-tsdecrypt_SRC = data.c \
++tsdecrypt_SRC = astra-ciphertext-probe.c \
++ data.c \
+  csa.c \
+  udp.c \
+  util.c \
+@@ -58,7 +59,7 @@ tsdecrypt_SRC = data.c \
+  tables.c \
+  notify.c \
+  tsdecrypt.c
+-tsdecrypt_LIBS = -lcrypto -lpthread
++tsdecrypt_LIBS = -lcrypto -lpthread -ldvbcsa
+ 
+ # If the file do not exist, libdvbcsa will be used
+ -include FFdecsa.opts
+diff --git a/data.h b/data.h
+index 27804cb..ed032fa 100644
+--- a/data.h
++++ b/data.h
+@@ -20,6 +20,8 @@
+ #include <stdbool.h>
+ #include <stdatomic.h>
+ #include "astra-pes-validation.h"
++#include "astra-ciphertext-safety.h"
++#include "astra-ciphertext-probe.h"
+ 
+ // Prevent warnings about openssl functions. Apple may consider 'openssl'
+ // deprecated but changing perfectly working portable code just because they
+@@ -92,6 +94,7 @@ enum msg_type { EMM_MSG, ECM_MSG };
+ 
+ struct camd_msg {
+ 	int64_t created_us;
++	uint32_t ciphertext_context;
+ 	enum msg_type	type;
+ 	uint16_t		ca_id;
+ 	uint16_t		service_id;
+@@ -199,9 +202,15 @@ struct io {
+ 	struct in_addr		isrc;
+ };
+ 
++struct ciphertext_slot {
++	uint8_t data[188];
++	uint32_t context;
++	uint8_t type, allowed;
++};
++struct ciphertext_word_event { uint8_t words[16]; uint32_t context; };
+ struct packet_buf {
+ 	int64_t		time;
+-	uint8_t		data[188];
++	struct ciphertext_slot slot;
+ };
+ 
+ #define MAX_FILTERS     16
+@@ -298,6 +307,18 @@ struct ts {
+ 
+ 	bool				allow_encrypted_output;
+ 	struct astra_pes_validation pes_validation;
++	_Atomic uint32_t ciphertext_context;
++	uint16_t ciphertext_service, ciphertext_pmt, ciphertext_caid, ciphertext_ecm;
++	pthread_mutex_t ciphertext_words_lock;
++	struct ciphertext_word_event ciphertext_words[64];
++	unsigned int ciphertext_word_count;
++	int ciphertext_word_overflow;
++	struct astra_ciphertext *ciphertext;
++	csakey_t *ciphertext_work_key;
++	struct astra_ciphertext_probe *ciphertext_probe;
++	uint8_t ciphertext_work_word[8];
++	int ciphertext_work_valid;
++	uint64_t ciphertext_report_ms;
+ 	bool				output_is_encrypted;
+ 	int64_t				last_encrypted_output_ts;
+ 	int64_t				last_decrypted_output_ts;
+diff --git a/data.c b/data.c
+index d39e444..d082f3c 100644
+--- a/data.c
++++ b/data.c
+@@ -103,6 +103,8 @@ void data_init(struct ts *ts) {
+ 
+ 	ts->allow_encrypted_output   = 0;
+ 	astra_pes_init(&ts->pes_validation);
++	atomic_init(&ts->ciphertext_context, 1);
++	pthread_mutex_init(&ts->ciphertext_words_lock, NULL);
+ 	ts->output_is_encrypted      = 0;
+ 	ts->last_encrypted_output_ts = get_time();
+ 	ts->last_decrypted_output_ts = get_time();
+@@ -116,7 +118,8 @@ void data_init(struct ts *ts) {
+ 	ts->output.tos  = -1;
+ 	ts->output.v6_if_index = -1;
+ 
+-	ts->decode_buf  = cbuf_init((7 * csa_get_batch_size() * 188) * 16, "decode"); // ~658Kb
++	/* Same number of input packets; carry immutable input-order PMT context. */
++	ts->decode_buf  = cbuf_init((7 * csa_get_batch_size() * sizeof(struct ciphertext_slot)) * 16, "decode");
+ 	ts->write_buf   = cbuf_init((7 * csa_get_batch_size() * 188) *  8, "write");  // ~324Kb
+ 
+ 	ts->input_buffer= list_new("input");
+@@ -129,6 +132,10 @@ void data_init(struct ts *ts) {
+ }
+ 
+ void data_free(struct ts *ts) {
++	astra_ciphertext_destroy(ts->ciphertext);
++	csa_key_free(&ts->ciphertext_work_key);
++	astra_ciphertext_probe_free(&ts->ciphertext_probe);
++	pthread_mutex_destroy(&ts->ciphertext_words_lock);
+ 	astra_pes_destroy(&ts->pes_validation);
+ 	ts_pat_free(&ts->pat);
+ 	ts_pat_free(&ts->curpat);
+diff --git a/process.h b/process.h
+index fd4dab1..64cefa1 100644
+--- a/process.h
++++ b/process.h
+@@ -19,5 +19,8 @@ void *decode_thread(void *_ts);
+ void *write_thread(void *_ts);
+ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len);
+ void show_pid_report(struct ts *ts);
++void process_ciphertext_word(struct ts *ts, uint32_t context, const uint8_t words[16]);
++void process_flush_input_buffer(struct ts *ts);
++void process_finish_ciphertext(struct ts *ts);
+ 
+ #endif
+diff --git a/camd.c b/camd.c
+index b07c11c..e5ef751 100644
+--- a/camd.c
++++ b/camd.c
+@@ -28,6 +28,7 @@
+ #include "util.h"
+ #include "camd.h"
+ #include "notify.h"
++#include "process.h"
+ 
+ int ai_family = AF_UNSPEC;
+ 
+@@ -109,7 +110,7 @@ void camd_set_cw(struct ts *ts, uint8_t *new_cw, int check_validity) {
+ 	csa_set_cw(c->key->csakey, new_cw, check_validity);
+ }
+ 
+-static int camd_recv_cw(struct ts *ts) {
++static int camd_recv_cw(struct ts *ts, struct camd_msg *msg) {
+ 	struct camd *c = &ts->camd;
+ 	struct timeval tv1, tv2, last_ts_keyset;
+ 	uint16_t ca_id = 0;
+@@ -157,6 +158,8 @@ static int camd_recv_cw(struct ts *ts) {
+ 	last_ts_keyset = c->key->ts_keyset;
+ 	if (valid_cw)
+ 		camd_set_cw(ts, c->key->cw, 1);
++	if (valid_cw)
++		process_ciphertext_word(ts, msg->ciphertext_context, c->key->cw);
+ 	/* Do not publish the first valid key before its schedules are installed. */
+ 	c->key->is_valid_cw = valid_cw;
+ 
+@@ -184,7 +187,7 @@ static int camd_send_ecm(struct ts *ts, struct camd_msg *msg) {
+ 		return ret;
+ 	}
+ 
+-	ret = camd_recv_cw(ts);
++	ret = camd_recv_cw(ts, msg);
+ 	if (ret < 1) {
+ 		time_t now = time(NULL);
+ 		ts->is_cw_error = 1;
+@@ -326,6 +329,7 @@ static void *camd_thread(void *in_ts) {
+ }
+ 
+ void camd_process_packet(struct ts *ts, struct camd_msg *msg) {
++	if (msg) msg->ciphertext_context = atomic_load(&ts->ciphertext_context);
+ 	if (!msg)
+ 		return;
+ 	if (ts->camd.constant_codeword)
+diff --git a/tables.c b/tables.c
+index e89ba98..d552b23 100644
+--- a/tables.c
++++ b/tables.c
+@@ -424,7 +424,10 @@ static void __process_ecm(struct ts *ts, uint16_t pid, uint8_t *ts_packet) {
+ 		return;
+ 	}
+ 
+-	int duplicate = ts_privsec_is_same(ts->ecm, ts->last_ecm);
++	/* ECM identity is the FULL completed section, not section_length bytes.
++	 * Keep identical-body suppression; do not change EMM or retry behavior. */
++	int duplicate = ts->last_ecm && astra_ciphertext_same_ecm(sec->section_data, sec->section_data_len,
++		ts->last_ecm->section_header->section_data, ts->last_ecm->section_header->section_data_len);
+ 	if (duplicate && !ts->is_cw_error)
+ 		ts->ecm_duplicate_count++;
+ 	if (!ts->ecm_change_time.tv_sec && !ts->ecm_change_time.tv_usec) // The first time
+diff --git a/tsdecrypt.c b/tsdecrypt.c
+index 5db0cde..e7cb1c5 100644
+--- a/tsdecrypt.c
++++ b/tsdecrypt.c
+@@ -1109,6 +1109,7 @@ int main(int argc, char **argv) {
+ 		}
+ 	} while (have_data && keep_running);
+ EXIT:
++	process_flush_input_buffer(&ts);
+ 	camd_stop(&ts);
+ 
+ 	// If pthread_join failes make sure we exit...
+@@ -1126,6 +1127,7 @@ EXIT:
+ 		if (ts.write_thread)
+ 			pthread_join(ts.write_thread, NULL);
+ 	}
++	if (!ts.threaded) process_finish_ciphertext(&ts);
+ 
+ 	show_pid_report(&ts);
+ 
+diff --git a/process.c b/process.c
+index 0887e15..b124029 100644
+--- a/process.c
++++ b/process.c
+@@ -29,6 +29,137 @@ static unsigned long ts_pack;
+ static int ts_pack_shown;
+ extern int keep_running;
+ 
++static inline void output_write(struct ts *ts, uint8_t *data, unsigned int data_size);
++
++/* CAMD owns this bounded publication queue; decoder owns every retention/
++ * candidate object. No media write, allocation, or provider operation occurs
++ * under the cross-thread word-copy mutex. */
++void process_ciphertext_word(struct ts *ts, uint32_t context, const uint8_t words[16]) {
++	pthread_mutex_lock(&ts->ciphertext_words_lock);
++	if (ts->ciphertext_word_count == 64) {
++		ts->ciphertext_word_overflow = 1;
++		ts->ciphertext_word_count = 0;
++	}
++	struct ciphertext_word_event *event = &ts->ciphertext_words[ts->ciphertext_word_count++];
++	event->context = context; memcpy(event->words, words, 16);
++	pthread_mutex_unlock(&ts->ciphertext_words_lock);
++}
++static int ciphertext_schedule(struct ts *ts, const uint8_t word[8]) {
++	if (!ts->ciphertext_work_key) ts->ciphertext_work_key = csa_key_alloc();
++	if (!ts->ciphertext_work_key) return 0;
++	if (!ts->ciphertext_work_valid || memcmp(ts->ciphertext_work_word, word, 8)) {
++		uint8_t pair[16]; memcpy(pair, word, 8); memcpy(pair + 8, word, 8);
++		csa_set_cw(ts->ciphertext_work_key, pair, 0);
++		memcpy(ts->ciphertext_work_word, word, 8); ts->ciphertext_work_valid = 1;
++	}
++	return 1;
++}
++static int ciphertext_decrypt(void *opaque, const uint8_t word[8], const uint8_t in[188], uint8_t out[188]) {
++	struct ts *ts = opaque;
++	if (!ts->ciphertext_probe) ts->ciphertext_probe = astra_ciphertext_probe_alloc();
++	return astra_ciphertext_probe_decrypt(ts->ciphertext_probe, word, in, out);
++}
++static int ciphertext_decrypt_batch(void *opaque, const uint8_t word[8], const uint8_t (*in)[188], uint8_t (*out)[188], size_t count) {
++	struct ts *ts = opaque;
++	if (!ciphertext_schedule(ts, word) || count > ASTRA_CT_BATCH_PACKETS) return 0;
++	struct csa_batch packets[ASTRA_CT_BATCH_PACKETS + 1];
++	uint8_t *cluster[ASTRA_CT_BATCH_PACKETS * 2 + 1];
++	for (size_t i = 0; i < count; i++) {
++		memcpy(out[i], in[i], 188);
++		unsigned int offset = ts_packet_get_payload_offset(out[i]);
++		if (offset >= 188) return 0;
++		packets[i].data = out[i] + offset; packets[i].len = 188 - offset;
++		cluster[i * 2] = out[i]; cluster[i * 2 + 1] = out[i] + 188;
++	}
++	packets[count].data = NULL; cluster[count * 2] = NULL;
++	if (use_dvbcsa) {
++		/* Both temporary schedules contain this exact immutable half. */
++		csa_decrypt_multiple_even(ts->ciphertext_work_key, packets);
++		for (size_t i = 0; i < count; i++) ts_packet_set_not_scrambled(out[i]);
++	}
++	if (use_ffdecsa) csa_decrypt_multiple_ff(ts->ciphertext_work_key, cluster);
++	return 1;
++}
++static int ciphertext_emit(void *opaque, const uint8_t packet[188]) {
++	struct ts *ts = opaque;
++	if (!ts->threaded) { output_write(ts, (uint8_t *)packet, 188); return 1; }
++	while (!ts->write_stop && cbuf_fill(ts->write_buf, (void *)packet, 188) != 0) {
++		if (!keep_running) return 0;
++		usleep(1000);
++	}
++	return !ts->write_stop;
++}
++static int ciphertext_ensure(struct ts *ts) {
++	if (ts->ciphertext) return 1;
++	/* Reserve256KiB of the8MiB envelope for the bounded native word queue,
++	 * input sidecar metadata and cached output/scalar-probe CSA schedules. */
++	ts->ciphertext = astra_ciphertext_create(ASTRA_CT_MAX_BYTES - 262144, ASTRA_CT_MAX_WAIT_MS,
++		ciphertext_decrypt, ciphertext_emit, ts);
++	if (!ts->ciphertext || !astra_ciphertext_batch(ts->ciphertext, ciphertext_decrypt_batch, csa_get_batch_size())) {
++		ts_LOGf("CT | allocation failure, withholding media\n"); return 0;
++	}
++	return 1;
++}
++static void ciphertext_words(struct ts *ts, uint32_t context, uint64_t now) {
++	struct ciphertext_word_event events[64]; unsigned int count = 0, kept = 0; int overflow;
++	pthread_mutex_lock(&ts->ciphertext_words_lock);
++	overflow = ts->ciphertext_word_overflow; ts->ciphertext_word_overflow = 0;
++	for (unsigned int i = 0; i < ts->ciphertext_word_count; i++) {
++		struct ciphertext_word_event *event = &ts->ciphertext_words[i];
++		if (event->context == context) events[count++] = *event;
++		else if (event->context > context) ts->ciphertext_words[kept++] = *event;
++	}
++	ts->ciphertext_word_count = kept;
++	pthread_mutex_unlock(&ts->ciphertext_words_lock);
++	if (overflow) astra_ciphertext_invalidate(ts->ciphertext);
++	for (unsigned int i = 0; i < count; i++) {
++		astra_ciphertext_word(ts->ciphertext, context, 0, events[i].words, now);
++		astra_ciphertext_word(ts->ciphertext, context, 1, events[i].words + 8, now);
++	}
++}
++static void ciphertext_report(struct ts *ts, uint64_t now, int force) {
++	if (!ts->ciphertext || (!force && now - ts->ciphertext_report_ms < 5000)) return;
++	ts->ciphertext_report_ms = now;
++	struct astra_ct_stats *s = &ts->ciphertext->stats;
++	ts_LOGf("CT | heldBytes=%" PRIu64 " peakBytes=%" PRIu64 " dropped=%" PRIu64 " timeout=%" PRIu64 " capacity=%" PRIu64 " prefix=%" PRIu64 " recovered=%" PRIu64 " allocated=%" PRIu64 "\n",
++		s->current_held_bytes, s->peak_held_bytes, s->packets_dropped, s->timeout_drops,
++		s->capacity_drops, s->prefix_drops, s->recovered_holds, s->allocated_bytes);
++}
++static int ciphertext_slot(struct ts *ts, const struct ciphertext_slot *slot, uint64_t now) {
++	if (!ciphertext_ensure(ts)) return 0;
++	int changed = ts->ciphertext->context != slot->context;
++	if (changed) {
++		astra_ciphertext_context(ts->ciphertext, slot->context);
++		if (ts->camd.constant_codeword) {
++			astra_ciphertext_word(ts->ciphertext, slot->context, 0, ts->key.cw, now);
++			astra_ciphertext_word(ts->ciphertext, slot->context, 1, ts->key.cw + 8, now);
++		}
++	}
++	if (changed || !ts->threaded) ciphertext_words(ts, slot->context, now);
++	unsigned int pid = ts_packet_get_pid((uint8_t *)slot->data);
++	astra_ciphertext_pid(ts->ciphertext, pid, slot->type);
++	return !slot->allowed || astra_ciphertext_push(ts->ciphertext, slot->data, now);
++}
++static void ciphertext_batch(struct ts *ts, const uint8_t *data, int data_len) {
++	uint64_t now = ecm_clock_us() / 1000;
++	if (!ciphertext_ensure(ts)) { ts->decode_stop = 1; keep_running = 0; return; }
++	ciphertext_words(ts, ts->ciphertext->context, now);
++	astra_ciphertext_defer(ts->ciphertext, 1);
++	for (int at = 0; at + (int)sizeof(struct ciphertext_slot) <= data_len; at += sizeof(struct ciphertext_slot)) {
++		struct ciphertext_slot slot; memcpy(&slot, data + at, sizeof(slot));
++		if (!ciphertext_slot(ts, &slot, now)) { ts->decode_stop = 1; keep_running = 0; break; }
++	}
++	astra_ciphertext_defer(ts->ciphertext, 0);
++	if (!astra_ciphertext_pump(ts->ciphertext, now, 0)) { ts->decode_stop = 1; keep_running = 0; }
++	ciphertext_report(ts, now, 0);
++}
++void process_finish_ciphertext(struct ts *ts) {
++	if (!ts->ciphertext) return;
++	uint64_t now = ecm_clock_us() / 1000;
++	ciphertext_words(ts, ts->ciphertext->context, now);
++	astra_ciphertext_finish(ts->ciphertext, now); ciphertext_report(ts, now, 1);
++}
++
+ char *get_pid_desc(struct ts *ts, uint16_t pid) {
+ 	int i;
+ 	uint16_t nitpid = 0x0010, pmtpid = 0xffff, pcrpid = 0xffff;
+@@ -102,153 +233,23 @@ static void dump_ts_pack(struct ts *ts, uint16_t pid, uint8_t *ts_packet) {
+ 	else					show_ts_pack(ts, pid, "---", NULL, ts_packet);
+ }
+ 
+-static void decode_packet(struct ts *ts, uint8_t *ts_packet) {
+-	int scramble_idx = ts_packet_get_scrambled(ts_packet);
+-	if (scramble_idx > 1) {
+-		if (ts->key.is_valid_cw) {
+-			csa_decrypt_single_packet(ts->key.csakey, ts_packet);
+-		} else {
+-			// Can't decrypt the packet just make it NULL packet
+-			if (ts->pid_filter)
+-				ts_packet_set_pid(ts_packet, 0x1fff);
+-		}
+-	}
+-}
+-
+-static void decode_buffer(struct ts *ts, uint8_t *data, int data_len) {
+-	int i;
+-	int batch_sz = csa_get_batch_size(); // Tested with 32 for libdvbcsa, 70 for FFdecsa (must be multiplied by 2)
+-	int even_packets = 0;
+-	int odd_packets  = 0;
+-	struct csa_batch even_pcks[batch_sz + 1];
+-	struct csa_batch odd_pcks [batch_sz + 1];
+-	uint8_t *ff_even_pcks[batch_sz * 2 + 1];
+-	uint8_t *ff_odd_pcks [batch_sz * 2 + 1];
+-
+-	int scramble_idx_old = 0;
+-
+-	time_t now = time(NULL);
+-
+-	// Prepare batch structure
+-	for (i = 0; i < data_len / 188; i++) {
+-		uint8_t *ts_packet = data + (i * 188);
+-
+-		uint16_t pid = ts_packet_get_pid(ts_packet);
+-		bool in_pidmap = pidmap_get(&ts->pidmap, pid);
+-		bool is_scrambled = ts_packet_is_scrambled(ts_packet);
+-		if (in_pidmap && ts->have_valid_pmt) {
+-			if (is_scrambled) {
+-				if (ts->last_scrambled_packet_ts < now) {
+-					ts->stream_is_not_scrambled = 0;
+-					ts->last_scrambled_packet_ts = now;
+-				}
+-			} else {
+-				if (now - 5 >= ts->last_scrambled_packet_ts) {
+-					if (ts->last_not_scrambled_packet_ts < now) {
+-						ts->camd.key->is_valid_cw = 0;
+-						ts->stream_is_not_scrambled = 1;
+-						ts->last_not_scrambled_packet_ts = now;
+-					}
+-				}
+-			}
+-		}
+-		if (in_pidmap && is_scrambled) {
+-			if (ts->key.is_valid_cw) {
+-				int scramble_idx = ts_packet_get_scrambled(ts_packet);
+-				if (!scramble_idx_old)
+-					scramble_idx_old = scramble_idx;
+-				if (use_dvbcsa) {
+-					uint8_t payload_ofs = ts_packet_get_payload_offset(ts_packet);
+-					if (scramble_idx == 2) { // scramble_idx 2 == even key
+-						even_pcks[even_packets].data = ts_packet + payload_ofs;
+-						even_pcks[even_packets].len  = 188 - payload_ofs;
+-						even_packets++;
+-					}
+-					if (scramble_idx == 3) { // scramble_idx 3 == odd key
+-						odd_pcks[odd_packets].data = ts_packet + payload_ofs;
+-						odd_pcks[odd_packets].len  = 188 - payload_ofs;
+-						odd_packets++;
+-					}
+-					ts_packet_set_not_scrambled(ts_packet);
+-				}
+-				if (use_ffdecsa) {
+-					if (scramble_idx == 2) { // scramble_idx 2 == even key
+-						ff_even_pcks[even_packets * 2    ] = ts_packet;
+-						ff_even_pcks[even_packets * 2 + 1] = ts_packet + 188;
+-						even_packets++;
+-					}
+-					if (scramble_idx == 3) { // scramble_idx 3 == odd key
+-						ff_odd_pcks[odd_packets * 2    ] = ts_packet;
+-						ff_odd_pcks[odd_packets * 2 + 1] = ts_packet + 188;
+-						odd_packets++;
+-					}
+-				}
+-				if (scramble_idx_old != scramble_idx && !ts->camd.constant_codeword) {
+-					struct timeval tv;
+-					gettimeofday(&tv, NULL);
+-					ts_LOGf("CWC | SID 0x%04x ------------ EcmTime: %5llu ms CW_time: %5llu ms\n",
+-						ts->service_id,
+-						timeval_diff_msec(&ts->ecm_change_time, &tv),
+-						timeval_diff_msec(&ts->key.ts_keyset, &tv));
+-				}
+-				scramble_idx_old = scramble_idx;
+-			} else {
+-				if (ts->pid_filter)
+-					ts_packet_set_pid(ts_packet, 0x1fff);
+-			}
+-		}
+-	}
+-
+-	// Decode packets
+-	if (even_packets) {
+-		if (use_dvbcsa) {
+-			even_pcks[even_packets].data = NULL; // Last one...
+-			csa_decrypt_multiple_even(ts->key.csakey, even_pcks);
+-		}
+-		if (use_ffdecsa) {
+-			ff_even_pcks[even_packets * 2] = NULL;
+-			csa_decrypt_multiple_ff(ts->key.csakey, ff_even_pcks);
+-		}
+-	}
+-	if (odd_packets) {
+-		if (use_dvbcsa) {
+-			odd_pcks[odd_packets].data = NULL; // Last one...
+-			csa_decrypt_multiple_odd(ts->key.csakey, odd_pcks);
+-		}
+-		if (use_ffdecsa) {
+-			ff_odd_pcks[odd_packets * 2] = NULL;
+-			csa_decrypt_multiple_ff(ts->key.csakey, ff_odd_pcks);
+-		}
+-	}
+-
+-	// Fill write buffer
+-	for (i=0; i<data_len; i += 188) {
+-		uint8_t *ts_packet = data + i;
+-
+-		if (!ts->pid_filter) {
+-			while (cbuf_fill(ts->write_buf, ts_packet, 188) != 0 && keep_running && !ts->write_stop)
+-				usleep(1000);
+-		} else {
+-			uint16_t pid = ts_packet_get_pid(ts_packet);
+-			if (pidmap_get(&ts->pidmap, pid)) { // PAT or allowed PIDs
+-				while (cbuf_fill(ts->write_buf, ts_packet, 188) != 0 && keep_running && !ts->write_stop)
+-					usleep(1000);
+-			}
+-		}
+-	}
+-}
+ 
+ void *decode_thread(void *_ts) {
+ 	struct ts *ts = _ts;
+ 	uint8_t *data;
+ 	int data_size;
+-	int req_size = 188 * csa_get_batch_size();
++	int req_size = sizeof(struct ciphertext_slot) * csa_get_batch_size();
+ 
+ 	set_thread_name("tsdec-decode");
+ 
+ 	while (!ts->decode_stop) {
+ 		cbuf_peek(ts->decode_buf, req_size, &data_size);
+ 		if (data_size < req_size) {
++			if (ts->ciphertext) {
++				uint64_t now = ecm_clock_us() / 1000;
++				ciphertext_words(ts, ts->ciphertext->context, now);
++				if (!astra_ciphertext_pump(ts->ciphertext, now, 0)) { ts->decode_stop = 1; keep_running = 0; }
++			}
+ 			usleep(1000);
+ 			continue;
+ 		}
+@@ -256,7 +257,7 @@ void *decode_thread(void *_ts) {
+ 		 * frees its returned range immediately, allowing producer overwrite. */
+ 		data = cbuf_peek(ts->decode_buf, req_size, &data_size);
+ 		if (data) {
+-			decode_buffer(ts, data, data_size);
++			ciphertext_batch(ts, data, data_size);
+ 			cbuf_get(ts->decode_buf, data_size, &data_size);
+ 		}
+ 	}
+@@ -264,10 +265,11 @@ void *decode_thread(void *_ts) {
+ 	do { // Flush data
+ 		data = cbuf_peek(ts->decode_buf, req_size, &data_size);
+ 		if (data) {
+-			decode_buffer(ts, data, data_size);
++			ciphertext_batch(ts, data, data_size);
+ 			cbuf_get(ts->decode_buf, data_size, &data_size);
+ 		}
+ 	} while(data);
++	process_finish_ciphertext(ts);
+ 
+ 	return NULL;
+ }
+@@ -277,8 +279,8 @@ static inline void output_write(struct ts *ts, uint8_t *data, unsigned int data_
+ 		return;
+ 	if (!ts->have_valid_pmt)
+ 		return;
+-	if (ts->no_output_on_error && !ts->camd.key->is_valid_cw)
+-		return;
++	/* The upstream ciphertext gate certifies selected encrypted packets using
++	 * immutable per-run words. A global last-reply bit is not their validity. */
+ 	if (!ts->allow_encrypted_output) {
+ 		int64_t now = get_time();
+ 		int blocked = 0;
+@@ -423,6 +425,15 @@ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len) {
+ 		process_pmt(ts, pid, ts_packet);
+ 		process_sdt(ts, pid, ts_packet);
+ 		process_emm(ts, pid, ts_packet);
++		/* A PMT version/descriptor-only update is not a new CAS identity and
++		 * must not discard a cached key while identical ECM dedupe is active.
++		 * Capture actual identity before this input packet can enqueue ECM. */
++		if (ts->ciphertext_service != ts->service_id || ts->ciphertext_pmt != ts->pmt_pid ||
++		    ts->ciphertext_caid != ts->ecm_caid || ts->ciphertext_ecm != ts->ecm_pid) {
++			ts->ciphertext_service = ts->service_id; ts->ciphertext_pmt = ts->pmt_pid;
++			ts->ciphertext_caid = ts->ecm_caid; ts->ciphertext_ecm = ts->ecm_pid;
++			atomic_fetch_add(&ts->ciphertext_context, 1);
++		}
+ 		process_ecm(ts, pid, ts_packet);
+ 
+ 		detect_discontinuity(ts, ts_packet);
+@@ -442,25 +453,33 @@ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len) {
+ 			ts_packet = ts->genpat->section_header->packet_data;
+ 			ts->genpat_cc = (ts->genpat_cc + 1) & 0x0f;
+ 		}
++		struct ciphertext_slot slot;
++		memset(&slot, 0, sizeof(slot)); memcpy(slot.data, ts_packet, 188);
++		slot.context = atomic_load(&ts->ciphertext_context);
++		slot.allowed = !ts->pid_filter || pidmap_get(&ts->pidmap, pid);
++		pthread_mutex_lock(&ts->pes_validation.lock);
++		slot.type = ts->pes_validation.expected[pid];
++		pthread_mutex_unlock(&ts->pes_validation.lock);
+ 
+ 		if (ts->threaded) {
+ 			// Add to decode buffer. The decoder thread will handle it
+ 			if (ts->input_buffer_time == 0) {
+ 				// No input buffer, move packets to decoding buffer
+-				while (cbuf_fill(ts->decode_buf, ts_packet, 188) != 0 && keep_running && !ts->decode_stop)
++				while (cbuf_fill(ts->decode_buf, &slot, sizeof(slot)) != 0 && keep_running && !ts->decode_stop)
+ 					usleep(1000);
+ 			} else {
+ 				// Handle input buffer
+ 				struct packet_buf *p = malloc(sizeof(struct packet_buf));
++				if (!p) { ts_LOGf("CT | input allocation failure, withholding media\n"); keep_running = 0; return; }
+ 				p->time = now + (ts->input_buffer_time * 1000); //buffer time is in ms, p->time is in us
+-				memcpy(p->data, ts_packet, 188);
++				p->slot = slot;
+ 				list_add(ts->input_buffer, p);
+ 				// Move packets to decrypt buffer
+ 				LNODE *lc, *lctmp;
+ 				list_for_each(ts->input_buffer, lc, lctmp) {
+ 					p = lc->data;
+ 					if (p->time <= now) {
+-						while (cbuf_fill(ts->decode_buf, p->data, 188) != 0 && keep_running && !ts->decode_stop)
++						while (cbuf_fill(ts->decode_buf, &p->slot, sizeof(p->slot)) != 0 && keep_running && !ts->decode_stop)
+ 							usleep(1000);
+ 						list_del(ts->input_buffer, &lc);
+ 						free(p);
+@@ -470,21 +489,26 @@ void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len) {
+ 				}
+ 			}
+ 		} else {
+-			int allowed_pid = pidmap_get(&ts->pidmap, pid);
+-			if (allowed_pid) // PAT or allowed PIDs
+-				decode_packet(ts, ts_packet);
+-			if (ts->pid_filter) {
+-				if (allowed_pid) // PAT or allowed PIDs
+-					output_write(ts, ts_packet, 188);
+-			} else {
+-				output_write(ts, ts_packet, 188);
+-			}
++			if (!ciphertext_slot(ts, &slot, ecm_clock_us() / 1000)) keep_running = 0;
+ 		}
+ 
+ 		ts_pack++;
+ 	}
+ }
+ 
++/* At finite EOF there may be no new input packet to advance the old optional
++ * input-delay list. Drain every already-owned packet without padding/delay. */
++void process_flush_input_buffer(struct ts *ts) {
++	LNODE *node, *next;
++	list_for_each(ts->input_buffer, node, next) {
++		struct packet_buf *p = node->data;
++		if (ts->threaded) {
++			while (cbuf_fill(ts->decode_buf, &p->slot, sizeof(p->slot)) != 0 && keep_running && !ts->decode_stop && !ts->write_stop) usleep(1000);
++		} else ciphertext_slot(ts, &p->slot, ecm_clock_us() / 1000);
++		list_del(ts->input_buffer, &node); free(p);
++	}
++}
++
+ void show_pid_report(struct ts *ts) {
+ 	int i;
+ 	if (!ts->pid_report)
+diff --git a/astra-ciphertext-safety.h b/astra-ciphertext-safety.h
+new file mode 100644
+index 0000000..8d815b3
+--- /dev/null
++++ b/astra-ciphertext-safety.h
+@@ -0,0 +1,430 @@
++/* Isolated decoder candidate. Not part of the normal native build.
++ * Copyright AstraDVB contributors, GPL-2.0-only.
++ *
++ * A PES anchor is syntax evidence, not CSA authentication. Retrospective
++ * continuation release requires an unchanged physical CW within the observed
++ * same-parity run. An unannounced same-parity key boundary is not provable from
++ * a TS continuation. Never infer CSA parity from an ECM table identifier.
++ */
++#ifndef ASTRA_CIPHERTEXT_SAFETY_H
++#define ASTRA_CIPHERTEXT_SAFETY_H
++#include <stdint.h>
++#include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++#include "astra-pes-validation.h"
++
++#define ASTRA_CT_KEY_COUNT 64
++#define ASTRA_CT_RUN_COUNT 256
++#define ASTRA_CT_PID_COUNT 8192
++#define ASTRA_CT_NONE UINT16_MAX
++#define ASTRA_CT_MAX_BYTES (8u * 1024u * 1024u)
++#define ASTRA_CT_MAX_WAIT_MS 2000u
++#define ASTRA_CT_BATCH_PACKETS 70u
++
++/* This helper is used at the ECM call site only. section_data_len includes
++ * all three bytes omitted by the pinned library's section_length comparison. */
++static inline int astra_ciphertext_same_ecm(const uint8_t *a, size_t a_length, const uint8_t *b, size_t b_length) {
++    return a && b && a_length && a_length == b_length && !memcmp(a, b, a_length);
++}
++
++typedef int (*astra_ct_decrypt_fn)(void *, const uint8_t[8], const uint8_t[188], uint8_t[188]);
++typedef int (*astra_ct_emit_fn)(void *, const uint8_t[188]);
++typedef int (*astra_ct_batch_fn)(void *, const uint8_t[8], const uint8_t (*)[188], uint8_t (*)[188], size_t);
++struct astra_ct_stats {
++    uint64_t packets_in, packets_out, packets_dropped;
++    uint64_t held_packets, recovered_holds, timeout_drops, capacity_drops;
++    uint64_t context_drops, prefix_drops, candidate_overflows, run_overflows, ambiguous_probes;
++    uint64_t current_held_bytes, peak_held_bytes, allocated_bytes;
++};
++struct astra_ct_key {
++    uint8_t word[8], present, parity;
++    uint32_t context, references;
++    uint64_t serial, received_ms;
++};
++struct astra_ct_run {
++    uint8_t present, parity, type, failed, confirmed, had_hold, prefix_allowed;
++    uint16_t pid, key, references;
++    uint32_t context;
++    uint64_t serial, first_ms, ambiguous_mask, retained_mask;
++    /* References into the bounded raw queue, not copied media. A PES prefix
++     * needs at most19 payload bytes, hence at most19 TS packets. */
++    uint64_t anchor_slots[19];
++    uint8_t anchor_count, anchor_bytes, anchor_cc, anchor_complete;
++};
++struct astra_ct_pid {
++    uint16_t run;
++    uint8_t type, seen, parity, cc;
++    uint64_t seen_ms, word_revision, transition_revision;
++};
++struct astra_ct_packet {
++    uint8_t bytes[188];
++    uint16_t run;
++    uint64_t run_serial, sequence, received_ms;
++};
++struct astra_ciphertext {
++    astra_ct_decrypt_fn decrypt;
++    astra_ct_emit_fn emit;
++    astra_ct_batch_fn batch;
++    void *opaque;
++    struct astra_ct_stats stats;
++    struct astra_ct_key keys[ASTRA_CT_KEY_COUNT];
++    struct astra_ct_run runs[ASTRA_CT_RUN_COUNT];
++    struct astra_ct_pid pids[ASTRA_CT_PID_COUNT];
++    struct astra_ct_packet *queue;
++    uint8_t batch_raw[ASTRA_CT_BATCH_PACKETS][188], batch_clear[ASTRA_CT_BATCH_PACKETS][188];
++    size_t capacity, head, count;
++    uint32_t context, wait_ms;
++    uint64_t serial, sequence, word_revision[2], transition_revision, next_gc_ms;
++    uint8_t phase_seen, phase, output_failed, candidate_blocked, probe_dirty, batch_size, deferred;
++};
++
++static inline unsigned int astra_ct_offset(const uint8_t *p) {
++    unsigned int control = (p[3] >> 4) & 3;
++    if (control != 1 && control != 3) return 188;
++    unsigned int offset = control == 3 ? 5u + p[4] : 4u;
++    return offset < 188 ? offset : 188;
++}
++static inline void astra_ct_key_release(struct astra_ciphertext *s, uint16_t id) {
++    if (id != ASTRA_CT_NONE && s->keys[id].references) s->keys[id].references--;
++}
++static inline void astra_ct_run_release(struct astra_ciphertext *s, uint16_t id) {
++    if (id == ASTRA_CT_NONE) return;
++    struct astra_ct_run *r = &s->runs[id];
++    if (!r->references || --r->references) return;
++    astra_ct_key_release(s, r->key);
++    for (unsigned int i = 0; i < ASTRA_CT_KEY_COUNT; i++) if (r->retained_mask & (UINT64_C(1) << i)) astra_ct_key_release(s, i);
++    memset(r, 0, sizeof(*r));
++}
++static inline struct astra_ciphertext *astra_ciphertext_create(size_t max_bytes, unsigned int wait_ms,
++        astra_ct_decrypt_fn decrypt, astra_ct_emit_fn emit, void *opaque) {
++    if (!decrypt || !emit || !wait_ms || wait_ms > ASTRA_CT_MAX_WAIT_MS ||
++        max_bytes > ASTRA_CT_MAX_BYTES || max_bytes < sizeof(struct astra_ciphertext) + 32 * sizeof(struct astra_ct_packet)) return NULL;
++    struct astra_ciphertext *s = calloc(1, sizeof(*s));
++    if (!s) return NULL;
++    s->capacity = (max_bytes - sizeof(*s)) / sizeof(*s->queue);
++    s->queue = calloc(s->capacity, sizeof(*s->queue));
++    if (!s->queue) { free(s); return NULL; }
++    s->decrypt = decrypt; s->emit = emit; s->opaque = opaque; s->wait_ms = wait_ms;
++    s->stats.allocated_bytes = sizeof(*s) + s->capacity * sizeof(*s->queue);
++    for (unsigned int i = 0; i < ASTRA_CT_PID_COUNT; i++) s->pids[i].run = ASTRA_CT_NONE;
++    return s;
++}
++static inline int astra_ciphertext_batch(struct astra_ciphertext *s, astra_ct_batch_fn batch, unsigned int count) {
++    if (!batch || !count || count > ASTRA_CT_BATCH_PACKETS) return 0;
++    s->batch = batch; s->batch_size = count; return 1;
++}
++/* Native callers feed one existing CSA-sized input batch before pumping, so
++ * healthy traffic retains SIMD CSA batching instead of decrypting one packet
++ * per push. Deferral never bypasses the hard queue capacity. */
++static inline void astra_ciphertext_defer(struct astra_ciphertext *s, int deferred) { s->deferred = !!deferred; }
++static inline void astra_ct_drop_head(struct astra_ciphertext *s, unsigned int reason) {
++    struct astra_ct_packet *p = &s->queue[s->head];
++    s->stats.packets_dropped++;
++    if (reason == 1) s->stats.timeout_drops++;
++    if (reason == 2) s->stats.capacity_drops++;
++    if (reason == 3) s->stats.context_drops++;
++    if (reason == 4) s->stats.prefix_drops++;
++    astra_ct_run_release(s, p->run);
++    s->head = (s->head + 1) % s->capacity; s->count--;
++    if (!s->count) s->head = 0;
++    s->stats.current_held_bytes = s->count * sizeof(*p);
++}
++static inline void astra_ciphertext_destroy(struct astra_ciphertext *s) {
++    if (!s) return;
++    while (s->count) astra_ct_drop_head(s, 0);
++    for (unsigned int i = 0; i < ASTRA_CT_PID_COUNT; i++) astra_ct_run_release(s, s->pids[i].run);
++    memset(s->keys, 0, sizeof(s->keys)); free(s->queue); free(s);
++}
++static inline void astra_ciphertext_invalidate(struct astra_ciphertext *s) {
++    for (unsigned int i = 0; i < ASTRA_CT_RUN_COUNT; i++) if (s->runs[i].present) { s->runs[i].confirmed = 0; s->runs[i].failed = 3; }
++    for (unsigned int i = 0; i < ASTRA_CT_PID_COUNT; i++) {
++        astra_ct_run_release(s, s->pids[i].run); s->pids[i].run = ASTRA_CT_NONE; s->pids[i].seen = 0;
++    }
++    for (unsigned int i = 0; i < ASTRA_CT_KEY_COUNT; i++) {
++        if (s->keys[i].references) s->keys[i].context = UINT32_MAX;
++        else memset(&s->keys[i], 0, sizeof(s->keys[i]));
++    }
++    s->candidate_blocked = 3; s->word_revision[0]++; s->word_revision[1]++;
++}
++static inline void astra_ciphertext_context(struct astra_ciphertext *s, uint32_t context) {
++    if (s->context == context) return;
++    for (unsigned int i = 0; i < ASTRA_CT_RUN_COUNT; i++) if (s->runs[i].present && !s->runs[i].confirmed) s->runs[i].failed = 3;
++    for (unsigned int i = 0; i < ASTRA_CT_PID_COUNT; i++) {
++        astra_ct_run_release(s, s->pids[i].run);
++        uint8_t type = s->pids[i].type;
++        memset(&s->pids[i], 0, sizeof(s->pids[i]));
++        s->pids[i].run = ASTRA_CT_NONE; s->pids[i].type = type;
++    }
++    s->context = context; s->phase_seen = 0; s->candidate_blocked = 0;
++    s->word_revision[0]++; s->word_revision[1]++; s->transition_revision++;
++}
++static inline void astra_ciphertext_pid(struct astra_ciphertext *s, unsigned int pid, uint8_t type) {
++    if (pid >= ASTRA_CT_PID_COUNT) return;
++    if (!astra_pes_stream_type(type)) type = 0;
++    if (s->pids[pid].type == type) return;
++    astra_ct_run_release(s, s->pids[pid].run);
++    memset(&s->pids[pid], 0, sizeof(s->pids[pid]));
++    s->pids[pid].run = ASTRA_CT_NONE; s->pids[pid].type = type;
++}
++static inline int astra_ciphertext_word(struct astra_ciphertext *s, uint32_t context,
++        unsigned int parity, const uint8_t word[8], uint64_t now_ms) {
++    static const uint8_t zero[8] = {0};
++    if (context != s->context || parity > 1 || !word || !memcmp(word, zero, 8)) return 0;
++    uint16_t chosen = ASTRA_CT_NONE;
++    /* Keep the two newest distinct halves per parity plus every pinned word
++     * and the bounded late-reply window. Historical unreferenced words cannot
++     * make PES probing grow for years. */
++    for (unsigned int i = 0; i < ASTRA_CT_KEY_COUNT; i++) {
++        struct astra_ct_key *k = &s->keys[i];
++        if (!k->present || k->references || now_ms < k->received_ms || now_ms - k->received_ms <= s->wait_ms) continue;
++        unsigned int newer = 0;
++        for (unsigned int j = 0; j < ASTRA_CT_KEY_COUNT; j++) if (s->keys[j].present &&
++            s->keys[j].context == k->context && s->keys[j].parity == k->parity && s->keys[j].serial > k->serial) newer++;
++        if (k->context != context || newer >= 2) memset(k, 0, sizeof(*k));
++    }
++    for (unsigned int i = 0; i < ASTRA_CT_KEY_COUNT; i++) {
++        struct astra_ct_key *k = &s->keys[i];
++        if (k->present && k->context == context && k->parity == parity && !memcmp(k->word, word, 8)) return 1;
++        if (!k->present) chosen = i;
++    }
++    if (chosen == ASTRA_CT_NONE) {
++        for (unsigned int i = 0; i < ASTRA_CT_KEY_COUNT; i++) {
++            struct astra_ct_key *k = &s->keys[i];
++            if (!k->references && (chosen == ASTRA_CT_NONE || k->serial < s->keys[chosen].serial)) chosen = i;
++        }
++    }
++    if (chosen == ASTRA_CT_NONE) {
++        s->stats.candidate_overflows++; s->candidate_blocked |= 1u << parity;
++        s->word_revision[parity]++;
++        /* No old certificate may silently stand in for an unrecorded word. */
++        for (unsigned int i = 0; i < ASTRA_CT_RUN_COUNT; i++) {
++            struct astra_ct_run *r = &s->runs[i];
++            if (r->present && r->context == context && r->parity == parity) { r->confirmed = 0; r->failed = 2; }
++        }
++        return 0;
++    }
++    struct astra_ct_key *k = &s->keys[chosen];
++    memset(k, 0, sizeof(*k)); memcpy(k->word, word, 8);
++    k->present = 1; k->parity = parity; k->context = context; k->serial = ++s->serial; k->received_ms = now_ms;
++    s->candidate_blocked &= ~(1u << parity);
++    s->word_revision[parity]++; s->probe_dirty = 1;
++    return 1;
++}
++static inline uint16_t astra_ct_new_run(struct astra_ciphertext *s, unsigned int pid, unsigned int parity, int prefix_allowed, uint64_t now_ms) {
++    struct astra_ct_pid *p = &s->pids[pid];
++    astra_ct_run_release(s, p->run); p->run = ASTRA_CT_NONE;
++    for (unsigned int i = 0; i < ASTRA_CT_RUN_COUNT; i++) if (!s->runs[i].present) {
++        struct astra_ct_run *r = &s->runs[i];
++        memset(r, 0, sizeof(*r)); r->present = 1; r->references = 1;
++        r->parity = parity; r->pid = pid; r->type = p->type;
++        r->prefix_allowed = prefix_allowed;
++        r->context = s->context; r->key = ASTRA_CT_NONE; r->serial = ++s->serial;
++        r->first_ms = now_ms;
++        p->run = i; return i;
++    }
++    s->stats.run_overflows++; return ASTRA_CT_NONE;
++}
++static inline struct astra_ct_packet *astra_ct_anchor_packet(struct astra_ciphertext *s, uint64_t sequence) {
++    if (!s->count) return NULL;
++    uint64_t first = s->queue[s->head].sequence;
++    if (sequence < first || sequence - first >= s->count) return NULL;
++    struct astra_ct_packet *p = &s->queue[(s->head + sequence - first) % s->capacity];
++    return p->sequence == sequence ? p : NULL;
++}
++static inline void astra_ct_probe(struct astra_ciphertext *s, struct astra_ct_run *r, uint64_t now_ms) {
++    if (r->confirmed || r->failed || !r->anchor_count || (s->candidate_blocked & (1u << r->parity))) return;
++    if (now_ms - r->first_ms >= s->wait_ms) { r->failed = 1; return; }
++    uint16_t chosen = ASTRA_CT_NONE; unsigned int matches = 0, unknown = 0; uint64_t possible_mask = 0;
++    for (unsigned int i = 0; i < ASTRA_CT_KEY_COUNT; i++) {
++        struct astra_ct_key *k = &s->keys[i];
++        if (!k->present || k->parity != r->parity || k->context != r->context) continue;
++        if (r->ambiguous_mask && !(r->ambiguous_mask & (UINT64_C(1) << i))) continue;
++        uint8_t prefix[19]; size_t filled = 0; int usable = 1;
++        for (unsigned int a = 0; a < r->anchor_count && filled < sizeof(prefix); a++) {
++            struct astra_ct_packet *p = astra_ct_anchor_packet(s, r->anchor_slots[a]);
++            uint8_t clear[188];
++            if (!p || p->run_serial != r->serial || !s->decrypt(s->opaque, k->word, p->bytes, clear) || (clear[3] & 0xc0)) { usable = 0; break; }
++            unsigned int offset = astra_ct_offset(clear); size_t copy = 188 - offset;
++            if (copy > sizeof(prefix) - filled) copy = sizeof(prefix) - filled;
++            memcpy(prefix + filled, clear + offset, copy); filled += copy;
++        }
++        enum astra_pes_evidence result = usable ? astra_pes_header(prefix, filled, r->type) : ASTRA_PES_INVALID;
++        if (result == ASTRA_PES_VALID) { chosen = i; matches++; possible_mask |= UINT64_C(1) << i; }
++        if (result == ASTRA_PES_UNKNOWN) { unknown++; possible_mask |= UINT64_C(1) << i; }
++    }
++    /* Retention is not eligibility. Even with zero VALID candidates, every
++     * UNKNOWN word remains pinned so eviction cannot manufacture evidence.
++     * The all-UNKNOWN case does not latch ambiguous_mask: a genuinely late
++     * new word must still be considered. Exactly one reference per retained
++     * bit is released only by explicit exclusion, confirmation or run death. */
++    uint64_t excluded = r->retained_mask & ~possible_mask;
++    uint64_t added = possible_mask & ~r->retained_mask;
++    for (unsigned int i = 0; i < ASTRA_CT_KEY_COUNT; i++) {
++        if (excluded & (UINT64_C(1) << i)) astra_ct_key_release(s, i);
++        if (added & (UINT64_C(1) << i)) s->keys[i].references++;
++    }
++    r->retained_mask = possible_mask;
++    if (r->ambiguous_mask) {
++        r->ambiguous_mask &= possible_mask;
++        if (!possible_mask) { r->failed = 5; return; }
++    }
++    if (matches == 1 && !unknown) {
++        for (unsigned int i = 0; i < ASTRA_CT_KEY_COUNT; i++) if (r->retained_mask & (UINT64_C(1) << i)) astra_ct_key_release(s, i);
++        r->ambiguous_mask = 0; r->retained_mask = 0;
++        r->confirmed = 1; r->key = chosen; s->keys[chosen].references++;
++        if (r->had_hold) s->stats.recovered_holds++;
++    } else if (matches >= 1 && matches + unknown > 1 && !r->ambiguous_mask) {
++        s->stats.ambiguous_probes++; r->ambiguous_mask = possible_mask;
++    }
++}
++static inline int astra_ciphertext_pump(struct astra_ciphertext *s, uint64_t now_ms, int finishing) {
++    if (s->output_failed) return 0;
++    if (now_ms >= s->next_gc_ms) {
++        s->next_gc_ms = now_ms + (s->wait_ms < 1000 ? s->wait_ms : 1000);
++        /* A removed PMT component may never produce another packet. Release
++         * only its idle PID-owner reference; queued ciphertext still pins the
++         * immutable run/key until emission or fail-closed discard. Returning
++         * after this same silence threshold already requires reanchoring. */
++        for (unsigned int i = 0; i < ASTRA_CT_RUN_COUNT; i++) {
++            struct astra_ct_run *r = &s->runs[i];
++            if (!r->present) continue;
++            struct astra_ct_pid *p = &s->pids[r->pid];
++            if (p->run == i && p->seen && now_ms - p->seen_ms >= s->wait_ms) {
++                p->run = ASTRA_CT_NONE; p->seen = 0; astra_ct_run_release(s, i);
++            }
++        }
++    }
++    if (s->probe_dirty) {
++        s->probe_dirty = 0;
++        for (unsigned int i = 0; i < ASTRA_CT_RUN_COUNT; i++) if (s->runs[i].present) astra_ct_probe(s, &s->runs[i], now_ms);
++    }
++    while (s->count) {
++        struct astra_ct_packet *p = &s->queue[s->head];
++        struct astra_ct_run *r = p->run == ASTRA_CT_NONE ? NULL : &s->runs[p->run];
++        if (r && (!r->present || r->serial != p->run_serial)) { s->output_failed = 1; return 0; }
++        if (r && !r->confirmed && !r->failed && !finishing && now_ms - p->received_ms < s->wait_ms) break;
++        if (r && !r->confirmed) {
++            unsigned int reason = r->failed ? r->failed : 1;
++            r->failed = reason; astra_ct_drop_head(s, reason); continue;
++        }
++        /* A later header cannot authenticate a same-parity prefix across a
++         * word/context/gap invalidation. Only a directly observed physical
++         * parity boundary permits retrospective release of continuation. */
++        if (r && !r->prefix_allowed && p->sequence < r->anchor_slots[0]) {
++            astra_ct_drop_head(s, 4); continue;
++        }
++        if (r && s->batch) {
++            unsigned int count = 0; uint16_t key_id = r->key;
++            while (count < s->batch_size && count < s->count) {
++                struct astra_ct_packet *item = &s->queue[(s->head + count) % s->capacity];
++                if (item->run == ASTRA_CT_NONE) break;
++                struct astra_ct_run *run = &s->runs[item->run];
++                if (!run->present || run->serial != item->run_serial || !run->confirmed || run->failed || run->key != key_id ||
++                    (!run->prefix_allowed && item->sequence < run->anchor_slots[0])) break;
++                memcpy(s->batch_raw[count++], item->bytes, 188);
++            }
++            if (!count || !s->batch(s->opaque, s->keys[key_id].word, s->batch_raw, s->batch_clear, count)) {
++                s->output_failed = 1; return 0;
++            }
++            for (unsigned int i = 0; i < count; i++) if (s->batch_clear[i][3] & 0xc0) { s->output_failed = 1; return 0; }
++            for (unsigned int i = 0; i < count; i++) {
++                if (!s->emit(s->opaque, s->batch_clear[i])) { s->output_failed = 1; return 0; }
++                p = &s->queue[s->head]; s->stats.packets_out++;
++                astra_ct_run_release(s, p->run);
++                s->head = (s->head + 1) % s->capacity; s->count--;
++            }
++            if (!s->count) s->head = 0;
++            s->stats.current_held_bytes = s->count * sizeof(*p); continue;
++        }
++        uint8_t clear[188]; const uint8_t *out = p->bytes;
++        if (r) {
++            if (!s->decrypt(s->opaque, s->keys[r->key].word, p->bytes, clear) || (clear[3] & 0xc0)) { r->failed = 1; r->confirmed = 0; continue; }
++            out = clear;
++        }
++        if (!s->emit(s->opaque, out)) { s->output_failed = 1; return 0; }
++        s->stats.packets_out++;
++        astra_ct_run_release(s, p->run);
++        s->head = (s->head + 1) % s->capacity; s->count--;
++        if (!s->count) s->head = 0;
++        s->stats.current_held_bytes = s->count * sizeof(*p);
++    }
++    return !s->output_failed;
++}
++static inline int astra_ciphertext_push(struct astra_ciphertext *s, const uint8_t packet[188], uint64_t now_ms) {
++    if (s->output_failed || !packet || packet[0] != 0x47 || (!s->deferred && !astra_ciphertext_pump(s, now_ms, 0))) return 0;
++    while (s->count == s->capacity) {
++        struct astra_ct_packet *head = &s->queue[s->head];
++        if (head->run != ASTRA_CT_NONE) { s->runs[head->run].confirmed = 0; s->runs[head->run].failed = 2; }
++        astra_ct_drop_head(s, 2);
++        if (!astra_ciphertext_pump(s, now_ms, 0)) return 0;
++    }
++    unsigned int pid = ((unsigned int)(packet[1] & 31) << 8) | packet[2];
++    unsigned int tsc = packet[3] >> 6, parity = tsc & 1, offset = astra_ct_offset(packet);
++    struct astra_ct_pid *p = &s->pids[pid]; uint16_t id = ASTRA_CT_NONE;
++    unsigned int control = (packet[3] >> 4) & 3;
++    if (p->type && ((packet[1] & 0x80) || tsc == 1 || control == 0 ||
++        ((control == 2 || control == 3) && packet[4] > 183))) {
++        astra_ct_run_release(s, p->run); p->run = ASTRA_CT_NONE; p->seen = 0;
++        s->stats.packets_in++; s->stats.packets_dropped++; return 1;
++    }
++    if (p->type && tsc > 1 && offset < 188 && !(packet[1] & 0x80)) {
++        if (p->seen && parity != p->parity && (!s->phase_seen || s->phase != parity)) {
++            s->phase_seen = 1; s->phase = parity; s->transition_revision++;
++        }
++        if (!s->phase_seen) { s->phase_seen = 1; s->phase = parity; }
++        unsigned int cc = packet[3] & 15;
++        int discontinuity = ((packet[3] & 0x20) && packet[4] && (packet[5] & 0x80));
++        /* A future half can be published while old same-parity media is
++         * still queued. It is a candidate, not a physical key boundary.
++         * Preserve an already certified continuous run until its own TSC/
++         * context boundary or next PUSI; that PUSI independently reprobes. */
++        int word_split = p->word_revision != s->word_revision[parity] &&
++            (p->run == ASTRA_CT_NONE || !s->runs[p->run].confirmed);
++        int split = !p->seen || p->run == ASTRA_CT_NONE || parity != p->parity || discontinuity ||
++            now_ms - p->seen_ms >= s->wait_ms || word_split ||
++            p->transition_revision != s->transition_revision || (cc != p->cc && cc != ((p->cc + 1) & 15));
++        if (!split && s->runs[p->run].failed) split = 1;
++        if (!split && !s->runs[p->run].confirmed && now_ms - s->runs[p->run].first_ms >= s->wait_ms) split = 1;
++        if (!split && (packet[1] & 0x40) && s->runs[p->run].confirmed) split = 1;
++        if (split) {
++            int prefix_allowed = p->seen && parity != p->parity && !discontinuity &&
++                now_ms - p->seen_ms < s->wait_ms && (cc == p->cc || cc == ((p->cc + 1) & 15));
++            astra_ct_new_run(s, pid, parity, prefix_allowed, now_ms);
++        }
++        id = p->run;
++        p->seen = 1; p->parity = parity; p->cc = cc; p->seen_ms = now_ms;
++        p->word_revision = s->word_revision[parity]; p->transition_revision = s->transition_revision;
++    } else if (p->type && tsc > 1) {
++        /* Never send a malformed/TEI encrypted selected packet as clear. */
++        s->stats.packets_in++; s->stats.packets_dropped++; return 1;
++    } else if (p->type && offset < 188 && p->seen) {
++        /* A clear/encrypted transition must not inherit an old certificate. */
++        astra_ct_run_release(s, p->run); p->run = ASTRA_CT_NONE; p->seen = 0;
++    }
++    struct astra_ct_packet *q = &s->queue[(s->head + s->count) % s->capacity];
++    memcpy(q->bytes, packet, 188); q->run = id; q->run_serial = id == ASTRA_CT_NONE ? 0 : s->runs[id].serial;
++    q->sequence = ++s->sequence; q->received_ms = now_ms; s->count++; s->stats.packets_in++;
++    s->stats.current_held_bytes = s->count * sizeof(*q);
++    if (s->stats.current_held_bytes > s->stats.peak_held_bytes) s->stats.peak_held_bytes = s->stats.current_held_bytes;
++    if (id != ASTRA_CT_NONE) {
++        struct astra_ct_run *r = &s->runs[id]; r->references++;
++        if (packet[1] & 0x40) { r->anchor_count = 0; r->anchor_bytes = 0; r->anchor_complete = 0; r->anchor_cc = packet[3] & 15; }
++        if (((packet[1] & 0x40) || (r->anchor_count && (packet[3] & 15) != r->anchor_cc)) && !r->anchor_complete && r->anchor_count < 19) {
++            unsigned int copy = 188 - offset;
++            if (copy > 19u - r->anchor_bytes) copy = 19u - r->anchor_bytes;
++            r->anchor_slots[r->anchor_count++] = q->sequence; r->anchor_bytes += copy;
++            r->anchor_cc = packet[3] & 15; r->anchor_complete = r->anchor_bytes == 19;
++        }
++        astra_ct_probe(s, r, now_ms);
++        if (!r->confirmed) { r->had_hold = 1; s->stats.held_packets++; }
++    } else if (p->type && tsc > 1) {
++        /* Run exhaustion is fail-closed, not an untagged clear-packet path. */
++        s->count--; s->sequence--; s->stats.current_held_bytes = s->count * sizeof(*q); s->stats.packets_dropped++;
++    }
++    return s->deferred ? 1 : astra_ciphertext_pump(s, now_ms, 0);
++}
++static inline int astra_ciphertext_finish(struct astra_ciphertext *s, uint64_t now_ms) {
++    return astra_ciphertext_pump(s, now_ms, 1);
++}
++#endif
+diff --git a/astra-ciphertext-probe.h b/astra-ciphertext-probe.h
+new file mode 100644
+index 0000000..6310a58
+--- /dev/null
++++ b/astra-ciphertext-probe.h
+@@ -0,0 +1,10 @@
++/* Private single-packet PES probes; no FFdecsa/global backend selection. */
++#ifndef ASTRA_CIPHERTEXT_PROBE_H
++#define ASTRA_CIPHERTEXT_PROBE_H
++#include <stdint.h>
++struct astra_ciphertext_probe;
++struct astra_ciphertext_probe *astra_ciphertext_probe_alloc(void);
++void astra_ciphertext_probe_free(struct astra_ciphertext_probe **probe);
++int astra_ciphertext_probe_decrypt(struct astra_ciphertext_probe *probe,
++    const uint8_t word[8], const uint8_t in[188], uint8_t out[188]);
++#endif
+diff --git a/astra-ciphertext-probe.c b/astra-ciphertext-probe.c
+new file mode 100644
+index 0000000..45414db
+--- /dev/null
++++ b/astra-ciphertext-probe.c
+@@ -0,0 +1,41 @@
++/* AstraDVB contributors, GPL-2.0-only.
++ * This separate TU deliberately never includes native csa.h. Enabling both
++ * native backend macros would run both decryptors and corrupt media. */
++#include <stdlib.h>
++#include <string.h>
++#include <dvbcsa/dvbcsa.h>
++#include "astra-ciphertext-probe.h"
++
++struct astra_ciphertext_probe {
++    dvbcsa_key_t *key;
++    uint8_t word[8];
++    int valid;
++};
++struct astra_ciphertext_probe *astra_ciphertext_probe_alloc(void) {
++    struct astra_ciphertext_probe *probe = calloc(1, sizeof(*probe));
++    if (!probe) return NULL;
++    probe->key = dvbcsa_key_alloc();
++    if (!probe->key) { free(probe); return NULL; }
++    return probe;
++}
++void astra_ciphertext_probe_free(struct astra_ciphertext_probe **pointer) {
++    if (!pointer || !*pointer) return;
++    struct astra_ciphertext_probe *probe = *pointer;
++    dvbcsa_key_free(probe->key);
++    memset(probe, 0, sizeof(*probe)); free(probe); *pointer = NULL;
++}
++int astra_ciphertext_probe_decrypt(struct astra_ciphertext_probe *probe,
++        const uint8_t word[8], const uint8_t in[188], uint8_t out[188]) {
++    if (!probe || !word || !in || !out || in[0] != 0x47 || (in[1] & 0x80) || (in[3] >> 6) < 2) return 0;
++    unsigned int control = (in[3] >> 4) & 3;
++    if (control != 1 && control != 3) return 0;
++    unsigned int offset = control == 3 ? 5u + in[4] : 4u;
++    if (offset >= 188) return 0;
++    if (!probe->valid || memcmp(probe->word, word, 8)) {
++        dvbcsa_key_set(word, probe->key); memcpy(probe->word, word, 8); probe->valid = 1;
++    }
++    memcpy(out, in, 188);
++    dvbcsa_decrypt(probe->key, out + offset, 188 - offset);
++    out[3] &= 0x3f;
++    return 1;
++}

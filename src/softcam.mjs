@@ -2,30 +2,45 @@ import { spawn } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
-export const NATIVE_CAS_POLICY_VERSION = 3;
+export const NATIVE_CAS_POLICY_VERSION = 5;
 export const NATIVE_CAS_SOURCE_REVISION = 'f4876e84cf1866645f84b93f830af67193c85f69';
 const nativeVerification = new Map();
+
+// Native safety telemetry is deliberately numeric and ordered. Never copy a
+// native log line (which could contain CAMD credentials) into the API/history.
+export function parseCiphertextStatus(line, sampledAt = Date.now()) {
+  if (typeof line !== 'string' || line.length > 16384 || !Number.isSafeInteger(sampledAt) || sampledAt < 0) return null;
+  const match = line.match(/(?:^|\s)CT \| heldBytes=(\d+) peakBytes=(\d+) dropped=(\d+) timeout=(\d+) capacity=(\d+) prefix=(\d+) recovered=(\d+) allocated=(\d+)\s*$/);
+  if (!match) return null;
+  const values = match.slice(1).map(Number);
+  if (!values.every(value => Number.isSafeInteger(value) && value >= 0)) return null;
+  const [heldBytes, peakBytes, dropped, timeout, capacity, prefix, recovered, allocated] = values;
+  if (allocated > 8 * 1024 * 1024 || heldBytes > allocated || peakBytes > allocated || heldBytes > peakBytes || timeout + capacity + prefix > dropped) return null;
+  return { heldBytes, peakBytes, dropped, timeout, capacity, prefix, recovered, allocated, sampledAt };
+}
 
 // A leftover patch marker does not prove which executable is running. Verify
 // the installed build once per executable/manifest identity, without exposing
 // native argv, credentials, keys, or provider data.
-export function protectedNativeBuild(binary = process.env.ASTRA_TSDECRYPT || '/usr/local/bin/tsdecrypt', manifestPath = process.env.ASTRA_NATIVE_CAS_MANIFEST || '/usr/local/share/licenses/tsdecrypt/astra-native-cas.json') {
+export function protectedNativeBuild(binary = process.env.ASTRA_TSDECRYPT || '/usr/local/bin/tsdecrypt', manifestPath = process.env.ASTRA_NATIVE_CAS_MANIFEST || '/usr/local/share/licenses/tsdecrypt/astra-native-cas.json', { allowExperimental = false } = {}) {
   try {
     const binaryStat = statSync(binary); const manifestStat = statSync(manifestPath);
+    if (!binaryStat.isFile() || !(binaryStat.mode & 0o111) || !manifestStat.isFile()) return false;
     const identity = [binaryStat.ino, binaryStat.size, binaryStat.mtimeMs, binaryStat.ctimeMs, manifestStat.ino, manifestStat.size, manifestStat.mtimeMs, manifestStat.ctimeMs].join(':');
-    const key = `${binary}\0${manifestPath}`; const cached = nativeVerification.get(key);
+    const key = `${binary}\0${manifestPath}\0${allowExperimental === true}`; const cached = nativeVerification.get(key);
     if (cached?.identity === identity) return cached.valid;
     if (manifestStat.size > 16384 || binaryStat.size > 32 * 1024 * 1024) return false;
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-    const valid = manifest.policyVersion === NATIVE_CAS_POLICY_VERSION && manifest.sourceRevision === NATIVE_CAS_SOURCE_REVISION && /^[a-f0-9]{64}$/.test(manifest.binarySha256 || '') && createHash('sha256').update(readFileSync(binary)).digest('hex') === manifest.binarySha256;
+    const releaseAllowed = manifest.experimental === undefined || manifest.experimental === false || (manifest.experimental === true && allowExperimental === true);
+    const valid = releaseAllowed && manifest.policyVersion === NATIVE_CAS_POLICY_VERSION && manifest.sourceRevision === NATIVE_CAS_SOURCE_REVISION && /^[a-f0-9]{64}$/.test(manifest.patchSetSha256 || '') && /^[a-f0-9]{64}$/.test(manifest.patches?.ciphertextSafety || '') && /^[a-f0-9]{64}$/.test(manifest.binarySha256 || '') && createHash('sha256').update(readFileSync(binary)).digest('hex') === manifest.binarySha256;
     if (nativeVerification.size >= 16) nativeVerification.clear();
     nativeVerification.set(key, { identity, valid }); return valid;
   } catch { return false; }
 }
 
-// Default to live decryption. The legacy native packet delay does not retain
-// a key epoch per packet: key updates can invalidate packets still waiting in
-// that queue. Keep the bounded override for diagnostics, not as late-key repair.
+// No fixed packet delay by default. Policy5's native adaptive ciphertext hold
+// is independent of this legacy diagnostic input-delay override; adding a
+// blanket delay is not a substitute for bounded per-run key validation.
 export function casInputBufferMs(value = process.env.ASTRA_CAS_INPUT_BUFFER_MS) {
   if (value === undefined || value === null || String(value).trim() === '') return 0;
   const milliseconds = Number(value);
@@ -65,7 +80,7 @@ export function formatTsdecryptCaid(value) {
 export class SoftcamBridge {
   constructor(stream, profile, connection, onData, logger, options = {}) {
     this.stream = stream; this.profile = profile; this.connection = connection; this.onData = onData; this.logger = logger; this.child = null; this.status = 'stopped'; this.lastOutputAt = 0; this.watchdog = null;
-    this.diagnostics = { outputPauses: 0, outputResumes: 0, cwFailures: 0, protocolErrors: 0, protocolReasons: {}, nativeInputOverflows: 0, inputQueueOverflows: 0, startupDroppedBytes: 0, inputBytes: 0, outputBytes: 0, inputHighWaterBytes: 0, maxOutputGapMs: 0, lastEvent: null }; this.stderrBuffer = '';
+    this.diagnostics = { outputPauses: 0, outputResumes: 0, cwFailures: 0, protocolErrors: 0, protocolReasons: {}, nativeInputOverflows: 0, inputQueueOverflows: 0, startupDroppedBytes: 0, inputBytes: 0, outputBytes: 0, inputHighWaterBytes: 0, maxOutputGapMs: 0, ciphertext: null, lastEvent: null }; this.stderrBuffer = '';
     this.spawnChild = options.spawnChild || spawn; this.protectedBuild = options.protectedBuild || protectedNativeBuild;
     this.setTimer = options.setTimer || setTimeout; this.clearTimer = options.clearTimer || clearTimeout;
     this.onDiscontinuity = options.onDiscontinuity || (() => {}); this.now = options.now || Date.now;
@@ -76,7 +91,7 @@ export class SoftcamBridge {
   start() {
     if (this.child || this.cancelStart || this.retryTimer) return;
     if (!this.connection) throw new Error(`Shared CAS connection for profile ${this.stream.cam.profile} is unavailable`);
-    if (!this.protectedBuild()) throw new Error('Install the verified native CAS policy v3 build with install-cas.sh before enabling CAS');
+    if (!this.protectedBuild()) throw new Error('Install the verified native CAS policy v5 build with install-cas.sh before enabling CAS');
     this.stopped = false; this.queueStart();
   }
 
@@ -102,13 +117,15 @@ export class SoftcamBridge {
     this.inputBufferMs = casInputBufferMs();
     const args = tsdecryptArgs(this.stream, this.profile, this.connection, this.inputBufferMs);
     const child = this.spawnChild(binary, args, { stdio: ['pipe', 'pipe', 'pipe'] }); this.child = child; this.status = 'connecting';
-    this.stderrBuffer = ''; this.healthySince = 0;
+    this.stderrBuffer = ''; this.healthySince = 0; this.diagnostics.ciphertext = null;
     if (this.startedBefore) { this.diagnostics.restarts++; this.diagnostics.lastRestartAt = this.now(); }
     this.startedBefore = true;
     child.stderr.on('data', (chunk) => {
       if (this.child !== child) return;
       const lines = (this.stderrBuffer + String(chunk)).split(/\r?\n/); this.stderrBuffer = lines.pop().slice(-16384);
       for (const line of lines) {
+        const ciphertext = parseCiphertextStatus(line, this.now());
+        if (ciphertext) { this.diagnostics.ciphertext = ciphertext; continue; }
         let event;
         if (/stopping output/.test(line)) { this.diagnostics.outputPauses++; event = 'native payload validation paused'; }
         else if (/Got decrypted data/.test(line)) { this.diagnostics.outputResumes++; event = 'decrypted payload resumed'; }

@@ -57,3 +57,19 @@ test('proxy recovery coordinates only native decoders without restarting inputs 
   assert.deepEqual(availability, [false, true]);
   assert.equal(clear.starts, 1); assert.equal(clear.stops, 0); assert.equal(encrypted.starts, 1); assert.equal(encrypted.stops, 0);
 });
+
+test('shutdown fences an active and queued reconciliation before new workers can start', async () => {
+  const { store, manager, proxy } = setup({ streams: [channel('existing')] });
+  await manager.start(); const existing = manager.get('existing');
+  let enter, release; const entered = new Promise(resolve => { enter = resolve; }), pending = new Promise(resolve => { release = resolve; }); let starts = 0, stops = 0;
+  proxy.start = async () => { starts++; enter(); await pending; return proxy.connections; };
+  proxy.stop = async () => { stops++; };
+  const applying = manager.reconcile(normalizeConfig({ ...store.value, streams: [channel('new')] })); await entered;
+  const queued = manager.reconcile(normalizeConfig({ ...store.value, streams: [channel('later')] }));
+  let finished = false; const stop = manager.stop().then(() => { finished = true; });
+  await Promise.resolve(); assert.equal(finished, false); assert.equal(existing.stops, 1); assert.equal(manager.workers.size, 0);
+  await assert.rejects(manager.reconcile(store.value), /stopping/);
+  release(); await Promise.all([applying, queued, stop]);
+  assert.equal(starts, 1); assert.equal(stops, 1); assert.equal(manager.workers.size, 0);
+  await manager.stop(); assert.equal(stops, 1);
+});

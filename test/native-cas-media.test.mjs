@@ -31,7 +31,9 @@ function checked(command, args, options = {}) {
 async function streamDecode(encrypted, fragmented, slowConsumer, requireBackpressure = false, options = {}) {
   /* Production suppression is intentionally enabled: --output-enc-pass would
    * hide false-PES suppression and fail-open invalid-key bugs from this test. */
-  const child = spawn(nativeBinary, ['--const-cw', options.word || TEST_CW, '--input-buffer', '0', '--ecm-no-log', '--no-output-filter', '--no-output-on-error', '--output-eit-pass', '--output-tdt-pass'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const bufferMs = options.inputBufferMs || 0;
+  assert.ok(Number.isSafeInteger(bufferMs) && bufferMs >= 0 && bufferMs <= 2000, 'Isolated finite media fixture buffer must be explicitly bounded');
+  const child = spawn(nativeBinary, ['--const-cw', options.word || TEST_CW, '--input-buffer', String(bufferMs), '--ecm-no-log', '--no-output-filter', '--no-output-on-error', '--output-eit-pass', '--output-tdt-pass'], { stdio: ['pipe', 'pipe', 'pipe'] });
   const exited = once(child, 'close');
   const chunks = [], errors = []; let backpressureEvents = 0;
   child.stderr.on('data', bytes => errors.push(bytes));
@@ -134,6 +136,11 @@ test('real native CSA preserves all A/V packets with fragmented stdin and slow o
     const gapOutput = avPackets(await streamDecode(encrypted, false, false, false, { inputGapAt: continuationGap(plain) }));
     assert.equal(gapOutput.length, expected.length, 'A legitimate arrival gap must not drop valid continuation packets');
     assert.equal(createHash('sha256').update(gapOutput).digest('hex'), expectedHash);
+    if (process.env.ASTRA_TEST_TSDECRYPT_EXPERIMENTAL === '1') {
+      const bufferedOutput = avPackets(await streamDecode(encrypted, true, false, false, { inputBufferMs: 2000 }));
+      assert.equal(bufferedOutput.length, expected.length, 'Finite 2-second native input buffer must drain its real EOF tail without padding or ignored packet loss');
+      assert.equal(createHash('sha256').update(bufferedOutput).digest('hex'), expectedHash, 'Every buffered A/V byte must survive native EOF');
+    }
     const wrongOutput = await streamDecode(encrypted, false, false, false, { word: WRONG_TEST_CW });
     assert.equal(avPackets(wrongOutput).length, 0, 'Wrong-CW selected PES must never be published as clear A/V');
     const joinOutput = await streamDecode(joinOnContinuation(plain, encrypted), false, false, false, { word: WRONG_TEST_CW });

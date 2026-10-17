@@ -8,10 +8,11 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const install = readFileSync(new URL('../install.sh', import.meta.url), 'utf8');
+const casInstall = readFileSync(new URL('../install-cas.sh', import.meta.url), 'utf8');
 const docker = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
 
 test('installers and Docker RUN commands parse without executing installation or a container build', () => {
-  for (const name of ['install.sh', 'install-cas.sh', 'bin/build-media-tcp.sh']) {
+  for (const name of ['install.sh', 'install-cas.sh', 'bin/build-media-tcp.sh', 'bin/run-cas-lab.sh']) {
     const result = spawnSync('bash', ['-n', `${root}${name}`], { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
   }
@@ -21,6 +22,31 @@ test('installers and Docker RUN commands parse without executing installation or
     const result = spawnSync('sh', ['-n'], { input: instruction.slice(4), encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
   }
+});
+
+test('CAS laboratory isolates network, devices, secrets and resources without touching the live service', () => {
+  const launcher = readFileSync(new URL('../bin/run-cas-lab.sh', import.meta.url), 'utf8');
+  const preflight = readFileSync(new URL('../bin/cas-lab-preflight.mjs', import.meta.url), 'utf8');
+  for (const property of ['PrivateNetwork=yes', 'PrivateTmp=yes', 'PrivateDevices=yes', 'ProtectSystem=strict', 'ProtectHome=yes', 'NoNewPrivileges=yes', 'CPUQuota=200%', 'MemoryMax=4G', 'MemorySwapMax=0', 'LimitCORE=0']) {
+    assert.ok(launcher.includes(property), `Lab must retain ${property}`);
+  }
+  assert.match(launcher, /InaccessiblePaths=\/etc\/astra-linux \/var\/lib\/astra-linux/);
+  assert.match(launcher, /Lab dispatched, not yet verified/);
+  assert.match(launcher, /exec \/usr\/bin\/node --test/);
+  assert.match(launcher, /faults:continuation-late\|faults:continuation-missing/);
+  assert.match(launcher, /ASTRA_CAS_LAB_COMPAT_CASES/);
+  assert.match(launcher, /faults:semantic-burst/);
+  assert.match(launcher, /faults:native-buffered-init-repeated/);
+  assert.match(launcher, /faults:semantic-scheduled-drop/);
+  assert.doesNotMatch(install, /oscam-semantic-scheduler\.experimental\.patch/);
+  assert.doesNotMatch(docker, /oscam-semantic-scheduler\.experimental\.patch/);
+  assert.doesNotMatch(launcher, /systemctl (?:stop|start|restart)|iptables|sysctl|modprobe/);
+  assert.match(preflight, /ASTRA_SECRET_KEY/);
+  assert.match(preflight, /\/dev\/dvb/);
+});
+
+test('container explicitly installs the OS lock required by persistent CAS budgets', () => {
+  assert.match(docker, /apt-get install[^\n]*\butil-linux\b/);
 });
 
 test('socket-scoped helper builds before activation without global TCP changes or elevated Node capabilities', () => {
@@ -33,18 +59,34 @@ test('socket-scoped helper builds before activation without global TCP changes o
   for (const source of [install, docker, builder]) assert.doesNotMatch(source, /setcap|sysctl|modprobe|CAP_NET_ADMIN/);
 });
 
-test('system and container installations require a verified policy-3 executable and include every native patch', () => {
+test('system and container installations require a verified policy-5 executable and include every normal native patch', () => {
   assert.match(install, /protectedNativeBuild\("\/usr\/local\/bin\/tsdecrypt", "\/usr\/local\/share\/licenses\/tsdecrypt\/astra-native-cas\.json"\)/);
   assert.doesNotMatch(install, /\[\[.*astra-ecm-protection\.patch/);
-  for (const name of ['tsdecrypt-emm-pid.patch', 'tsdecrypt-ecm-protection.patch', 'tsdecrypt-stream-io.patch', 'tsdecrypt-cw-threadsafe.patch', 'tsdecrypt-pes-validation.patch']) {
+  const patchNames = ['tsdecrypt-emm-pid.patch', 'tsdecrypt-ecm-protection.patch', 'tsdecrypt-stream-io.patch', 'tsdecrypt-cw-threadsafe.patch', 'tsdecrypt-pes-validation.patch', 'tsdecrypt-newcamd-lifetime.patch', 'tsdecrypt-ciphertext-safety.patch'];
+  assert.deepEqual(casInstall.match(/^patch_names=\(([^)]+)\)/m)?.[1].split(/\s+/), patchNames, 'Native installer patch and digest order is part of the manifest contract');
+  for (const name of patchNames) {
     assert.ok(docker.split(name).length >= 3, `Docker must copy and apply ${name}`);
   }
-  assert.match(docker, /policyVersion:3/); assert.match(docker, /binarySha256:hash/);
+  assert.match(casInstall, /"policyVersion":5/); assert.match(casInstall, /"ciphertextSafety":"%s"/); assert.match(casInstall, /\$\{patch_digests\[6\]\}/);
+  assert.match(docker, /policyVersion:5/); assert.match(docker, /binarySha256:hash/); assert.match(docker, /ciphertextSafety:digests\[6\]/);
+  for (const text of [casInstall, docker]) assert.doesNotMatch(text, /tsdecrypt-ciphertext-safety\.experimental\.patch/);
   assert.match(docker, /protectedNativeBuild\(\)/); assert.match(docker, /sourceDirectory:"\/usr\/local\/src\/tsdecrypt"/);
   assert.match(install, /protectedOscamBuild\("\/usr\/local\/bin\/oscam", "\/usr\/local\/share\/licenses\/oscam\/astra-native-oscam\.json"\)/);
   assert.match(install, /oscam_verified \|\| \{[^\n]*rollback_install 1;/);
   assert.match(docker, /oscam-newcamd-stream-io\.patch/);
-  assert.match(docker, /policyVersion:1/); assert.match(docker, /protectedOscamBuild\(\)/);
+  assert.match(docker, /policyVersion:2/); assert.match(docker, /semanticPolicyVersion:2/); assert.match(docker, /protectedOscamBuild\(\)/);
+});
+
+test('policy-5 packaging runs portable safety and real scalar CSA probe gates before native publication', () => {
+  for (const text of [casInstall, docker]) {
+    assert.match(text, /for fixture in native-ecm-policy native-cas-io native-pes-validation native-ciphertext-safety; do/);
+    assert.match(text, /native-ciphertext-probe\.c[^\n]*astra-ciphertext-probe\.c[^\n]*-ldvbcsa[^\n]*-o[^\n]*native-ciphertext-probe-test/);
+    assert.doesNotMatch(text, /-I[^\n]*experimental/);
+  }
+  const copies = docker.split('\n').find(line => line.startsWith('COPY test/native-ecm-policy.c'));
+  assert.match(copies, /test\/native-ciphertext-safety\.c/); assert.match(copies, /test\/native-ciphertext-probe\.c/);
+  assert.ok(casInstall.indexOf('"$source_dir/native-ciphertext-probe-test"') < casInstall.indexOf('binary_stage="$(mktemp'));
+  assert.ok(docker.indexOf('&& /tmp/astra-native-tests/native-ciphertext-probe-test') < docker.indexOf('&& install -m 0755 /usr/local/src/tsdecrypt/tsdecrypt'));
 });
 
 test('application upgrades compile off-line, preserve existing secrets, and stop before publishing the directory', () => {

@@ -9,6 +9,7 @@ import { DVBInputPool } from './dvb-shared.mjs';
 import { CASProxyManager } from './cas-proxy.mjs';
 import { StreamMetadata } from './si-metadata.mjs';
 import { PacketPool } from './packet-pool.mjs';
+import { ByteRateWindow } from './byte-rate.mjs';
 
 const wait = (ms, signal) => new Promise((resolve) => {
   const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
@@ -20,6 +21,32 @@ const wait = (ms, signal) => new Promise((resolve) => {
 const CAS_PROBE_PACKETS = 500;
 const CAS_SCRAMBLED_RATIO = 0.05;
 const CAS_BUFFER_BYTES = 512 * 1024;
+
+export function inputBitrateScope(input) {
+  try {
+    const url = new URL(input?.url);
+    const service = Number(url.searchParams.get('service'));
+    return url.protocol === 'dvb:' && Number.isInteger(service) && service > 0 && service <= 65535 ? 'dvb-service' : 'source-transport';
+  } catch { return 'source-transport'; }
+}
+
+function casPayloadEvidence(input, output, sourceScope, at, timeoutMs) {
+  const inputPids = (input.pids || []).slice(0, 32), outputPids = (output.pids || []).slice(0, 32);
+  const hasActivity = pid => Number.isFinite(pid.lastScrambledPayloadAt) && Number.isFinite(pid.lastClearPayloadAt);
+  const recent = time => Number.isFinite(time) && time > 0 && time <= at && at - time <= timeoutMs;
+  const complete = (metrics, pids) => Number.isInteger(metrics.pidCount) && metrics.pidCount === pids.length && pids.every(hasActivity);
+  const byPID = new Map(outputPids.map(pid => [pid.pid, pid]));
+  // DVB service input is filtered before this worker. An arbitrary HTTP/UDP
+  // source can be MPTS: never call its unrelated encrypted services missing.
+  const selectedDVB = sourceScope === 'dvb-service' && inputPids.length > 0 && complete(input, inputPids) && complete(output, outputPids);
+  const encrypted = inputPids.filter(pid => recent(pid.lastScrambledPayloadAt));
+  const expected = selectedDVB ? encrypted : encrypted.filter(pid => {
+    const previous = byPID.get(pid.pid);
+    return previous && hasActivity(previous) && previous.lastClearPayloadAt > 0;
+  });
+  return { scope: selectedDVB ? 'dvb-service' : expected.length ? 'previously-observed' : 'incomplete',
+    missingPids: expected.filter(pid => !recent(byPID.get(pid.pid)?.lastClearPayloadAt)).map(pid => pid.pid) };
+}
 
 export function scramblingStats(chunk) {
   let packets = 0; let scrambled = 0;
@@ -35,6 +62,7 @@ export class StreamWorker extends EventEmitter {
     super(); this.config = config; this.settings = settings; this.logger = logger;
     this.packetPool = packetPool; this.dataPlane = null;
     this.runningSince = null;
+    this.inputRate = new ByteRateWindow(); this.outputRate = new ByteRateWindow();
     this.analyzer = new MPEGTSAnalyzer(); this.inputAnalyzer = new MPEGTSAnalyzer(); this.epg = new EPGCollector({ serviceId: config.service?.serviceId || config.service?.id || 0 });
     this.framer = new TransportStreamFramer({ shared: Boolean(packetPool?.count) }); this.outputFramer = new TransportStreamFramer({ shared: Boolean(packetPool?.count) }); this.cam = null; this.camProfile = null; this.camConnection = null; this.casMode = 'disabled'; this.casBuffer = []; this.casBufferBytes = 0; this.casProbePackets = 0; this.casProbeScrambled = 0; this.casProfiles = casProfiles; this.casConnections = casConnections; this.adapters = adapters; this.dvbPool = dvbPool;
     this.hls = new HLSSegmenter({ segmentSeconds: settings.hlsSegmentSeconds, windowSegments: settings.hlsWindowSegments });
@@ -58,7 +86,7 @@ export class StreamWorker extends EventEmitter {
         sequence: () => this.hls.sequence,
         onSegment: segment => this.hls.appendSegment(segment),
         onData: data => { if (this.abort) this.#deliverProcessed(data); },
-        onGap: () => { this.runningSince = null; this.lastDataAt = 0; },
+        onGap: () => { this.runningSince = null; this.lastDataAt = 0; this.outputRate.reset(); },
       }, group);
       this.analyzer = this.dataPlane.analyzer; this.inputAnalyzer = this.dataPlane.inputAnalyzer; this.epg = this.dataPlane.epg;
     }
@@ -81,6 +109,7 @@ export class StreamWorker extends EventEmitter {
   }
   stop() {
     this.runningSince = null;
+    this.inputRate.reset(); this.outputRate.reset();
     this.abort?.abort(); this.abort = null; this.cam?.stop(); this.cam = null; this.camProfile = null; this.camConnection = null; this.casMode = 'disabled'; this.casBuffer = []; this.casBufferBytes = 0; this.casProbePackets = 0; this.casProbeScrambled = 0; this.hlsBridge?.stop(); this.hlsBridge = null; this.hlsFramer.reset(); this.outputs.forEach((output) => output.close()); this.outputs = []; this.state = 'stopped'; this.activeInput = -1;
     this.dataPlane?.close(); this.dataPlane = null;
     for (const client of this.clients) client.end(); this.clients.clear();
@@ -100,6 +129,7 @@ export class StreamWorker extends EventEmitter {
     const aligned = this.framer.push(chunk);
     if (!aligned.length) return;
     this.inputDataAt = Date.now();
+    this.inputRate.add(aligned.length, this.inputDataAt); this.outputRate.begin(this.inputDataAt);
     if (this.config.cam?.enabled) {
       if (this.dataPlane) this.dataPlane.push('input', aligned); else this.epg.push(aligned);
       this.#pushCAS(aligned); return;
@@ -151,8 +181,9 @@ export class StreamWorker extends EventEmitter {
   #deliverProcessed(aligned) {
     const input = this.config.inputs[this.activeInput];
     const timeout = input && isAdaptiveManifest(input.url) ? Math.max(30000, this.settings.inputTimeoutMs * 3) : this.settings.inputTimeoutMs;
-    if (!this.runningSince || Date.now() - this.lastDataAt > timeout) this.runningSince = Date.now();
-    this.lastDataAt = Date.now();
+    const at = Date.now();
+    if (!this.runningSince || at - this.lastDataAt > timeout) this.runningSince = at;
+    this.lastDataAt = at; this.outputRate.add(aligned.length, at);
     if (this.hlsBridge) this.hlsBridge.write(aligned);
     for (const output of this.outputs) output.send(aligned);
     for (const client of this.clients) {
@@ -165,6 +196,7 @@ export class StreamWorker extends EventEmitter {
     this.emit('data', aligned);
   }
   snapshot() {
+    const at = Date.now();
     const outputMetrics = this.analyzer.snapshot();
     const inputMetrics = this.inputAnalyzer.snapshot();
     const metrics = this.config.cam?.enabled && !outputMetrics.packets ? inputMetrics : outputMetrics;
@@ -173,20 +205,25 @@ export class StreamWorker extends EventEmitter {
       ? Math.max(30000, this.settings.inputTimeoutMs * 3)
       : this.settings.inputTimeoutMs;
     const activityAt = this.lastDataAt;
-    const stale = !activityAt || Date.now() - activityAt > staleTimeoutMs;
+    const stale = !activityAt || at - activityAt > staleTimeoutMs;
     const scrambled = metrics.packets >= 100 && metrics.scrambledPackets / metrics.packets >= 0.05;
     const casStatus = this.config.cam?.enabled ? (this.casMode === 'bypass' ? 'not-needed' : this.cam?.status || this.casMode) : null;
-    // Old clear output must not hide a current decryption outage. If encrypted
-    // input is still arriving but CAS output has stopped, report Scrambled;
-    // reserve Warning for an actual input/output stall without that evidence.
-    const inputFlowing = this.inputDataAt > 0 && Date.now() - this.inputDataAt <= staleTimeoutMs;
+    // Old clear media or fresh PSI/other audio must not hide a current key
+    // outage on a known required PID. Keep the stale transport fallback when
+    // PID coverage is incomplete; do not guess arbitrary MPTS membership.
+    const inputFlowing = this.inputDataAt > 0 && at - this.inputDataAt <= staleTimeoutMs;
     const encryptedInput = inputMetrics.packets >= 100 && inputMetrics.scrambledPackets / inputMetrics.packets >= 0.05;
-    const waitingForKeys = Boolean(this.config.cam?.enabled && this.casMode === 'descrambling' && stale && inputFlowing && encryptedInput);
+    const payloadEvidence = casPayloadEvidence(inputMetrics, outputMetrics, inputBitrateScope(activeInput), at, staleTimeoutMs);
+    const waitingForKeys = Boolean(this.config.cam?.enabled && this.casMode === 'descrambling' && inputFlowing &&
+      (payloadEvidence.missingPids.length || (payloadEvidence.scope !== 'dvb-service' && stale && encryptedInput)));
+    const displayCasStatus = waitingForKeys && (casStatus === 'descrambling' || casStatus === 'stalled') ? 'waiting-for-keys' : casStatus;
     const processingUnavailable = this.dataPlane && this.dataPlane.state !== 'running';
     const state = processingUnavailable && this.state === 'running' ? 'warning' : this.state === 'running' && ((scrambled && (!stale || inputFlowing)) || waitingForKeys) ? 'scrambled' : stale && this.state === 'running' ? 'warning' : this.state;
     const continuity = this.config.cam?.enabled ? { input: inputMetrics.continuityErrors, output: outputMetrics.continuityErrors } : null;
     const startedAt = !stale && this.state === 'running' ? this.runningSince : null;
-    return { id: this.config.id, name: this.config.name, enabled: this.config.enabled, state, startedAt: startedAt ? new Date(startedAt).toISOString() : null, uptimeSeconds: startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0, activeInput: this.activeInput, clients: this.clients.size, processing: this.dataPlane?.status() || null, cas: casStatus ? { profile: this.config.cam.profile, status: casStatus, continuity, diagnostics: this.cam?.diagnostics } : null, ...metrics };
+    return { id: this.config.id, name: this.config.name, enabled: this.config.enabled, state, startedAt: startedAt ? new Date(startedAt).toISOString() : null, uptimeSeconds: startedAt ? Math.floor((at - startedAt) / 1000) : 0, activeInput: this.activeInput, clients: this.clients.size, processing: this.dataPlane?.status() || null, cas: casStatus ? { profile: this.config.cam.profile, status: displayCasStatus, continuity, payloadEvidence, diagnostics: this.cam?.diagnostics } : null, ...metrics,
+      inputBitrateKbps: this.inputRate.snapshot(at), outputBitrateKbps: this.outputRate.snapshot(at),
+      inputBitrateScope: inputBitrateScope(activeInput), bitrateWindowMs: this.inputRate.windowMs };
   }
   async #loop(signal) {
     if (!this.config.inputs.length) { this.state = 'error'; this.logger.error(this.config.id, 'No inputs configured'); return; }
@@ -201,6 +238,7 @@ export class StreamWorker extends EventEmitter {
       this.metadata.reset(); this.hlsMetadata.reset();
       this.dataPlane?.control('reset');
       this.activeInput = inputIndex; this.state = 'connecting'; this.lastDataAt = 0; this.inputDataAt = 0;
+      this.inputRate.reset(); this.outputRate.reset();
       this.logger.info(this.config.id, `Connecting input #${inputIndex + 1}`);
       const startupTimeoutMs = usesFFmpegBridge(input.url, input) ? Math.max(30000, this.settings.inputTimeoutMs * 3) : this.settings.inputTimeoutMs;
       const runningTimeoutMs = isAdaptiveManifest(input.url) ? Math.max(30000, this.settings.inputTimeoutMs * 3) : this.settings.inputTimeoutMs;
@@ -227,22 +265,33 @@ export class StreamWorker extends EventEmitter {
 export class StreamManager {
   constructor(configStore, logger, options = {}) {
     this.packetPool = options.packetPool || new PacketPool(logger, options.workerFactory ? { count: 0 } : {});
-    this.store = configStore; this.logger = logger; this.workers = new Map(); this.dvbPool = options.dvbPool || new DVBInputPool(logger, { sharedTransport: Boolean(this.packetPool.count) }); this.casProxy = options.casProxy || new CASProxyManager(logger); this.workerFactory = options.workerFactory || ((...args) => new StreamWorker(...args)); this.reconcileQueue = Promise.resolve();
+    this.store = configStore; this.logger = logger; this.workers = new Map(); this.dvbPool = options.dvbPool || new DVBInputPool(logger, { sharedTransport: Boolean(this.packetPool.count) }); this.casProxy = options.casProxy || new CASProxyManager(logger); this.workerFactory = options.workerFactory || ((...args) => new StreamWorker(...args)); this.reconcileQueue = Promise.resolve(); this.stopping = false; this.stopPromise = null;
     this.casProxy.on?.('availability', available => { for (const worker of this.workers.values()) worker.cam?.setBackendAvailable?.(available); });
   }
   async start() { await this.reconcile(this.store.value); }
-  stop() { for (const worker of this.workers.values()) worker.stop(); this.workers.clear(); this.dvbPool.stop(); void this.casProxy.stop(); void this.packetPool.stop(); }
+  stop() {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopping = true;
+    for (const worker of this.workers.values()) worker.stop(); this.workers.clear(); this.dvbPool.stop();
+    this.stopPromise = Promise.allSettled([this.reconcileQueue, this.casProxy.stop(), this.packetPool.stop()]).then(results => {
+      const failed = results.slice(1).find(result => result.status === 'rejected'); if (failed) throw failed.reason;
+    });
+    return this.stopPromise;
+  }
   reconcile(config) {
+    if (this.stopping) return Promise.reject(new Error('Stream manager is stopping'));
     const work = this.reconcileQueue.catch(() => {}).then(() => this.#apply(config));
     this.reconcileQueue = work;
     return work;
   }
   async #apply(config) {
+    if (this.stopping) return;
     const profileIds = new Set(config.streams.filter((stream) => stream.enabled && stream.cam?.enabled).map((stream) => stream.cam.profile));
     // Keep configured, valid profile listeners stable even when their last
     // channel is removed, so channel CRUD never restarts shared CAS readers.
     const profiles = config.casProfiles.filter((profile) => profileIds.has(profile.id) || (profile.lineEncrypted && /^(?:0x)?[a-fA-F0-9]{4}$/.test(profile.caid)));
     const casConnections = await this.casProxy.start(profiles);
+    if (this.stopping) return;
     const desired = new Map(config.streams.map((stream) => {
       const adapterIds = new Set(stream.inputs.filter((input) => input.url.startsWith('dvb://')).map((input) => { try { return new URL(input.url).hostname; } catch { return ''; } }));
       const signature = JSON.stringify({ stream, settings: config.settings, adapters: config.adapters.filter((adapter) => adapterIds.has(adapter.id)), profile: stream.cam?.enabled ? config.casProfiles.find((profile) => profile.id === stream.cam.profile) : null, connection: stream.cam?.enabled ? casConnections.get(stream.cam.profile) : null });

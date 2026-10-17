@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { RingLogger } from '../src/logger.mjs';
-import { scramblingStats, StreamWorker } from '../src/stream-manager.mjs';
+import { inputBitrateScope, scramblingStats, StreamWorker } from '../src/stream-manager.mjs';
 import { mpegCRC32 } from '../src/mpeg-crc.mjs';
 
 function packet(pid, cc) {
@@ -16,6 +16,42 @@ function packet(pid, cc) {
 test('detects transport scrambling flags', () => {
   const clear = packet(256, 0); const scrambled = packet(256, 1); scrambled[3] |= 0x80;
   assert.deepEqual(scramblingStats(Buffer.concat([clear, scrambled])), { packets: 2, scrambled: 1 });
+});
+
+test('clear stream byte rates measure real source and output without a second input TS parse', t => {
+  let at = 1000; t.mock.method(Date, 'now', () => at);
+  const worker = new StreamWorker({ id: 'rates-clear', name: 'Clear', enabled: true, inputs: [{ url: 'udp://239.1.1.1:1234' }], outputs: [], hls: false }, { inputTimeoutMs: 1000 }, new RingLogger());
+  worker.state = 'running'; worker.activeInput = 0;
+  assert.equal(worker.snapshot().inputBitrateKbps, null);
+  worker.push(Buffer.concat(Array.from({ length: 1000 }, (_, i) => packet(256, i & 15))));
+  at = 2000;
+  const snapshot = worker.snapshot();
+  assert.equal(snapshot.inputBitrateKbps, 1504); assert.equal(snapshot.outputBitrateKbps, 1504);
+  assert.equal(snapshot.inputBitrateScope, 'source-transport'); assert.equal(snapshot.bitrateWindowMs, 5000);
+  assert.equal(worker.inputAnalyzer.snapshot().packets, 0);
+  at = 7000; assert.equal(worker.snapshot().inputBitrateKbps, 0); assert.equal(worker.snapshot().outputBitrateKbps, 0);
+  worker.stop(); assert.equal(worker.snapshot().inputBitrateKbps, null); assert.equal(worker.snapshot().outputBitrateKbps, null);
+});
+
+test('CAS Source IN stays measured when previously clear output stops; OUT is never replaced by IN', t => {
+  let at = 1000; t.mock.method(Date, 'now', () => at);
+  const worker = new StreamWorker({ id: 'rates-cas', name: 'CAS', enabled: true, inputs: [{ url: 'dvb://tuner?service=1' }], outputs: [], hls: false, cam: { enabled: false, profile: 'fixture' } }, { inputTimeoutMs: 1000 }, new RingLogger());
+  worker.state = 'running'; worker.activeInput = 0;
+  worker.push(Buffer.concat(Array.from({ length: 1000 }, (_, i) => packet(256, i & 15))));
+  worker.config.cam.enabled = true; worker.casMode = 'descrambling'; worker.cam = { status: 'stalled', write() {}, stop() {} };
+  const encrypted = Buffer.concat(Array.from({ length: 1000 }, (_, i) => { const p = packet(256, i & 15); p[3] |= 0x80; return p; }));
+  for (at = 2000; at <= 7000; at += 1000) worker.push(encrypted);
+  at = 7000;
+  const snapshot = worker.snapshot();
+  assert.ok(snapshot.inputBitrateKbps > 1000); assert.equal(snapshot.outputBitrateKbps, 0);
+  assert.equal(snapshot.inputBitrateScope, 'dvb-service'); assert.equal(snapshot.state, 'scrambled');
+  assert.ok(snapshot.bitrateKbps > 0, 'legacy cumulative analyzer field is preserved, not used as Source IN or OUT');
+  worker.stop();
+});
+
+test('source rate scope never claims an arbitrary multiplex is one selected channel', () => {
+  assert.equal(inputBitrateScope({ url: 'dvb://tuner?service=42' }), 'dvb-service');
+  for (const url of ['dvb://tuner', 'dvb://tuner?service=0', 'udp://239.1.1.1:1234', 'http://127.0.0.1/source.ts', 'bad']) assert.equal(inputBitrateScope({ url }), 'source-transport');
 });
 
 test('steady CAS delivery does not also retain a redundant startup replay buffer', () => {
@@ -39,11 +75,13 @@ test('broadcast EPG is collected while a native decoder has no clear output', ()
   assert.equal(worker.epg.snapshot(730).length, 1); assert.ok(worker.epg.lastReceivedAt);
 });
 
-test('reports lost decryption as scrambled after previously clear output, but retains real input-stall warnings', () => {
+test('reports lost decryption as scrambled after previously clear output, but retains real input-stall warnings', t => {
+  let at = 1000; t.mock.method(Date, 'now', () => at);
   const worker = new StreamWorker({ id: 'cas-state', name: 'CAS state', enabled: true, inputs: [{ url: 'dvb://tuner?service=1' }], outputs: [], hls: false, cam: { enabled: true, profile: 'provider' } }, { inputTimeoutMs: 1000 }, new RingLogger());
   worker.state = 'running'; worker.activeInput = 0; worker.casMode = 'descrambling';
   worker.cam = { status: 'stalled', diagnostics: {} };
   worker.analyzer.push(Buffer.concat(Array.from({ length: 120 }, (_, i) => packet(256, i & 15))));
+  at = 3000;
   worker.inputAnalyzer.push(Buffer.concat(Array.from({ length: 120 }, (_, i) => { const p = packet(256, i & 15); p[3] |= 0x80; return p; })));
   worker.lastDataAt = Date.now() - 2000; worker.inputDataAt = Date.now();
   assert.equal(worker.snapshot().state, 'scrambled');
@@ -57,6 +95,72 @@ test('reports lost decryption as scrambled after previously clear output, but re
   assert.equal(worker.snapshot().state, 'running');
   worker.lastDataAt = Date.now() - 2000; worker.casMode = 'bypass';
   assert.equal(worker.snapshot().state, 'warning');
+});
+
+test('fresh PSI or clear audio cannot hide withheld encrypted DVB video, and media recovery clears that evidence', t => {
+  let at = 1000; t.mock.method(Date, 'now', () => at);
+  const worker = new StreamWorker({ id: 'psi-only', name: 'PSI only', enabled: true, inputs: [{ url: 'dvb://tuner?service=1' }], outputs: [], hls: false, cam: { enabled: true, profile: 'fixture' } }, { inputTimeoutMs: 1000 }, new RingLogger());
+  worker.state = 'running'; worker.activeInput = 0; worker.casMode = 'descrambling';
+  worker.cam = { status: 'descrambling', write() {}, stop() {} };
+  const encryptedVideo = packet(256, 0); encryptedVideo[3] |= 0x80;
+  worker.push(encryptedVideo);
+  worker.analyzer.push(Buffer.concat([packet(0, 0), packet(17, 0), packet(18, 0)])); worker.lastDataAt = at;
+  let snapshot = worker.snapshot();
+  assert.equal(snapshot.state, 'scrambled'); assert.equal(snapshot.cas.status, 'waiting-for-keys');
+  assert.deepEqual(snapshot.cas.payloadEvidence, { scope: 'dvb-service', missingPids: [256] });
+  assert.equal(worker.cam.status, 'descrambling', 'Presentation must not mutate bridge lifecycle state');
+  at = 1500; worker.analyzer.push(packet(256, 0)); worker.lastDataAt = at;
+  assert.equal(worker.snapshot().state, 'running'); assert.equal(worker.snapshot().cas.status, 'descrambling');
+  at = 3000; worker.push(Buffer.concat([encryptedVideo, packet(257, 0)]));
+  worker.analyzer.push(Buffer.concat([packet(0, 1), packet(257, 0)])); worker.lastDataAt = at;
+  snapshot = worker.snapshot(); assert.equal(snapshot.state, 'scrambled'); assert.deepEqual(snapshot.cas.payloadEvidence.missingPids, [256]);
+  at = 3200; worker.analyzer.push(packet(256, 1)); worker.lastDataAt = at;
+  assert.equal(worker.snapshot().state, 'running'); assert.deepEqual(worker.snapshot().cas.payloadEvidence.missingPids, []);
+  at = 5000; assert.equal(worker.snapshot().state, 'warning', 'No source input is not evidence of a current key outage');
+  worker.stop();
+});
+
+test('clear CAS bypass and scheduled startup do not inherit encrypted-media waiting state', t => {
+  let at = 1000; t.mock.method(Date, 'now', () => at);
+  const worker = new StreamWorker({ id: 'clear-cas', name: 'Clear CAS', enabled: true, inputs: [{ url: 'dvb://tuner?service=1' }], outputs: [], hls: false, cam: { enabled: true, profile: 'fixture' } }, { inputTimeoutMs: 1000 }, new RingLogger());
+  worker.state = 'running'; worker.activeInput = 0; worker.casMode = 'bypass';
+  worker.push(Buffer.concat(Array.from({ length: 500 }, (_, i) => packet(256, i & 15))));
+  assert.equal(worker.snapshot().state, 'running'); assert.equal(worker.snapshot().cas.status, 'not-needed');
+  worker.casMode = 'descrambling'; worker.cam = { status: 'scheduled', write() {}, stop() {} };
+  worker.state = 'starting'; const encrypted = packet(256, 0); encrypted[3] |= 0x80; at = 3000; worker.push(encrypted);
+  assert.equal(worker.snapshot().state, 'starting'); assert.equal(worker.snapshot().cas.status, 'scheduled');
+  worker.state = 'running';
+  for (const status of ['scheduled', 'connecting', 'recovering', 'waiting-for-proxy']) {
+    worker.cam.status = status;
+    assert.equal(worker.snapshot().state, 'scrambled'); assert.equal(worker.snapshot().cas.status, status);
+  }
+  worker.stop();
+});
+
+test('MPTS checks only previously clear output PIDs, not unrelated encrypted input services', t => {
+  let at = 1000; t.mock.method(Date, 'now', () => at);
+  const worker = new StreamWorker({ id: 'mpts', name: 'MPTS', enabled: true, service: { serviceId: 1 }, inputs: [{ url: 'udp://239.1.1.1:1234' }], outputs: [], hls: false, cam: { enabled: true, profile: 'fixture' } }, { inputTimeoutMs: 1000 }, new RingLogger());
+  worker.state = 'running'; worker.activeInput = 0; worker.casMode = 'descrambling'; worker.cam = { status: 'descrambling', write() {}, stop() {} };
+  const encrypted = pid => { const p = packet(pid, 0); p[3] |= 0x80; return p; };
+  worker.push(Buffer.concat([encrypted(256), encrypted(300)]));
+  worker.analyzer.push(packet(0, 0)); worker.lastDataAt = at;
+  assert.deepEqual(worker.snapshot().cas.payloadEvidence, { scope: 'incomplete', missingPids: [] });
+  worker.analyzer.push(packet(256, 0));
+  let snapshot = worker.snapshot(); assert.equal(snapshot.state, 'running');
+  assert.deepEqual(snapshot.cas.payloadEvidence, { scope: 'previously-observed', missingPids: [] });
+  at = 3000; worker.push(Buffer.concat([encrypted(256), encrypted(300)]));
+  worker.analyzer.push(Buffer.concat([packet(0, 1), packet(257, 0)])); worker.lastDataAt = at;
+  snapshot = worker.snapshot(); assert.equal(snapshot.state, 'scrambled'); assert.deepEqual(snapshot.cas.payloadEvidence.missingPids, [256]);
+  worker.analyzer.push(packet(256, 1)); assert.equal(worker.snapshot().state, 'running');
+  worker.stop();
+});
+
+test('legacy or incomplete PID snapshots keep the input-flow/stale-output fallback', () => {
+  const worker = new StreamWorker({ id: 'legacy', name: 'Legacy', enabled: true, inputs: [{ url: 'dvb://tuner?service=1' }], outputs: [], hls: false, cam: { enabled: true, profile: 'fixture' } }, { inputTimeoutMs: 1000 }, new RingLogger());
+  worker.state = 'running'; worker.activeInput = 0; worker.casMode = 'descrambling'; worker.inputDataAt = Date.now(); worker.lastDataAt = Date.now() - 2000;
+  worker.inputAnalyzer = { snapshot: () => ({ packets: 100, scrambledPackets: 100, continuityErrors: 0, pids: [{ pid: 256, packets: 100 }] }) };
+  worker.analyzer = { snapshot: () => ({ packets: 100, scrambledPackets: 0, continuityErrors: 0, pids: [{ pid: 256, packets: 100 }] }) };
+  assert.equal(worker.snapshot().state, 'scrambled'); assert.equal(worker.snapshot().cas.payloadEvidence.scope, 'incomplete');
 });
 
 test('disconnects stalled relay clients without accumulating drain listeners', () => {

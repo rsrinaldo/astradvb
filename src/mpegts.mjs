@@ -47,7 +47,7 @@ export class MPEGTSAnalyzer {
     const adaptation = (packet[offset + 3] >> 4) & 0x03;
     const cc = packet[offset + 3] & 0x0f;
     const hasPayload = adaptation === 1 || adaptation === 3;
-    const stat = this.pidStats.get(pid) || { packets: 0, continuityErrors: 0, duplicatePackets: 0, discontinuities: 0, teiPackets: 0, malformedPackets: 0, lastCC: null, payload: null, payloadLength: 0 };
+    const stat = this.pidStats.get(pid) || { packets: 0, continuityErrors: 0, duplicatePackets: 0, discontinuities: 0, teiPackets: 0, malformedPackets: 0, lastScrambledPayloadAt: 0, lastClearPayloadAt: 0, lastCC: null, payload: null, payloadLength: 0 };
     stat.packets += 1;
     const tei = Boolean(packet[offset + 1] & 0x80);
     const adaptationLength = adaptation === 2 || adaptation === 3 ? packet[offset + 4] : 0;
@@ -63,6 +63,12 @@ export class MPEGTSAnalyzer {
     const discontinuity = (adaptation === 2 || adaptation === 3) && adaptationLength > 0 && Boolean(packet[offset + 5] & 0x80);
     if (discontinuity) { stat.lastCC = null; stat.discontinuities++; this.discontinuities++; }
     if (pid !== 0x1fff) {
+      // The existing parse already establishes a valid payload. Reuse the
+      // chunk timestamp: PSI on a different PID cannot prove media progress.
+      if (hasPayload) {
+        if (scrambling === 0) stat.lastClearPayloadAt = this.lastPacketAt;
+        else if (scrambling === 2 || scrambling === 3) stat.lastScrambledPayloadAt = this.lastPacketAt;
+      }
       const payloadOffset = offset + (adaptation === 3 ? 5 + adaptationLength : 4);
       let error = false;
       if (hasPayload && stat.lastCC !== null) {
@@ -88,7 +94,7 @@ export class MPEGTSAnalyzer {
 
   snapshot() {
     const elapsed = Math.max(1, Date.now() - this.startedAt);
-    const pids = [...this.pidStats.entries()].map(([pid, value]) => ({ pid, packets: value.packets, continuityErrors: value.continuityErrors, duplicatePackets: value.duplicatePackets, discontinuities: value.discontinuities, teiPackets: value.teiPackets, malformedPackets: value.malformedPackets })).sort((a, b) => b.packets - a.packets);
+    const pids = [...this.pidStats.entries()].map(([pid, value]) => ({ pid, packets: value.packets, continuityErrors: value.continuityErrors, duplicatePackets: value.duplicatePackets, discontinuities: value.discontinuities, teiPackets: value.teiPackets, malformedPackets: value.malformedPackets, lastScrambledPayloadAt: value.lastScrambledPayloadAt, lastClearPayloadAt: value.lastClearPayloadAt })).sort((a, b) => b.packets - a.packets);
     return {
       bitrateKbps: Math.round((this.bytes * 8) / elapsed),
       bytes: this.bytes,

@@ -1,8 +1,22 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildOscamConfiguration, CASProxyManager } from '../src/cas-proxy.mjs';
+import { buildOscamConfiguration, CASProxyManager, groupCasProfiles, parseSemanticStatus } from '../src/cas-proxy.mjs';
 import { RingLogger } from '../src/logger.mjs';
 import { encryptSecret } from '../src/secrets.mjs';
+
+test('semantic telemetry retains exact numeric fields only, never raw child output', () => {
+  const line = 'raw-reader-context astra semantic status: port=23456 generation=1 queued=85 aliases=0 sent=32 peak=32 dispatched=32 matched=0 coalesced=0 expired=0 rejected=0 resets=0 abandoned=0 closes=0 oldestMs=4000 resetReason=0';
+  const parsed = parseSemanticStatus(line);
+  assert.equal(parsed.sent, 32); assert.equal(parsed.port, 23456);
+  assert.equal(JSON.stringify(parsed).includes('raw-reader-context'), false);
+  assert.equal(parseSemanticStatus(line + ' password=DO-NOT-RETAIN'), null);
+  assert.equal(parseSemanticStatus(line.replace('sent=32', 'sent=NaN')), null);
+  assert.equal(parseSemanticStatus(line.replace('queued=85', 'queued=9007199254740993')), null);
+  assert.equal(parseSemanticStatus(line.replace('port=23456', 'port=0')), null);
+  assert.equal(parseSemanticStatus(line.replace('resetReason=0', 'resetReason=4')), null);
+  assert.equal(parseSemanticStatus(line.replace('resetReason=0', 'resetReason=3')).resetReason, 3);
+  assert.equal(parseSemanticStatus(line.replace('status:', 'reset:')).generation, 1);
+});
 
 test('retains a running shared CAS process and its connections for unchanged profiles', async () => {
   const proxy = new CASProxyManager(new RingLogger()); const profile = { id: 'provider', lineEncrypted: 'configured', caid: '0B00' };
@@ -49,4 +63,16 @@ test('permits the intentional loopback guard path without opening the downstream
   assert.match(guarded.conf, /^allowed = 127\.0\.0\.1$/m);
   assert.match(guarded.user, /^hostname = 127\.0\.0\.1$/m);
   assert.doesNotMatch(buildOscamConfiguration(profiles).conf, /block_same_ip/);
+});
+
+test('equivalent profiles share an opaque account identity without password-based budget resets', () => {
+  process.env.ASTRA_SECRET_KEY = '55'.repeat(32);
+  const profile = (id, host = 'provider.test', password = 'fake') => ({ id, caid: '0B00', lineEncrypted: encryptSecret(`${host} 15000 subscriber ${password} 0102030405060708091011121314`) });
+  const grouped = groupCasProfiles([profile('one'), profile('two', 'PROVIDER.TEST.')]);
+  assert.equal(grouped.length, 1); assert.deepEqual(grouped[0].aliasIds, ['one', 'two']);
+  assert.match(grouped[0].accountId, /^[a-f0-9]{64}$/);
+  assert.equal(grouped[0].accountId, groupCasProfiles([profile('rotated', 'provider.test', 'new-fake')])[0].accountId);
+  assert.notEqual(grouped[0].accountId, groupCasProfiles([{ ...profile('different'), lineEncrypted: encryptSecret('provider.test 15000 another fake 0102030405060708091011121314') }])[0].accountId);
+  assert.throws(() => groupCasProfiles([profile('one'), profile('two', 'provider.test', 'conflict')]), /same CAID and credentials/);
+  assert.throws(() => groupCasProfiles([profile('one'), { ...profile('two'), caid: '0500' }]), /same CAID and credentials/);
 });
