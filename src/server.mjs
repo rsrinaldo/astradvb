@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { ConfigStore, normalizeStream } from './config.mjs';
 import { RingLogger } from './logger.mjs';
 import { StreamManager } from './stream-manager.mjs';
-import { formatPlaylist, playlistEntries, streamAliases } from './playlist.mjs';
+import { formatPlaylist, playlistEntries, StreamAliasIndex } from './playlist.mjs';
 import { DailyEPGPublisher } from './epg-publisher.mjs';
 import { encryptSecret } from './secrets.mjs';
 import { RelaySessions } from './sessions.mjs';
@@ -53,6 +53,7 @@ const networkSampling = setInterval(() => { void network.sample(); }, 2000); net
 const startedAt = Date.now();
 const sessions = new RelaySessions();
 const sseClients = new Set();
+const aliasIndex = new StreamAliasIndex();
 let adapterCache = { expires: 0, value: [] };
 let adapterStatusPending = null;
 const adapterScans = new Set();
@@ -68,6 +69,8 @@ function json(response, status, value) {
 }
 
 function error(response, status, message) {
+  if (response.destroyed || response.writableEnded) return;
+  if (response.headersSent) { response.destroy(); return; }
   if (response.req && !mediaSocket(response.req, false)) return;
   json(response, status, { error: message });
 }
@@ -132,6 +135,7 @@ function status() {
     resources: resources.value,
     network: network.value,
     processing: manager.packetPool.status(),
+    mediaCache: manager.mediaCacheSnapshot(),
     httpDelivery: deliverySnapshot(),
     epg: { ...manager.epgStatus(), publication: epgPublisher.status },
   };
@@ -140,12 +144,11 @@ function status() {
 function resolveWorker(key) {
   const direct = manager.get(key);
   if (direct) return direct;
-  const aliases = streamAliases(store.value.streams);
-  const stream = store.value.streams.find((item) => aliases.get(item.id) === key);
-  return stream ? manager.get(stream.id) : null;
+  return manager.get(aliasIndex.resolve(store.value.streams, key));
 }
 
 function broadcast(event, data) {
+  if (!sseClients.size) return;
   const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const response of sseClients) {
     if (!auth.byId(response.authSessionId)) { sseClients.delete(response); response.end(); continue; }
@@ -155,7 +158,7 @@ function broadcast(event, data) {
 }
 
 function openRelay(request, response, worker) {
-  if (!worker || !worker.config.http) return error(response, 404, 'HTTP relay is disabled');
+  if (!worker?.config.enabled || !worker.config.http) return error(response, 404, 'HTTP relay is disabled');
   if (!mediaSocket(request, true)) return;
   response.writeHead(200, { 'content-type': 'video/mp2t', 'cache-control': 'no-store', connection: 'keep-alive', 'x-content-type-options': 'nosniff' });
   sessions.track(request, response, worker.config.id);
@@ -174,7 +177,9 @@ async function serveStatic(response, pathname, head = false) {
 }
 
 const server = http.createServer(async (request, response) => {
-  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  let url;
+  try { url = new URL(request.url, `http://${request.headers.host || 'localhost'}`); }
+  catch { return error(response, 400, 'Invalid request URL'); }
   const path = url.pathname;
   try {
     const scope = mediaScope(request.method, path);
@@ -254,12 +259,13 @@ const server = http.createServer(async (request, response) => {
       let access;
       try { access = normalizeAccess(await body(request, 32768)); } catch (caught) { return error(response, 400, caught.message); }
       const nextPolicy = new AccessPolicy(access);
-      await store.save({ ...store.value, access }); accessPolicy = nextPolicy;
+      await store.update(current => ({ ...current, access })); accessPolicy = nextPolicy;
       const disconnectedSessions = sessions.disconnectWhere(entry => !accessPolicy.allows('streaming', entry.ip));
       logger.info('security', 'Streaming and EPG IP restrictions updated');
       return json(response, 200, { ...access, clientIP: clientIP(request.socket.remoteAddress), disconnectedSessions });
     }
     if (request.method === 'GET' && path === '/api/events') {
+      if (sseClients.size >= 100) return error(response, 429, 'Too many dashboard event connections');
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       response.authSessionId = session.id;
       response.write(`event: status\ndata: ${JSON.stringify(status())}\n\n`); sseClients.add(response); response.on('close', () => sseClients.delete(response)); return;
@@ -269,15 +275,18 @@ const server = http.createServer(async (request, response) => {
     if (request.method === 'GET' && play) return openRelay(request, response, resolveWorker(play[1]));
     const playlist = path.match(/^\/hls\/([a-zA-Z0-9_-]+)\/index\.m3u8$/);
     if (request.method === 'GET' && playlist) {
-      const worker = resolveWorker(playlist[1]); if (!worker?.config.hls) return error(response, 404, 'HLS is disabled');
+      const worker = resolveWorker(playlist[1]); if (!worker?.config.enabled || !worker.config.hls) return error(response, 404, 'HLS is disabled');
       if (!mediaSocket(request, true)) return;
+      worker.touchHLS();
+      if (!worker.hls.segments.length) { response.setHeader('retry-after', '1'); return error(response, 503, 'HLS is starting; retry shortly'); }
       const text = worker.hls.playlist(`/hls/${playlist[1]}`); response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-store' }); response.end(text); return;
     }
     const segment = path.match(/^\/hls\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9-]+)\.ts$/);
     if (request.method === 'GET' && segment) {
       const worker = resolveWorker(segment[1]);
-      const media = worker?.config.hls && worker.hls.getSegment(segment[2]); if (!media) return error(response, 404, 'Segment not found');
+      const media = worker?.config.enabled && worker.config.hls && worker.hls.getSegment(segment[2]); if (!media) return error(response, 404, 'Segment not found');
       if (!mediaSocket(request, true)) return;
+      worker.touchHLS();
       const { data } = media;
       const segmentSeconds = Math.max(worker.hls.segmentMs / 1000, ...worker.hls.segments.map(item => item.duration));
       sessions.trackHLS(request, response, worker.config.id, { segmentSeconds });
@@ -341,20 +350,26 @@ const server = http.createServer(async (request, response) => {
       const removed = await manager.remove(streamRoute[1]); return removed ? json(response, 200, { removed: true }) : error(response, 404, 'Stream not found');
     }
     if (request.method === 'PUT' && path === '/api/settings') {
-      const next = await store.save({ ...store.value, settings: { ...store.value.settings, ...(await body(request)) } }); await manager.reconcile(next); return json(response, 200, next.settings);
+      const settings = await body(request);
+      const next = await store.update(current => ({ ...current, settings: { ...current.settings, ...settings } })); logger.setLimit(next.settings.logLimit); await manager.reconcile(next); return json(response, 200, next.settings);
     }
     if (request.method === 'PUT' && path === '/api/adapters') {
-      const next = await store.save({ ...store.value, adapters: (await body(request)).adapters || [] }); adapterCache.expires = 0; await manager.reconcile(next); return json(response, 200, { adapters: await adapterStatus(true) });
+      const adapters = (await body(request)).adapters || [];
+      const next = await store.update(current => ({ ...current, adapters })); adapterCache.expires = 0; await manager.reconcile(next); return json(response, 200, { adapters: await adapterStatus(true) });
     }
     if (request.method === 'PUT' && path === '/api/cas-profiles') {
-      const incoming = (await body(request)).profiles || []; const existing = new Map(store.value.casProfiles.map((profile) => [profile.id, profile]));
-      const profiles = incoming.map((profile) => {
-        let lineEncrypted = existing.get(profile.id)?.lineEncrypted || '';
-        if (profile.line) { parseNewcamdLine(profile.line); lineEncrypted = encryptSecret(profile.line); }
-        if (!lineEncrypted) throw new Error(`Credentials required for CAS profile ${profile.id}`);
-        return { ...profile, lineEncrypted };
+      const incoming = (await body(request)).profiles || [];
+      const next = await store.update(current => {
+        const existing = new Map(current.casProfiles.map(profile => [profile.id, profile]));
+        const profiles = incoming.map(profile => {
+          let lineEncrypted = existing.get(profile.id)?.lineEncrypted || '';
+          if (profile.line) { parseNewcamdLine(profile.line); lineEncrypted = encryptSecret(profile.line); }
+          if (!lineEncrypted) throw new Error(`Credentials required for CAS profile ${profile.id}`);
+          return { ...profile, lineEncrypted };
+        });
+        return { ...current, casProfiles: profiles };
       });
-      const next = await store.save({ ...store.value, casProfiles: profiles }); await manager.reconcile(next);
+      await manager.reconcile(next);
       return json(response, 200, { profiles: next.casProfiles.map(({ lineEncrypted, ...profile }) => ({ ...profile, configured: Boolean(lineEncrypted) })) });
     }
     error(response, 404, 'Not found');
@@ -364,7 +379,7 @@ const server = http.createServer(async (request, response) => {
 });
 httpDelivery.configureServer(server);
 
-const heartbeat = setInterval(async () => { sessions.prune(); await resources.sample(); broadcast('status', status()); }, 2000);
+const heartbeat = setInterval(async () => { sessions.prune(); manager.maintainMedia(); await resources.sample(); if (sseClients.size) broadcast('status', status()); }, 2000);
 const epgMaintenance = setInterval(() => manager.maintainEPG(), 60000); epgMaintenance.unref();
 const epgPublication = setInterval(() => { void epgPublisher.tick(); }, 60000); epgPublication.unref();
 const casHistoryPath = join(dirname(store.path), 'cas-request-history.json');

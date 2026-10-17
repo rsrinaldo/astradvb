@@ -21,7 +21,8 @@ export class SISectionAssembler {
   push(packet) {
     const control = (packet[3] >> 4) & 3;
     if (packet[1] & 0x80 || packet[3] & 0xc0) { this.reset(); return []; }
-    const discontinuity = control === 3 && packet[4] > 0 && (packet[5] & 0x80);
+    if (control === 0 || (control === 2 && packet[4] !== 183) || (control === 3 && packet[4] > 182)) { this.reset(); return []; }
+    const discontinuity = (control === 2 || control === 3) && packet[4] > 0 && (packet[5] & 0x80);
     if (discontinuity) this.reset();
     if (control !== 1 && control !== 3) return [];
     const offset = control === 3 ? 5 + packet[4] : 4;
@@ -130,13 +131,20 @@ function eventDescriptors(data) {
 }
 
 export class StreamMetadata {
-  constructor(name, serviceId = 0, onEPG = () => {}) {
+  constructor(name, serviceId = 0, onEPG = () => {}, createData = Buffer.concat) {
     this.name = String(name || 'Channel'); this.configuredServiceId = Number(serviceId) || 0; this.onEPG = onEPG;
+    this.createData = createData;
     this.reset();
   }
   reset() {
     this.serviceId = this.configuredServiceId; this.transportId = null; this.networkId = null;
     this.assemblers = new Map([0, 17, 18].map((pid) => [pid, new SISectionAssembler()]));
+    // Foreign EIT is dropped, not rewritten. Reject it before the CRC/decode
+    // work, using precisely the same selection as #eit below.
+    this.assemblers.get(18).acceptSection = section => section.length >= 18 &&
+      (section[0] === 0x4e || (section[0] >= 0x50 && section[0] <= 0x5f)) &&
+      (!this.serviceId || section.readUInt16BE(3) === this.serviceId) &&
+      (this.transportId === null || section.readUInt16BE(8) === this.transportId);
     this.counters = new Map();
   }
   packets(pid, section) {
@@ -152,27 +160,29 @@ export class StreamMetadata {
     return Buffer.concat(packets);
   }
   push(chunk) {
-    // Most media chunks contain no SI at all. Pass those immutable bytes on
-    // without allocating one Buffer view per packet and copying them again.
-    let hasSI = false;
-    for (let offset = 0; offset + 188 <= chunk.length; offset += 188) {
+    // Preserve whole media/PAT ranges. Only SDT/EIT actually change the output;
+    // a PAT-only chunk must not copy every A/V packet or allocate packet views.
+    const length = chunk.length - chunk.length % 188;
+    let output = null; let rangeStart = 0;
+    for (let offset = 0; offset < length; offset += 188) {
       const pid = ((chunk[offset + 1] & 31) << 8) | chunk[offset + 2];
-      if (this.assemblers.has(pid)) { hasSI = true; break; }
-    }
-    if (!hasSI) return chunk.length % 188 ? chunk.subarray(0, chunk.length - (chunk.length % 188)) : chunk;
-    const output = [];
-    for (let offset = 0; offset + 188 <= chunk.length; offset += 188) {
+      const assembler = this.assemblers.get(pid);
+      if (!assembler) continue;
       const packet = chunk.subarray(offset, offset + 188);
-      const pid = ((packet[1] & 31) << 8) | packet[2]; const assembler = this.assemblers.get(pid);
-      if (!assembler) { output.push(packet); continue; }
-      if (pid === 0) output.push(packet); // PAT/video/audio/PCR are never remuxed here.
+      if (pid !== 0) {
+        output ||= [];
+        if (offset > rangeStart) output.push(chunk.subarray(rangeStart, offset));
+        rangeStart = offset + 188;
+      }
       for (const section of assembler.push(packet)) {
         if (pid === 0) this.#pat(section);
         else if (pid === 17) { const sdt = this.#sdt(section); if (sdt) output.push(this.packets(pid, sdt)); }
         else if (pid === 18) for (const eit of this.#eit(section)) { output.push(this.packets(pid, eit)); this.onEPG(eit); }
       }
     }
-    return Buffer.concat(output);
+    if (!output) return length === chunk.length ? chunk : chunk.subarray(0, length);
+    if (rangeStart < length) output.push(chunk.subarray(rangeStart, length));
+    return this.createData(output);
   }
   #pat(section) {
     if (section[0] !== 0 || !(section[5] & 1)) return;

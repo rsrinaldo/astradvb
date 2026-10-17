@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { createServer } from 'node:net';
+import { createServer, createConnection } from 'node:net';
 import { createServer as createMediaServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,6 +22,13 @@ test('protects live management routes, keeps playback exports public, and change
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   for (const path of ['/api/config', '/api/status', '/api/streams', '/api/adapters', '/api/sessions', '/api/logs', '/api/events']) assert.equal((await fetch(base + path)).status, 401, path);
+  const malformed = await new Promise((resolve, reject) => {
+    const socket = createConnection({ host: '127.0.0.1', port }); let result = '';
+    socket.setTimeout(3000, () => socket.destroy(new Error('Malformed request check timed out')));
+    socket.on('error', reject); socket.on('data', chunk => { result += chunk; }); socket.on('end', () => resolve(result));
+    socket.on('connect', () => socket.end('GET /healthz HTTP/1.1\r\nHost: [\r\nConnection: close\r\n\r\n'));
+  });
+  assert.match(malformed, /^HTTP\/1\.1 400 /); assert.equal(child.exitCode, null); assert.equal((await fetch(base + '/healthz')).status, 200);
   assert.equal((await fetch(base + '/', { redirect: 'manual' })).status, 303);
   for (const path of ['/healthz', '/playlist.m3u?delivery=hls', '/api/playlist', '/epg.xml', '/api/epg', '/login']) assert.equal((await fetch(base + path)).status, 200, path);
   for (const path of ['/epg.xml', '/api/epg']) {
@@ -85,6 +92,11 @@ test('protects live management routes, keeps playback exports public, and change
   const dvb = { id: 'renamed-existing', name: 'Existing DVB', enabled: false, inputs: ['dvb://sat-a?service=100'], service: { serviceId: 100 } };
   assert.equal((await fetch(base + '/api/streams', { method: 'POST', headers, body: JSON.stringify(dvb) })).status, 201);
   const duplicate = await fetch(base + '/api/streams', { method: 'POST', headers, body: JSON.stringify({ ...dvb, id: 'scan-duplicate', scanImport: true }) }); assert.equal(duplicate.status, 409); assert.match((await duplicate.json()).error, /already added as Existing DVB/);
+  const lazy = await fetch(base + '/api/streams', { method: 'POST', headers, body: JSON.stringify({ id: 'lazy', name: 'On demand', enabled: true, onDemand: true, inputs: [`http://127.0.0.1:${media.address().port}/live.ts`] }) }); assert.equal(lazy.status, 201);
+  const startingHLS = await fetch(base + '/hls/on-demand/index.m3u8'); assert.equal(startingHLS.status, 503); assert.equal(startingHLS.headers.get('retry-after'), '1');
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const lazyStatus = await (await fetch(base + '/api/streams', { headers })).json(); assert.equal(lazyStatus.streams.find(stream => stream.id === 'lazy').state, 'running');
+  const cacheStatus = await (await fetch(base + '/api/status', { headers })).json(); assert.equal(cacheStatus.mediaCache.measurement, 'hls-payload-bytes-not-process-rss'); assert.ok(cacheStatus.mediaCache.totalBytes >= 0);
   const logout = await fetch(base + '/api/auth/logout', { method: 'POST', headers: { cookie: newCookie, origin: base, 'x-csrf-token': newAccount.csrfToken } }); assert.equal(logout.status, 200);
   assert.equal((await fetch(base + '/api/config', { headers: { cookie: newCookie } })).status, 401);
 });

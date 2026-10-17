@@ -13,7 +13,9 @@ test('real HLS routes count canonical segment clients, keep bytes unchanged and 
   const reserve = net.createServer(); reserve.listen(0, '127.0.0.1'); await once(reserve, 'listening');
   const port = reserve.address().port; await new Promise(resolve => reserve.close(resolve));
   const configPath = join(directory, 'config.json');
-  await writeFile(configPath, JSON.stringify({ server: { host: '127.0.0.1', port }, streams: [{ id: '1', name: 'Test Channel', enabled: false, inputs: [], hls: true, http: true }, { id: '2', name: 'Second Channel', enabled: false, inputs: [], hls: true }] }));
+  // Enabled streams with deterministic injected media; disabled streams are
+  // intentionally not publicly playable even when an old cache exists.
+  await writeFile(configPath, JSON.stringify({ server: { host: '127.0.0.1', port }, streams: [{ id: '1', name: 'Test Channel', enabled: true, onDemand: true, inputs: [], hls: true, http: true }, { id: '2', name: 'Second Channel', enabled: true, onDemand: true, inputs: [], hls: true }] }));
   const script = `
     const { server, manager } = await import(${JSON.stringify(new URL('../src/server.mjs', import.meta.url).href)});
     for (const worker of manager.workers.values()) {

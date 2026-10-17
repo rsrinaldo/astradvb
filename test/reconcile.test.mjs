@@ -41,6 +41,15 @@ test('repeated equivalent configuration retains worker identity', async () => {
   assert.equal(manager.get('one'), one); assert.equal(one.starts, 1); assert.equal(one.stops, 0);
 });
 
+test('logging-only settings never restart streams; HLS-only settings do not restart MPEG-TS-only streams', async () => {
+  const { store, manager } = setup({ streams: [channel('mpegts', { hls: false }), channel('hls')] }); await manager.start();
+  const mpegts = manager.get('mpegts'), hls = manager.get('hls');
+  await manager.reconcile(normalizeConfig({ ...store.value, settings: { ...store.value.settings, logLimit: 20 } }));
+  assert.equal(manager.get('mpegts'), mpegts); assert.equal(manager.get('hls'), hls);
+  await manager.reconcile(normalizeConfig({ ...store.value, settings: { ...store.value.settings, hlsSegmentSeconds: 4 } }));
+  assert.equal(manager.get('mpegts'), mpegts); assert.equal(mpegts.stops, 0); assert.equal(hls.stops, 1);
+});
+
 test('DVB pool invalidates changed hardware configuration but retains unchanged tuners', () => {
   const pool = new DVBInputPool(new RingLogger());
   const adapter = { id: 'sat', frequencyMHz: 10762 }; const controller = new AbortController();

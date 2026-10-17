@@ -202,6 +202,55 @@ test('retired media has a memory ceiling even for faster-than-real-time file inp
   assert.equal(hls.retired.size, 0); assert.equal(hls.retiredBytes, 0);
 });
 
+test('idle maintenance expires retired payloads without altering the advertised window', () => {
+  const hls = new HLSSegmenter({ segmentSeconds: 2, windowSegments: 3 });
+  for (let time = 0; time <= 30000; time += 2000) { hls.push(Buffer.alloc(188, 0xaa), time); hls.flush(time + 2000); }
+  assert.ok(hls.retiredBytes > 0);
+  const playlist = hls.segments.map(segment => ({ id: segment.id, data: segment.data }));
+  const firstExpiry = Math.min(...[...hls.retired.values()].map(segment => segment.expiresAt));
+  const before = hls.memoryUsage();
+  hls.prune(firstExpiry - 1); assert.deepEqual(hls.memoryUsage(), before);
+  hls.prune(200000);
+  assert.equal(hls.retiredBytes, 0); assert.equal(hls.retired.size, 0); assert.equal(hls.nextRetirementExpiry, Infinity);
+  assert.deepEqual(hls.segments.map(segment => ({ id: segment.id, data: segment.data })), playlist);
+  assert.equal(hls.memoryUsage().playlistBytes, playlist.length * 188);
+});
+
+test('retirement grace uses the largest real playlist, not an unpublished pre-trim window', () => {
+  const hls = new HLSSegmenter({ segmentSeconds: 2, windowSegments: 3 }); let longest = 0;
+  for (let time = 0; time <= 60000; time += 2000) {
+    hls.push(Buffer.alloc(188, 0xaa), time); hls.flush(time + 2000);
+    const visible = hls.segments.reduce((sum, segment) => sum + segment.duration, 0);
+    longest = Math.max(longest, visible);
+    assert.equal(hls.longestPlaylistSeconds, longest);
+    assert.ok(hls.retired.size < 10);
+    const latest = [...hls.retired.values()].at(-1);
+    if (latest) assert.ok(latest.expiresAt >= time + 2000 + (latest.duration + longest) * 1000);
+  }
+  assert.equal(longest, 10);
+  assert.equal(hls.longestPlaylistSeconds, 10, 'The transient twelve-second pre-trim list was never published');
+});
+
+test('on-demand retirement starts a fresh playlist but preserves old URI bytes for their full grace', () => {
+  const hls = new HLSSegmenter(); hls.push(Buffer.from('old'), 0); hls.flush(6000);
+  const segment = hls.segments[0], sequence = hls.sequence;
+  hls.retirePlaylist(7000); assert.equal(hls.segments.length, 0); assert.equal(hls.playlistSeconds, 0);
+  assert.equal(hls.sequence, sequence); assert.equal(hls.get(segment.id, 18999).toString(), 'old');
+  assert.equal(hls.get(segment.id, 19000), null);
+  hls.push(Buffer.from('new'), 20000); hls.flush(26000);
+  assert.equal(hls.segments[0].sequence, sequence); assert.equal(hls.segments[0].data.toString(), 'new');
+});
+
+test('HLS clock/media scan creates no Buffer views for ordinary media packets', () => {
+  const hls = new HLSSegmenter();
+  const chunk = Buffer.concat(Array.from({ length: 200 }, () => packet(256)));
+  let views = 0; const slice = chunk.subarray.bind(chunk);
+  chunk.subarray = (...args) => { views++; return slice(...args); };
+  hls.push(chunk, 0);
+  assert.equal(views, 1, 'Only the retained whole-chunk range needs a view, not each packet');
+  hls.flush(1000); assert.ok(hls.segments[0].data.equals(chunk));
+});
+
 test('cuts transport streams on random access and seeds program tables', () => {
   const hls = new HLSSegmenter({ segmentSeconds: 6, windowSegments: 5 });
   hls.push(Buffer.concat([pat(), pmt(), packet(256)]), 1000);

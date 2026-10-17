@@ -5,12 +5,12 @@ import { SISectionAssembler } from './si-metadata.mjs';
 const PACKET_SIZE = 188;
 const PCR_WRAP = 2 ** 33 * 300;
 
-function pid(packet) { return ((packet[1] & 0x1f) << 8) | packet[2]; }
-function payloadStart(packet) { return Boolean(packet[1] & 0x40); }
+function pid(packet, offset = 0) { return ((packet[offset + 1] & 0x1f) << 8) | packet[offset + 2]; }
+function payloadStart(packet, offset = 0) { return Boolean(packet[offset + 1] & 0x40); }
 
-function randomAccess(packet) {
-  const control = (packet[3] >> 4) & 0x03;
-  return (control === 2 || control === 3) && packet[4] > 0 && Boolean(packet[5] & 0x40);
+function randomAccess(packet, offset = 0) {
+  const control = (packet[offset + 3] >> 4) & 0x03;
+  return (control === 2 || control === 3) && packet[offset + 4] > 0 && Boolean(packet[offset + 5] & 0x40);
 }
 
 function patPrograms(section) {
@@ -54,11 +54,11 @@ function tablePackets(packetPid, section, counter = 0) {
   return packets;
 }
 
-function pcr(packet) {
-  const control = (packet[3] >> 4) & 3;
-  if ((packet[1] & 0x80) || (control !== 2 && control !== 3) || packet[4] < 7 || packet[4] > 183 || !(packet[5] & 0x10)) return null;
-  const base = packet[6] * 2 ** 25 + packet[7] * 2 ** 17 + packet[8] * 2 ** 9 + packet[9] * 2 + (packet[10] >> 7);
-  const extension = ((packet[10] & 1) << 8) + packet[11];
+function pcr(packet, offset) {
+  const control = (packet[offset + 3] >> 4) & 3;
+  if ((packet[offset + 1] & 0x80) || (control !== 2 && control !== 3) || packet[offset + 4] < 7 || packet[offset + 4] > 183 || !(packet[offset + 5] & 0x10)) return null;
+  const base = packet[offset + 6] * 2 ** 25 + packet[offset + 7] * 2 ** 17 + packet[offset + 8] * 2 ** 9 + packet[offset + 9] * 2 + (packet[offset + 10] >> 7);
+  const extension = ((packet[offset + 10] & 1) << 8) + packet[offset + 11];
   return extension < 300 ? base * 300 + extension : null;
 }
 
@@ -78,6 +78,7 @@ export class HLSSegmenter {
     this.segments = [];
     this.retired = new Map();
     this.retiredBytes = 0;
+    this.nextRetirementExpiry = Infinity;
     this.maxRetiredBytes = Math.max(PACKET_SIZE, Math.min(128 * 1024 * 1024, Number(retainedBytes) || 128 * 1024 * 1024));
     this.playlistSeconds = 0;
     this.longestPlaylistSeconds = 0;
@@ -112,9 +113,10 @@ export class HLSSegmenter {
 
     let rangeStart = 0;
     for (let offset = 0; offset < chunk.length; offset += PACKET_SIZE) {
-      const packet = chunk.subarray(offset, offset + PACKET_SIZE);
-      this.#cacheProgramTables(packet);
-      const { time, discontinuity } = this.#packetClock(packet, now);
+      const packetPid = pid(chunk, offset);
+      this.#cacheProgramTables(chunk, offset, packetPid);
+      const time = this.#packetClock(chunk, offset, packetPid, now);
+      const discontinuity = this.clockDiscontinuity;
       if (this.startedAt === null) this.startedAt = time;
       // A source clock reset or a delivery gap is not one enormous segment.
       // Finish the old media at its last observed timestamp, without dropping
@@ -129,12 +131,11 @@ export class HLSSegmenter {
       }
       const elapsed = time - this.startedAt;
       const firstTarget = this.sequence ? this.segmentMs : Math.min(2000, this.segmentMs);
-      const packetPid = pid(packet);
       const videoBoundary = !this.videoPids.size || this.videoPids.has(packetPid);
-      const pesBoundary = videoBoundary && payloadStart(packet) && packetPid > 0x1f && !this.pmtPids.has(packetPid);
+      const pesBoundary = videoBoundary && payloadStart(chunk, offset) && packetPid > 0x1f && !this.pmtPids.has(packetPid);
       const hasInput = this.currentInputBytes > 0 || offset > rangeStart;
       const byteLimit = this.currentInputBytes + offset - rangeStart >= 64 * 1024 * 1024;
-      const shouldCut = hasInput && (byteLimit || (elapsed >= firstTarget && ((pesBoundary && randomAccess(packet)) || (elapsed >= this.targetDuration * 1000 - 500 && pesBoundary) || elapsed >= this.targetDuration * 1000)));
+      const shouldCut = hasInput && (byteLimit || (elapsed >= firstTarget && ((pesBoundary && randomAccess(chunk, offset)) || (elapsed >= this.targetDuration * 1000 - 500 && pesBoundary) || elapsed >= this.targetDuration * 1000)));
       if (shouldCut) {
         if (offset > rangeStart) this.#append(chunk.subarray(rangeStart, offset));
         this.#publish(time, now);
@@ -175,14 +176,23 @@ export class HLSSegmenter {
     this.segments.push(segment);
     const duration = segment.duration;
     this.playlistSeconds += duration;
-    this.longestPlaylistSeconds = Math.max(this.longestPlaylistSeconds, this.playlistSeconds);
+    const retirements = [];
     // A segment-count preference must not shorten a live window below 3x
     // TARGETDURATION. Retired URIs stay fetchable for delayed HTTP readers.
     while (this.segments.length > this.window && this.playlistSeconds - this.segments[0].duration >= 3 * this.targetDuration) {
       const removed = this.segments.shift();
       this.playlistSeconds -= removed.duration;
       if (removed.discontinuity) this.discontinuitySequence++;
-      this.retired.set(removed.id, { data: removed.data, duration: removed.duration, expiresAt: now + (removed.duration + this.longestPlaylistSeconds) * 1000 });
+      retirements.push(removed);
+    }
+    // The pre-trim list is never observable or published. Counting it inflated
+    // every retired URI's grace by one extra segment interval on every stream.
+    // Keep the maximum actual visible window, including earlier larger ones.
+    this.longestPlaylistSeconds = Math.max(this.longestPlaylistSeconds, this.playlistSeconds);
+    for (const removed of retirements) {
+      const expiresAt = now + (removed.duration + this.longestPlaylistSeconds) * 1000;
+      this.retired.set(removed.id, { data: removed.data, duration: removed.duration, expiresAt });
+      this.nextRetirementExpiry = Math.min(this.nextRetirementExpiry, expiresAt);
       this.retiredBytes += removed.data.length;
     }
     this.#prune(now);
@@ -228,14 +238,42 @@ export class HLSSegmenter {
 
   #append(chunk) { this.current.push(chunk); this.currentInputBytes += chunk.length; }
 
+  // Maintenance also runs for idle/stopped sources: expired retired payloads
+  // must not remain resident forever merely because no more packets arrive.
+  prune(now = performance.now()) { this.#prune(now); }
+
+  retirePlaylist(now = performance.now()) {
+    // A later on-demand session must start on fresh media, while clients that
+    // already received the old playlist retain their full URI download grace.
+    for (const segment of this.segments) {
+      if (segment.discontinuity) this.discontinuitySequence++;
+      const expiresAt = now + (segment.duration + this.longestPlaylistSeconds) * 1000;
+      this.retired.set(segment.id, { data: segment.data, duration: segment.duration, expiresAt });
+      this.retiredBytes += segment.data.length;
+      this.nextRetirementExpiry = Math.min(this.nextRetirementExpiry, expiresAt);
+    }
+    this.segments = []; this.playlistSeconds = 0;
+    this.#prune(now);
+  }
+
+  memoryUsage() {
+    return { currentBytes: this.current.reduce((sum, data) => sum + data.length, 0),
+      playlistBytes: this.segments.reduce((sum, segment) => sum + segment.data.length, 0),
+      retiredBytes: this.retiredBytes, playlistSegments: this.segments.length, retiredSegments: this.retired.size };
+  }
+
   #prune(now) {
+    if (now < this.nextRetirementExpiry && this.retired.size <= 1024 && this.retiredBytes <= this.maxRetiredBytes) return;
+    let nextExpiry = Infinity;
     for (const [id, segment] of this.retired) {
-      if (segment.expiresAt > now && this.retired.size <= 1024 && this.retiredBytes <= this.maxRetiredBytes) continue;
+      if (segment.expiresAt > now && this.retired.size <= 1024 && this.retiredBytes <= this.maxRetiredBytes) { nextExpiry = Math.min(nextExpiry, segment.expiresAt); continue; }
       this.retired.delete(id); this.retiredBytes -= segment.data.length;
     }
+    this.nextRetirementExpiry = nextExpiry;
   }
 
   #resetClock() {
+    this.clockDiscontinuity = false;
     this.activePCRPid = null;
     this.lastPCR = null;
     this.clockTime = null;
@@ -243,12 +281,12 @@ export class HLSSegmenter {
     this.lastPCRAdvanceAt = null;
   }
 
-  #packetClock(packet, now) {
-    const packetPid = pid(packet);
-    const value = (this.pcrPid === null || packetPid === this.pcrPid) ? pcr(packet) : null;
+  #packetClock(packet, offset, packetPid, now) {
+    this.clockDiscontinuity = false;
+    const value = (this.pcrPid === null || packetPid === this.pcrPid) ? pcr(packet, offset) : null;
     if (value !== null && (this.activePCRPid === null || packetPid === this.activePCRPid || packetPid === this.pcrPid)) {
       const delta = this.lastPCR === null ? 0 : ((value - this.lastPCR + PCR_WRAP / 2) % PCR_WRAP + PCR_WRAP) % PCR_WRAP - PCR_WRAP / 2;
-      const reset = this.lastPCR !== null && (packetPid !== this.activePCRPid || Boolean(packet[5] & 0x80) || delta < 0 || delta / 27000 > this.maxDurationMs || now - this.lastPCRAdvanceAt > this.segmentMs);
+      const reset = this.lastPCR !== null && (packetPid !== this.activePCRPid || Boolean(packet[offset + 5] & 0x80) || delta < 0 || delta / 27000 > this.maxDurationMs || now - this.lastPCRAdvanceAt > this.segmentMs);
       if (this.clockTime === null) {
         this.clockTime = this.lastMediaTime ?? now;
         if (!this.clockEverSeen) this.startedAt = this.clockTime;
@@ -258,17 +296,19 @@ export class HLSSegmenter {
       else this.clockTime += delta / 27000;
       if (this.lastPCR === null || reset || delta > 0) this.lastPCRAdvanceAt = now;
       this.lastPCR = value; this.lastPCRAt = now; this.activePCRPid = packetPid;
-      return { time: this.clockTime, discontinuity: reset };
+      this.clockDiscontinuity = reset;
+      return this.clockTime;
     }
-    if (this.clockTime !== null && now - this.lastPCRAt <= this.segmentMs) return { time: this.clockTime, discontinuity: false };
+    if (this.clockTime !== null && now - this.lastPCRAt <= this.segmentMs) return this.clockTime;
     const lostClock = this.clockTime !== null;
     if (lostClock) this.#resetClock();
-    return { time: Math.max(this.lastMediaTime ?? now, now), discontinuity: lostClock };
+    this.clockDiscontinuity = lostClock;
+    return Math.max(this.lastMediaTime ?? now, now);
   }
 
-  #cacheProgramTables(packet) {
-    const packetPid = pid(packet);
+  #cacheProgramTables(chunk, offset, packetPid) {
     if (packetPid !== 0 && !this.pmtPids.has(packetPid)) return;
+    const packet = chunk.subarray(offset, offset + PACKET_SIZE);
     let assembler = this.tableAssemblers.get(packetPid);
     if (!assembler) { assembler = new SISectionAssembler(); this.tableAssemblers.set(packetPid, assembler); }
     for (const section of assembler.push(packet)) {

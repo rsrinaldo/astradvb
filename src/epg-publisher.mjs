@@ -52,20 +52,21 @@ export class DailyEPGPublisher {
     // Keep still-valid multi-day entries across source outages and restarts.
     // New broadcast entries replace the same channel/event/start identity.
     const events = new Map();
-    for (const event of [...(this.current?.document.programmes || []), ...source.programmes]) {
-      if (validEvent(event, channelIds, now)) events.set(JSON.stringify([event.channel, event.serviceId, event.eventId, event.start]), structuredClone(event));
+    for (const group of [this.current?.document.programmes || [], source.programmes]) for (const event of group) {
+      if (validEvent(event, channelIds, now)) events.set(JSON.stringify([event.channel, event.serviceId, event.eventId, event.start]), event);
     }
     const perChannel = new Map(); const programmes = [];
     for (const event of [...events.values()].sort((a, b) => a.start.localeCompare(b.start))) {
       const count = perChannel.get(event.channel) || 0;
       if (count >= 4096) continue;
-      programmes.push(event); perChannel.set(event.channel, count + 1);
+      programmes.push(structuredClone(event)); perChannel.set(event.channel, count + 1);
       if (programmes.length >= 200000) break;
     }
     const publishedAt = new Date(now).toISOString(); const nextRefreshAt = new Date(now + INTERVAL_MS).toISOString();
     const document = { generatedAt: publishedAt, publishedAt, nextRefreshAt, updatedAt: later(source.updatedAt, this.current?.document.updatedAt), lastReceivedAt: later(source.lastReceivedAt, this.current?.document.lastReceivedAt), recommendedRefreshSeconds: EPG_REFRESH_SECONDS, publicationIntervalSeconds: EPG_REFRESH_SECONDS, channels, programmes };
-    const candidate = bundle(document); const saved = JSON.stringify({ version: 1, document });
+    const saved = JSON.stringify({ version: 1, document });
     if (Buffer.byteLength(saved) > MAX_FILE_BYTES) throw new Error('Published EPG exceeds its size limit');
+    const candidate = bundle(document);
     await mkdir(dirname(this.path), { recursive: true });
     const temporary = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
     try { await writeFile(temporary, saved, { mode: 0o600 }); await rename(temporary, this.path); }

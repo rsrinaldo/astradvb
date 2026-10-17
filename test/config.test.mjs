@@ -28,6 +28,15 @@ test('normalizes server and failover settings', () => {
   assert.deepEqual(config.casProfiles, [{ id: 'premium', name: 'Premium gateway', lineEncrypted: '', caid: '', serviceId: 0 }]);
 });
 
+test('runtime settings have finite resource bounds and preserve an explicit zero failover delay', () => {
+  const config = normalizeConfig({ settings: { inputTimeoutMs: Infinity, failoverDelayMs: 0, hlsSegmentSeconds: 1e9, hlsWindowSegments: 1e9, logLimit: -1 } });
+  assert.equal(config.settings.inputTimeoutMs, 5000); assert.equal(config.settings.failoverDelayMs, 0);
+  assert.equal(config.settings.hlsSegmentSeconds, 60); assert.equal(config.settings.hlsWindowSegments, 60); assert.equal(config.settings.logLimit, 1);
+  assert.equal(normalizeStream({ id: 'timer', keepActiveSeconds: Infinity }).keepActiveSeconds, 0);
+  assert.equal(normalizeStream({ id: 'timer', keepActiveSeconds: 1e12 }).keepActiveSeconds, 86400);
+  assert.throws(() => normalizeConfig({ server: { port: 8000.5 } }), /integer/);
+});
+
 test('parses supported media URLs', () => {
   assert.equal(parseMediaUrl('rtp://239.1.1.2:5000').protocol, 'rtp');
   assert.equal(parseMediaUrl('rtmp://media.example.test/live/channel').protocol, 'rtmp');

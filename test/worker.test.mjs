@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { EventEmitter } from 'node:events';
 import { RingLogger } from '../src/logger.mjs';
 import { inputBitrateScope, scramblingStats, StreamWorker } from '../src/stream-manager.mjs';
 import { mpegCRC32 } from '../src/mpeg-crc.mjs';
@@ -12,6 +13,33 @@ function packet(pid, cc) {
   value[0] = 0x47; value[1] = (pid >> 8) & 0x1f; value[2] = pid & 0xff; value[3] = 0x10 | cc;
   return value;
 }
+
+test('an old input finishing after rapid stop/start cannot stop or feed its replacement', async t => {
+  const attempts = [];
+  const dvb = { run(_adapter, _service, callbacks) { callbacks.onReady(); return new Promise(resolve => attempts.push({ ...callbacks, resolve })); } };
+  const worker = new StreamWorker({ id: 'generation', name: 'Generation', enabled: true, inputs: [{ url: 'dvb://tuner?service=1' }], outputs: [], hls: false }, { inputTimeoutMs: 30000 }, new RingLogger(), [], [{ id: 'tuner' }], dvb);
+  t.after(() => { worker.stop(); for (const attempt of attempts) attempt.resolve(); });
+  worker.start(); worker.stop(); worker.start();
+  assert.equal(attempts.length, 2); assert.equal(worker.state, 'running');
+  attempts[0].onData(packet(256, 0)); attempts[0].onReady();
+  assert.equal(worker.analyzer.snapshot().packets, 0);
+  attempts[1].onData(packet(256, 0)); assert.equal(worker.analyzer.snapshot().packets, 1);
+  attempts[0].resolve(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(worker.state, 'running'); assert.ok(worker.runningSince);
+});
+
+test('on-demand HLS starts once, owns one idle timer, and coexists with MPEG-TS demand', t => {
+  const attempts = [];
+  const dvb = { run(_adapter, _service, callbacks) { callbacks.onReady(); return new Promise(resolve => { attempts.push(resolve); callbacks.signal.addEventListener('abort', resolve, { once: true }); }); } };
+  const worker = new StreamWorker({ id: 'lazy', name: 'Lazy', enabled: true, onDemand: true, keepActiveSeconds: 0, inputs: [{ url: 'dvb://tuner?service=1' }], outputs: [], hls: true }, { inputTimeoutMs: 30000 }, new RingLogger(), [], [{ id: 'tuner' }], dvb);
+  t.after(() => { worker.stop(); for (const resolve of attempts) resolve(); });
+  assert.equal(worker.abort, null); worker.touchHLS(); const first = worker.idleTimer;
+  assert.equal(attempts.length, 1); assert.ok(first); assert.ok(worker.hlsDemandUntil > Date.now());
+  worker.touchHLS(); assert.notEqual(worker.idleTimer, first); assert.equal(attempts.length, 1);
+  const response = new EventEmitter(); response.end = () => response.emit('close'); worker.subscribe(response);
+  assert.equal(worker.idleTimer, null); response.emit('close'); assert.ok(worker.idleTimer);
+  worker.stop(); assert.equal(worker.idleTimer, null); assert.equal(worker.hlsDemandUntil, 0);
+});
 
 test('detects transport scrambling flags', () => {
   const clear = packet(256, 0); const scrambled = packet(256, 1); scrambled[3] |= 0x80;

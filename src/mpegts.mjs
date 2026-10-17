@@ -1,4 +1,5 @@
 const PACKET_SIZE = 188;
+const EMPTY = Buffer.alloc(0);
 
 export class MPEGTSAnalyzer {
   constructor() { this.reset(); }
@@ -36,7 +37,8 @@ export class MPEGTSAnalyzer {
       this.#packet(this.buffer, offset);
       offset += PACKET_SIZE;
     }
-    this.buffer = this.buffer.subarray(offset);
+    // A <=187-byte remainder must not pin a whole media/shared allocation.
+    this.buffer = offset < this.buffer.length ? Buffer.from(this.buffer.subarray(offset)) : EMPTY;
   }
 
   #packet(packet, offset) {
@@ -133,14 +135,14 @@ export class TransportStreamFramer {
       start = this.buffer.indexOf(0x47, start + 1);
     }
     if (start < 0) {
-      this.buffer = this.buffer.subarray(Math.max(0, this.buffer.length - PACKET_SIZE + 1));
+      this.buffer = Buffer.from(this.buffer.subarray(Math.max(0, this.buffer.length - PACKET_SIZE + 1)));
       return Buffer.alloc(0);
     }
     if (start) this.buffer = this.buffer.subarray(start);
     const length = Math.floor(this.buffer.length / PACKET_SIZE) * PACKET_SIZE;
     if (!length) return Buffer.alloc(0);
     const framed = this.buffer.subarray(0, length);
-    this.buffer = this.buffer.subarray(length);
+    this.buffer = length < this.buffer.length ? Buffer.from(this.buffer.subarray(length)) : EMPTY;
     return framed;
   }
 

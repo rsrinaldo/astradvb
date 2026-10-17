@@ -109,7 +109,8 @@ export class PacketPool {
     return handle;
   }
   #register(handle) {
-    const config = { ...handle.config, sequence: handle.callbacks.sequence?.() || 0, discontinuity: handle.restarts > 0, epgSeed: { events: [...handle.epg.events], updatedAt: handle.epg.updatedAt, lastReceivedAt: handle.epg.lastReceivedAt } };
+    const sequence = handle.callbacks.sequence?.() || 0;
+    const config = { ...handle.config, sequence, discontinuity: handle.restarts > 0 || sequence > 0, epgSeed: { events: [...handle.epg.events], updatedAt: handle.epg.updatedAt, lastReceivedAt: handle.epg.lastReceivedAt } };
     handle.slot.worker.postMessage({ type: 'register', handle: handle.id, config, settings: handle.settings });
   }
   #launch(slot) {

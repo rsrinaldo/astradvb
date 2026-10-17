@@ -16,6 +16,7 @@ export function streamAliases(streams) {
   const counts = new Map();
   for (const base of bases) counts.set(base, (counts.get(base) || 0) + 1);
   const used = new Set();
+  const ids = new Set(streams.map(stream => stream.id));
   const aliases = new Map();
   streams.forEach((stream, index) => {
     const base = bases[index];
@@ -23,10 +24,23 @@ export function streamAliases(streams) {
     const suffix = channelSlug(serviceId || stream.id);
     let alias = counts.get(base) > 1 ? `${base}-${suffix}` : base;
     let duplicate = 2;
-    while (used.has(alias)) alias = `${base}-${suffix}-${duplicate++}`;
+    // Legacy numeric/internal-ID URLs remain valid. Never export an alias
+    // which the server's direct-ID lookup would resolve to another channel.
+    while (used.has(alias) || (ids.has(alias) && alias !== stream.id)) alias = `${base}-${suffix}-${duplicate++}`;
     used.add(alias); aliases.set(stream.id, alias);
   });
   return aliases;
+}
+
+export class StreamAliasIndex {
+  constructor() { this.streams = null; this.aliases = new Map(); }
+  resolve(streams, alias) {
+    if (streams !== this.streams) {
+      this.aliases = new Map([...streamAliases(streams)].map(([id, name]) => [name, id]));
+      this.streams = streams;
+    }
+    return this.aliases.get(alias);
+  }
 }
 
 export function playlistEntries(streams, baseUrl, includeDisabled = false, delivery = 'mpegts') {

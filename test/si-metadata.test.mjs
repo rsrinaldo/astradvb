@@ -47,6 +47,45 @@ test('media-only metadata fast path preserves exact bytes without per-packet cop
   assert.deepEqual(metadata.push(Buffer.concat([media,Buffer.from([1,2,3])])),media);
 });
 
+test('PAT-only metadata ranges retain their original shared allocation', () => {
+  const source = packets(0, pat());
+  const shared = Buffer.from(new SharedArrayBuffer(source.length + 188 * 100));
+  source.copy(shared);
+  for (let offset = source.length; offset < shared.length; offset += 188) shared.set([0x47, 1, 0, 0x10], offset);
+  const metadata = new StreamMetadata('Selected');
+  assert.equal(metadata.push(shared), shared);
+  assert.equal(metadata.serviceId, 100);
+});
+
+test('rewritten SI coalesces untouched media ranges through the chosen allocator exactly once', () => {
+  let allocations = 0; let ranges;
+  const metadata = new StreamMetadata('Selected', 100, () => {}, chunks => {
+    allocations++; ranges = chunks;
+    const result = Buffer.from(new SharedArrayBuffer(chunks.reduce((sum, chunk) => sum + chunk.length, 0)));
+    let offset = 0; for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; }
+    return result;
+  });
+  const video = Buffer.alloc(188 * 100, 0xaa);
+  for (let offset = 0; offset < video.length; offset += 188) video.set([0x47, 1, 0, 0x10], offset);
+  const input = Buffer.concat([video, packets(17, sdt()), video]); const saved = Buffer.from(input);
+  const output = metadata.push(input);
+  assert.equal(allocations, 1); assert.equal(ranges.length, 3);
+  assert.ok(output.buffer instanceof SharedArrayBuffer);
+  assert.deepEqual(output.subarray(0, video.length), video); assert.deepEqual(output.subarray(-video.length), video);
+  assert.deepEqual(input, saved);
+  assert.equal(read(output, 17).length, 1);
+});
+
+test('adaptation-only discontinuity and malformed adaptation reset partial SI', () => {
+  const source = packets(18, eit(100, 'A', 'a'.repeat(220)));
+  for (const malformed of [false, true]) {
+    const assembler = new SISectionAssembler(); assert.equal(assembler.push(source.subarray(0, 188)).length, 0);
+    const reset = Buffer.alloc(188, 0xff); reset.set([0x47, 0, 18, malformed ? 0x30 : 0x20, 183, 0x80]);
+    assert.equal(assembler.push(reset).length, 0);
+    assert.equal(assembler.push(source.subarray(188, 376)).length, 0);
+  }
+});
+
 test('selects one SDT service, uses the configured Unicode channel name, and preserves A/V bytes', () => {
   const metadata = new StreamMetadata('Shqipëri Ç', 100);
   const video = Buffer.alloc(188, 0xaa); video.set([0x47, 0x01, 0, 0x10]);

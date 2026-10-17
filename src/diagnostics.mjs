@@ -24,6 +24,7 @@ export function mediaDiagnostics(manager, version) {
     processing: manager.packetPool.status(),
     signalMonitor: manager.signalMonitor?.snapshot() || null,
     httpDelivery: manager.httpDelivery?.snapshot() || null,
+    mediaCache: manager.mediaCacheSnapshot?.() || null,
     casProxy: { ...manager.casProxy.metrics, providerGuards: manager.casProxy.guardMetrics() },
     streams: [...manager.workers.values()].map(worker => {
       const snapshot = worker.snapshot();

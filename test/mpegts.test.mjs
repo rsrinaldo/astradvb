@@ -23,6 +23,20 @@ test('analyzes aligned MPEG-TS packets and continuity', () => {
   assert.equal(result.continuityErrors, 1);
 });
 
+test('analyzer and framer retain only private short tails, never a whole shared source allocation', () => {
+  const source = Buffer.from(new SharedArrayBuffer(188 * 1000 + 10));
+  for (let offset = 0; offset + 188 <= source.length; offset += 188) source.set([0x47, 1, 0, 0x10], offset);
+  source.set([0x47, 1, 0, 0x11], 188 * 1000);
+  const analyzer = new MPEGTSAnalyzer(); analyzer.push(source);
+  assert.equal(analyzer.buffer.length, 10); assert.notEqual(analyzer.buffer.buffer, source.buffer);
+  const tail = Buffer.from(analyzer.buffer); source.fill(0); assert.deepEqual(analyzer.buffer, tail);
+  const framer = new TransportStreamFramer(); const framed = framer.push(Buffer.concat([...Array.from({ length: 1000 }, (_, index) => packet(256, index & 15)), tail]));
+  assert.equal(framer.buffer.length, 10); assert.ok(framer.buffer.buffer.byteLength <= Buffer.poolSize);
+  assert.notEqual(framer.buffer.buffer, framed.buffer, 'Private tail must not pin the returned transport allocation');
+  const aligned = Buffer.from(new SharedArrayBuffer(188)); aligned.set([0x47, 1, 0, 0x10]);
+  analyzer.reset(); analyzer.push(aligned); assert.equal(analyzer.buffer.length, 0); assert.notEqual(analyzer.buffer.buffer, aligned.buffer);
+});
+
 test('continuity diagnostics accept duplicate payload, null padding and explicitly declared counter resets', () => {
   const analyzer = new MPEGTSAnalyzer(); const original = packet(256, 0); const reset = packet(256, 9);
   reset[3] = 0x30 | 9; reset[4] = 1; reset[5] = 0x80;

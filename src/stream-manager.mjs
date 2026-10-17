@@ -75,6 +75,7 @@ export class StreamWorker extends EventEmitter {
       }
     });
     this.clients = new Set(); this.outputs = []; this.activeInput = -1; this.state = 'stopped'; this.lastDataAt = 0; this.inputDataAt = 0; this.abort = null;
+    this.idleTimer = null; this.hlsDemandUntil = 0;
   }
   start() {
     if (this.abort || !this.config.enabled) return;
@@ -90,24 +91,31 @@ export class StreamWorker extends EventEmitter {
       }, group);
       this.analyzer = this.dataPlane.analyzer; this.inputAnalyzer = this.dataPlane.inputAnalyzer; this.epg = this.dataPlane.epg;
     }
-    this.outputs = this.config.outputs.filter((output) => /^(udp|rtp):/.test(output.url)).map((output) => new UDPOutput(output.url));
+    this.outputs = [];
+    try {
+      for (const output of this.config.outputs.filter(output => /^(udp|rtp):/.test(output.url)))
+        this.outputs.push(new UDPOutput(output.url, { onError: error => this.logger.warn(this.config.id, error.message) }));
+    } catch (error) { this.stop(); this.state = 'error'; this.logger.error(this.config.id, error.message); return; }
     if (this.config.hls && this.config.hlsCompatibility) {
       this.hlsBridge = new HLSCompatibilityBridge((chunk) => {
         if (this.dataPlane) { this.dataPlane.push('hls', chunk); return; }
         const aligned = this.hlsFramer.push(chunk);
         if (aligned.length) { const normalized = this.hlsMetadata.push(aligned); if (normalized.length) this.hls.push(normalized); }
-      }, (error) => this.logger.warn(this.config.id, error.message));
+      }, (error) => this.logger.warn(this.config.id, error.message), { onDiscontinuity: () => this.#discontinuity() });
       this.hlsBridge.start(); this.logger.info(this.config.id, 'HLS compatibility mode active');
     }
     if (this.config.cam?.enabled) {
       this.camProfile = this.casProfiles.find((item) => item.id === this.config.cam.profile);
-      if (!this.camProfile?.lineEncrypted) { this.state = 'error'; this.logger.error(this.config.id, `CAS profile ${this.config.cam.profile} has no credentials`); this.outputs.forEach((output) => output.close()); this.outputs = []; this.dataPlane?.close(); this.dataPlane = null; this.abort = null; return; }
+      if (!this.camProfile?.lineEncrypted) { this.stop(); this.state = 'error'; this.logger.error(this.config.id, `CAS profile ${this.config.cam.profile} has no credentials`); return; }
       this.camConnection = this.casConnections.get(this.config.cam.profile) || null;
       this.casMode = 'detecting';
     }
     void this.#loop(this.abort.signal);
   }
   stop() {
+    clearTimeout(this.idleTimer); this.idleTimer = null; this.hlsDemandUntil = 0;
+    if (this.abort && !this.dataPlane) this.hls.markDiscontinuity();
+    if (this.abort && this.config.onDemand) this.hls.retirePlaylist();
     this.runningSince = null;
     this.inputRate.reset(); this.outputRate.reset();
     this.abort?.abort(); this.abort = null; this.cam?.stop(); this.cam = null; this.camProfile = null; this.camConnection = null; this.casMode = 'disabled'; this.casBuffer = []; this.casBufferBytes = 0; this.casProbePackets = 0; this.casProbeScrambled = 0; this.hlsBridge?.stop(); this.hlsBridge = null; this.hlsFramer.reset(); this.outputs.forEach((output) => output.close()); this.outputs = []; this.state = 'stopped'; this.activeInput = -1;
@@ -115,15 +123,27 @@ export class StreamWorker extends EventEmitter {
     for (const client of this.clients) client.end(); this.clients.clear();
   }
   subscribe(response) {
+    clearTimeout(this.idleTimer); this.idleTimer = null;
     this.clients.add(response);
     response.on('close', () => {
       this.clients.delete(response);
-      if (this.config.onDemand && this.clients.size === 0) {
-        const delay = this.config.keepActiveSeconds * 1000;
-        setTimeout(() => { if (this.config.onDemand && this.clients.size === 0) this.stop(); }, delay).unref();
-      }
+      this.#scheduleIdle();
     });
     if (this.config.onDemand && !this.abort) this.start();
+  }
+  touchHLS() {
+    if (!this.config.onDemand || !this.config.enabled) return;
+    this.hlsDemandUntil = Date.now() + Math.max(30000, this.hls.targetDuration * 3000);
+    if (!this.abort) this.start();
+    this.#scheduleIdle();
+  }
+  #scheduleIdle() {
+    clearTimeout(this.idleTimer); this.idleTimer = null;
+    if (!this.config.onDemand || this.clients.size || !this.abort) return;
+    const keepActive = Math.min(86400000, Math.max(0, Number(this.config.keepActiveSeconds) || 0) * 1000);
+    const delay = Math.max(keepActive, this.hlsDemandUntil - Date.now(), 0);
+    this.idleTimer = setTimeout(() => { this.idleTimer = null; if (!this.clients.size) this.stop(); }, delay);
+    this.idleTimer.unref();
   }
   push(chunk) {
     const aligned = this.framer.push(chunk);
@@ -223,6 +243,7 @@ export class StreamWorker extends EventEmitter {
     const startedAt = !stale && this.state === 'running' ? this.runningSince : null;
     return { id: this.config.id, name: this.config.name, enabled: this.config.enabled, state, startedAt: startedAt ? new Date(startedAt).toISOString() : null, uptimeSeconds: startedAt ? Math.floor((at - startedAt) / 1000) : 0, activeInput: this.activeInput, clients: this.clients.size, processing: this.dataPlane?.status() || null, cas: casStatus ? { profile: this.config.cam.profile, status: displayCasStatus, continuity, payloadEvidence, diagnostics: this.cam?.diagnostics } : null, ...metrics,
       inputBitrateKbps: this.inputRate.snapshot(at), outputBitrateKbps: this.outputRate.snapshot(at),
+      udpOutputs: this.outputs.map(output => output.snapshot()),
       inputBitrateScope: inputBitrateScope(activeInput), bitrateWindowMs: this.inputRate.windowMs };
   }
   async #loop(signal) {
@@ -247,18 +268,20 @@ export class StreamWorker extends EventEmitter {
         if (Date.now() - (this.inputDataAt || attemptStartedAt) > timeout) attempt.abort();
       }, 500);
       try {
-        await runInput(input, { signal: attempt.signal, adapters: this.adapters, dvbPool: this.dvbPool, onReady: () => { this.state = 'running'; this.logger.info(this.config.id, `Active input #${inputIndex + 1}`); }, onData: (chunk) => this.push(chunk) });
+        await runInput(input, { signal: attempt.signal, adapters: this.adapters, dvbPool: this.dvbPool,
+          onReady: () => { if (!signal.aborted && this.abort?.signal === signal) { this.state = 'running'; this.logger.info(this.config.id, `Active input #${inputIndex + 1}`); } },
+          onData: chunk => { if (!signal.aborted && this.abort?.signal === signal) this.push(chunk); } });
         if (!signal.aborted) throw new Error('Input ended');
       } catch (error) {
         if (!signal.aborted) this.logger.warn(this.config.id, `Input #${inputIndex + 1} failed: ${error.message}`);
       } finally {
-        this.runningSince = null;
+        if (this.abort?.signal === signal) this.runningSince = null;
         clearInterval(watchdog); signal.removeEventListener('abort', abortAttempt);
-        if (!signal.aborted) this.#discontinuity();
+        if (!signal.aborted && this.abort?.signal === signal) this.#discontinuity();
       }
       if (!signal.aborted) { cursor += 1; this.state = 'failover'; await wait(this.settings.failoverDelayMs, signal); }
     }
-    this.state = 'stopped';
+    if (this.abort?.signal === signal) this.state = 'stopped';
   }
 }
 
@@ -294,7 +317,9 @@ export class StreamManager {
     if (this.stopping) return;
     const desired = new Map(config.streams.map((stream) => {
       const adapterIds = new Set(stream.inputs.filter((input) => input.url.startsWith('dvb://')).map((input) => { try { return new URL(input.url).hostname; } catch { return ''; } }));
-      const signature = JSON.stringify({ stream, settings: config.settings, adapters: config.adapters.filter((adapter) => adapterIds.has(adapter.id)), profile: stream.cam?.enabled ? config.casProfiles.find((profile) => profile.id === stream.cam.profile) : null, connection: stream.cam?.enabled ? casConnections.get(stream.cam.profile) : null });
+      const settings = { inputTimeoutMs: config.settings.inputTimeoutMs, failoverDelayMs: config.settings.failoverDelayMs,
+        ...(stream.hls ? { hlsSegmentSeconds: config.settings.hlsSegmentSeconds, hlsWindowSegments: config.settings.hlsWindowSegments } : {}) };
+      const signature = JSON.stringify({ stream, settings, adapters: config.adapters.filter((adapter) => adapterIds.has(adapter.id)), profile: stream.cam?.enabled ? config.casProfiles.find((profile) => profile.id === stream.cam.profile) : null, connection: stream.cam?.enabled ? casConnections.get(stream.cam.profile) : null });
       return [stream.id, { stream, signature }];
     }));
     for (const [id, worker] of this.workers) {
@@ -310,6 +335,16 @@ export class StreamManager {
   }
   list() { return [...this.workers.values()].map((worker) => worker.snapshot()); }
   get(id) { return this.workers.get(id); }
+  maintainMedia() { for (const worker of this.workers.values()) worker.hls.prune(); }
+  mediaCacheSnapshot() {
+    const total = { measurement: 'hls-payload-bytes-not-process-rss', currentBytes: 0, playlistBytes: 0, retiredBytes: 0, playlistSegments: 0, retiredSegments: 0 };
+    for (const worker of this.workers.values()) {
+      const usage = worker.hls.memoryUsage();
+      for (const key of Object.keys(usage)) total[key] += usage[key];
+    }
+    total.totalBytes = total.currentBytes + total.playlistBytes + total.retiredBytes;
+    return total;
+  }
   epgSnapshot() { return epgDocument(this.workers.values()); }
   maintainEPG() { for (const worker of this.workers.values()) worker.epg?.prune(); }
   epgStatus() {
@@ -322,24 +357,34 @@ export class StreamManager {
     return { lastReceivedAt: lastReceivedAt ? new Date(lastReceivedAt).toISOString() : null, updatedAt: updatedAt ? new Date(updatedAt).toISOString() : null, events, channelsWithEPG, recommendedRefreshSeconds: EPG_REFRESH_SECONDS };
   }
   async upsert(stream) {
-    const current = this.store.value;
-    const index = current.streams.findIndex((item) => item.id === stream.id);
-    const streams = [...current.streams]; if (index >= 0) streams[index] = stream; else streams.push(stream);
-    const saved = await this.store.save({ ...current, streams }); await this.reconcile(saved); this.logger.info(stream.id, index >= 0 ? 'Configuration updated' : 'Stream created'); return saved.streams.find((item) => item.id === stream.id);
+    let existed;
+    const saved = await this.#updateConfig(current => {
+      const index = current.streams.findIndex(item => item.id === stream.id); existed = index >= 0;
+      const streams = [...current.streams]; if (existed) streams[index] = stream; else streams.push(stream);
+      return { ...current, streams };
+    });
+    await this.reconcile(saved); this.logger.info(stream.id, existed ? 'Configuration updated' : 'Stream created'); return saved.streams.find(item => item.id === stream.id);
   }
   async remove(id) {
-    const current = this.store.value; if (!current.streams.some((stream) => stream.id === id)) return false;
-    const name = current.streams.find((stream) => stream.id === id).name;
-    const saved = await this.store.save({ ...current, streams: current.streams.filter((stream) => stream.id !== id) }); await this.reconcile(saved); this.logger.info(id, 'Stream removed', { sourceName: name }); return true;
+    let removed;
+    const saved = await this.#updateConfig(current => {
+      removed = current.streams.find(stream => stream.id === id);
+      return { ...current, streams: current.streams.filter(stream => stream.id !== id) };
+    });
+    if (!removed) return false;
+    await this.reconcile(saved); this.logger.info(id, 'Stream removed', { sourceName: removed.name }); return true;
   }
   async removeMany(ids) {
     const selected = new Set(ids);
-    const current = this.store.value;
-    const removed = current.streams.filter((stream) => selected.has(stream.id)).map((stream) => stream.id);
+    let removed;
+    const saved = await this.#updateConfig(current => {
+      removed = current.streams.filter(stream => selected.has(stream.id));
+      return { ...current, streams: current.streams.filter(stream => !selected.has(stream.id)) };
+    });
     if (!removed.length) return [];
-    const saved = await this.store.save({ ...current, streams: current.streams.filter((stream) => !selected.has(stream.id)) });
     await this.reconcile(saved);
-    for (const id of removed) this.logger.info(id, 'Stream removed', { sourceName: current.streams.find((stream) => stream.id === id).name });
-    return removed;
+    for (const stream of removed) this.logger.info(stream.id, 'Stream removed', { sourceName: stream.name });
+    return removed.map(stream => stream.id);
   }
+  #updateConfig(change) { return this.store.update ? this.store.update(change) : this.store.save(change(this.store.value)); }
 }

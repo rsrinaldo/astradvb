@@ -25,7 +25,7 @@ export class PacketPipeline {
     this.metadata = new StreamMetadata(config.name, config.serviceId, section => {
       if (!config.hlsCompatibility) return;
       const packets = this.hlsMetadata.relayEPG(section); if (packets.length) this.hls.push(packets);
-    });
+    }, sharedConcat);
   }
   process(kind, data, now) {
     if (kind === 'input') { this.inputAnalyzer.push(data); this.epg.push(data); return null; }
@@ -54,7 +54,9 @@ export class PacketPipeline {
   }
   releasePublishedMedia() {
     // The parent owns HTTP cache retention. Workers only need HLS metadata.
-    for (const segment of this.hls.segments) segment.data = Buffer.alloc(0);
-    this.hls.retired.clear(); this.hls.retiredBytes = 0;
+    for (const segment of this.hls.segments) if (segment.data.length) segment.data = EMPTY_MEDIA;
+    this.hls.retired.clear(); this.hls.retiredBytes = 0; this.hls.nextRetirementExpiry = Infinity;
   }
 }
+
+const EMPTY_MEDIA = Buffer.alloc(0);

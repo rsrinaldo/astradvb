@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile, unlink } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { normalizeAccess } from './access.mjs';
@@ -9,6 +9,11 @@ const defaults = {
   adapters: [],
   casProfiles: [],
   streams: [],
+};
+
+const bounded = (value, fallback, minimum, maximum) => {
+  const number = value === null || value === '' ? NaN : Number(value);
+  return Number.isFinite(number) ? Math.min(maximum, Math.max(minimum, number)) : fallback;
 };
 
 export function normalizeConfig(value = {}) {
@@ -23,11 +28,13 @@ export function normalizeConfig(value = {}) {
   config.server.port = Number(config.server.port) || 8000;
   if (process.env.ASTRA_HOST) config.server.host = process.env.ASTRA_HOST;
   if (process.env.ASTRA_PORT) config.server.port = Number(process.env.ASTRA_PORT) || config.server.port;
-  if (config.server.port < 1 || config.server.port > 65535) throw new Error('Server port must be between 1 and 65535');
-  config.settings.inputTimeoutMs = Math.max(1000, Number(config.settings.inputTimeoutMs) || 5000);
-  config.settings.failoverDelayMs = Math.max(0, Number(config.settings.failoverDelayMs) || 1500);
-  config.settings.hlsSegmentSeconds = Math.max(2, Number(config.settings.hlsSegmentSeconds) || 6);
-  config.settings.hlsWindowSegments = Math.max(3, Number(config.settings.hlsWindowSegments) || 5);
+  if (!Number.isInteger(config.server.port) || config.server.port < 1 || config.server.port > 65535) throw new Error('Server port must be an integer between 1 and 65535');
+  config.settings.inputTimeoutMs = Math.trunc(bounded(config.settings.inputTimeoutMs, 5000, 1000, 300000));
+  config.settings.failoverDelayMs = Math.trunc(bounded(config.settings.failoverDelayMs, 1500, 0, 60000));
+  config.settings.hlsSegmentSeconds = bounded(config.settings.hlsSegmentSeconds, 6, 2, 60);
+  config.settings.hlsWindowSegments = Math.trunc(bounded(config.settings.hlsWindowSegments, 5, 3, 60));
+  const logLimit = Number(config.settings.logLimit);
+  config.settings.logLimit = Number.isFinite(logLimit) ? Math.max(1, Math.min(10000, Math.trunc(logLimit))) : 1000;
   config.streams = config.streams.map(normalizeStream);
   return config;
 }
@@ -82,7 +89,7 @@ export function normalizeStream(stream = {}) {
   const outputs = Array.isArray(stream.outputs) ? stream.outputs : [];
   return {
     id,
-    name: String(stream.name || id),
+    name: String(stream.name || id).slice(0, 256),
     enabled: Boolean(stream.enabled),
     inputs: inputs.map((input) => typeof input === 'string' ? { url: input } : { ...input, url: String(input.url || '') }).filter((input) => input.url),
     outputs: outputs.map((output) => typeof output === 'string' ? { url: output } : { ...output, url: String(output.url || '') }).filter((output) => output.url),
@@ -90,7 +97,7 @@ export function normalizeStream(stream = {}) {
     hlsCompatibility: Boolean(stream.hlsCompatibility),
     http: stream.http !== false,
     onDemand: Boolean(stream.onDemand),
-    keepActiveSeconds: Math.max(0, Number(stream.keepActiveSeconds) || 0),
+    keepActiveSeconds: bounded(stream.keepActiveSeconds, 0, 0, 86400),
     service: stream.service && typeof stream.service === 'object' ? stream.service : {},
     remap: stream.remap && typeof stream.remap === 'object' ? stream.remap : {},
     epg: stream.epg && typeof stream.epg === 'object' ? stream.epg : {},
@@ -105,6 +112,7 @@ export class ConfigStore {
   constructor(path = process.env.ASTRA_CONFIG || './data/config.json') {
     this.path = resolve(path);
     this.value = normalizeConfig();
+    this.writeQueue = Promise.resolve();
   }
 
   async load() {
@@ -117,12 +125,22 @@ export class ConfigStore {
     return this.value;
   }
 
-  async save(value) {
+  save(value) { return this.update(() => value); }
+
+  update(change) {
+    const write = this.writeQueue.catch(() => {}).then(() => this.#write(change(this.value)));
+    this.writeQueue = write;
+    return write;
+  }
+
+  async #write(value) {
     const next = normalizeConfig(value);
     await mkdir(dirname(this.path), { recursive: true });
     const temp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-    await rename(temp, this.path);
+    try {
+      await writeFile(temp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+      await rename(temp, this.path);
+    } finally { await unlink(temp).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
     this.value = next;
     return this.value;
   }

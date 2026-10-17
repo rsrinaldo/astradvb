@@ -46,6 +46,18 @@ node src/server.mjs
 
 Open `http://server-address:8000/` and sign in as `admin`. Read the unique initial password from `data/initial-admin-password`, then change it in **Settings → Administrator account**. All example streams are disabled.
 
+## Resource efficiency and correctness (v0.8.47)
+
+This release retains the v0.8.46 native decoder/policy-6 build, shared provider scheduling and all CAS budgets. It removes per-packet HLS temporary objects, coalesces unchanged metadata ranges, and writes rewritten worker metadata directly into one shared allocation. PAT-only media passes through without a transport copy. Analyzer/framer remainders own only their small tails rather than pinning a whole input allocation.
+
+HLS still keeps its minimum three-target-duration live window and retired-segment download grace. The grace calculation now uses the largest **actual post-trim playlist**, not an unpublished longer intermediate list. Expired retired data is also pruned while sources are idle. Authenticated status and private diagnostics expose `mediaCache`: current/playlist/retired payload bytes and segment counts. This is media payload accounting, not process RSS: worker-current media, HTTP writes, Node heaps, EPG, native processes and allocator/GC overhead are separate. No uniform RAM saving or Cesbo performance parity is implied.
+
+Input abort listeners/sockets/readers and child processes have explicit cleanup; stubborn FFmpeg/DVB children receive bounded termination. The optional HLS compatibility remux has a 2-MiB pending input ceiling and paced recovery without restarting source tuners or CAS. UDP/RTP outputs have a 2-MiB pending-send ceiling, sanitized/rate-limited failure warnings and numeric pending/drop/error counters. RTP timestamps use a monotonic 90-kHz send clock. These queue ceilings are overload protection, not intentional playback delays or a guarantee against packet loss.
+
+Concurrent configuration mutations are serialized and merged against the latest saved state. Logging-only changes no longer restart media workers, and log rings/timers have finite bounds. Exported channel aliases cannot shadow another stream's internal ID; alias lookup is cached per configuration snapshot. Malformed request URLs return HTTP 400 instead of terminating the service. On-demand HLS now starts on an allowed request, keeps one idle timer, and returns HTTP 503 with `Retry-After: 1` until its first segment is ready. Disabled streams are not publicly playable.
+
+The optional generated-transport CPU gate is `ASTRA_PACKET_PERFORMANCE=1 ASTRA_PACKET_PERFORMANCE_BASELINE=/path/to/previous/release node --test test/packet-performance.test.mjs`. It runs baseline/candidate Node processes sequentially with sanitized environments, uses no sockets/provider/production input, checks exact ordered A/V and zero introduced continuity errors, and rejects CPU/byte regressions above 25%. It is a same-host regression check, not a throughput promise; without explicit opt-in/baseline it skips. See [v0.8.47 audit and verification](VERIFICATION-0.8.47.md) for measurements and limitations.
+
 ## Docker
 
 ```bash
