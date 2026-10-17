@@ -1,4 +1,11 @@
-# Native ciphertext safety — policy 5
+# Native ciphertext safety — design baseline and policy 6
+
+The policy-5/v7 review below is the historical safety baseline. Current normal
+policy 6 retains that contract and adds bounded READY-prefix cohort gathering
+with strict ordered emission and revision-cached waiting-anchor probes. It does
+not add a media buffer or relax key evidence/retention. The current patch hash
+and measured performance/safety gates are in `../VERIFICATION-0.8.46.md`; the
+v7 hash below identifies the prior reviewed baseline, not the current artifact.
 
 This design note describes `patches/tsdecrypt-ciphertext-safety.patch`, included
 as the seventh normal native patch by the installer and Docker build. Policy 5

@@ -634,11 +634,12 @@ index 0887e15..b124029 100644
  	if (!ts->pid_report)
 diff --git a/astra-ciphertext-safety.h b/astra-ciphertext-safety.h
 new file mode 100644
-index 0000000..8d815b3
+index 0000000..e8fc54b
 --- /dev/null
 +++ b/astra-ciphertext-safety.h
-@@ -0,0 +1,430 @@
-+/* Isolated decoder candidate. Not part of the normal native build.
+@@ -0,0 +1,474 @@
++/* Normal native decoder safety (policy 6). READY-prefix SIMD cohorts preserve
++ * original TS order and adaptive retention bounds without fixed input delay.
 + * Copyright AstraDVB contributors, GPL-2.0-only.
 + *
 + * A PES anchor is syntax evidence, not CSA authentication. Retrospective
@@ -683,10 +684,11 @@ index 0000000..8d815b3
 +    uint64_t serial, received_ms;
 +};
 +struct astra_ct_run {
-+    uint8_t present, parity, type, failed, confirmed, had_hold, prefix_allowed;
++    uint8_t present, parity, type, failed, confirmed, had_hold, prefix_allowed, probe_cached;
 +    uint16_t pid, key, references;
 +    uint32_t context;
 +    uint64_t serial, first_ms, ambiguous_mask, retained_mask;
++    uint64_t anchor_revision, probe_anchor_revision, probe_candidate_revision;
 +    /* References into the bounded raw queue, not copied media. A PES prefix
 +     * needs at most19 payload bytes, hence at most19 TS packets. */
 +    uint64_t anchor_slots[19];
@@ -715,7 +717,7 @@ index 0000000..8d815b3
 +    uint8_t batch_raw[ASTRA_CT_BATCH_PACKETS][188], batch_clear[ASTRA_CT_BATCH_PACKETS][188];
 +    size_t capacity, head, count;
 +    uint32_t context, wait_ms;
-+    uint64_t serial, sequence, word_revision[2], transition_revision, next_gc_ms;
++    uint64_t serial, sequence, word_revision[2], candidate_revision[2], transition_revision, next_gc_ms;
 +    uint8_t phase_seen, phase, output_failed, candidate_blocked, probe_dirty, batch_size, deferred;
 +};
 +
@@ -786,6 +788,7 @@ index 0000000..8d815b3
 +        else memset(&s->keys[i], 0, sizeof(s->keys[i]));
 +    }
 +    s->candidate_blocked = 3; s->word_revision[0]++; s->word_revision[1]++;
++    s->candidate_revision[0]++; s->candidate_revision[1]++;
 +}
 +static inline void astra_ciphertext_context(struct astra_ciphertext *s, uint32_t context) {
 +    if (s->context == context) return;
@@ -798,6 +801,7 @@ index 0000000..8d815b3
 +    }
 +    s->context = context; s->phase_seen = 0; s->candidate_blocked = 0;
 +    s->word_revision[0]++; s->word_revision[1]++; s->transition_revision++;
++    s->candidate_revision[0]++; s->candidate_revision[1]++;
 +}
 +static inline void astra_ciphertext_pid(struct astra_ciphertext *s, unsigned int pid, uint8_t type) {
 +    if (pid >= ASTRA_CT_PID_COUNT) return;
@@ -821,7 +825,10 @@ index 0000000..8d815b3
 +        unsigned int newer = 0;
 +        for (unsigned int j = 0; j < ASTRA_CT_KEY_COUNT; j++) if (s->keys[j].present &&
 +            s->keys[j].context == k->context && s->keys[j].parity == k->parity && s->keys[j].serial > k->serial) newer++;
-+        if (k->context != context || newer >= 2) memset(k, 0, sizeof(*k));
++        if (k->context != context || newer >= 2) {
++            s->candidate_revision[k->parity]++; s->probe_dirty = 1;
++            memset(k, 0, sizeof(*k));
++        }
 +    }
 +    for (unsigned int i = 0; i < ASTRA_CT_KEY_COUNT; i++) {
 +        struct astra_ct_key *k = &s->keys[i];
@@ -837,6 +844,7 @@ index 0000000..8d815b3
 +    if (chosen == ASTRA_CT_NONE) {
 +        s->stats.candidate_overflows++; s->candidate_blocked |= 1u << parity;
 +        s->word_revision[parity]++;
++        s->candidate_revision[parity]++;
 +        /* No old certificate may silently stand in for an unrecorded word. */
 +        for (unsigned int i = 0; i < ASTRA_CT_RUN_COUNT; i++) {
 +            struct astra_ct_run *r = &s->runs[i];
@@ -845,10 +853,11 @@ index 0000000..8d815b3
 +        return 0;
 +    }
 +    struct astra_ct_key *k = &s->keys[chosen];
++    if (k->present) s->candidate_revision[k->parity]++;
 +    memset(k, 0, sizeof(*k)); memcpy(k->word, word, 8);
 +    k->present = 1; k->parity = parity; k->context = context; k->serial = ++s->serial; k->received_ms = now_ms;
 +    s->candidate_blocked &= ~(1u << parity);
-+    s->word_revision[parity]++; s->probe_dirty = 1;
++    s->word_revision[parity]++; s->candidate_revision[parity]++; s->probe_dirty = 1;
 +    return 1;
 +}
 +static inline uint16_t astra_ct_new_run(struct astra_ciphertext *s, unsigned int pid, unsigned int parity, int prefix_allowed, uint64_t now_ms) {
@@ -875,6 +884,13 @@ index 0000000..8d815b3
 +static inline void astra_ct_probe(struct astra_ciphertext *s, struct astra_ct_run *r, uint64_t now_ms) {
 +    if (r->confirmed || r->failed || !r->anchor_count || (s->candidate_blocked & (1u << r->parity))) return;
 +    if (now_ms - r->first_ms >= s->wait_ms) { r->failed = 1; return; }
++    /* A completed unchanged anchor does not gain evidence from another TS
++     * continuation. Keep UNKNOWN pins intact, but admit every genuinely new
++     * candidate and every new/split PES prefix. Expiry above is never cached. */
++    if (r->probe_cached && r->probe_anchor_revision == r->anchor_revision &&
++        r->probe_candidate_revision == s->candidate_revision[r->parity]) return;
++    r->probe_cached = 1; r->probe_anchor_revision = r->anchor_revision;
++    r->probe_candidate_revision = s->candidate_revision[r->parity];
 +    uint16_t chosen = ASTRA_CT_NONE; unsigned int matches = 0, unknown = 0; uint64_t possible_mask = 0;
 +    for (unsigned int i = 0; i < ASTRA_CT_KEY_COUNT; i++) {
 +        struct astra_ct_key *k = &s->keys[i];
@@ -955,22 +971,49 @@ index 0000000..8d815b3
 +            astra_ct_drop_head(s, 4); continue;
 +        }
 +        if (r && s->batch) {
-+            unsigned int count = 0; uint16_t key_id = r->key;
-+            while (count < s->batch_size && count < s->count) {
-+                struct astra_ct_packet *item = &s->queue[(s->head + count) % s->capacity];
-+                if (item->run == ASTRA_CT_NONE) break;
-+                struct astra_ct_run *run = &s->runs[item->run];
-+                if (!run->present || run->serial != item->run_serial || !run->confirmed || run->failed || run->key != key_id ||
-+                    (!run->prefix_allowed && item->sequence < run->anchor_slots[0])) break;
-+                memcpy(s->batch_raw[count++], item->bytes, 188);
++            unsigned int ready = 0;
++            /* Inspect only the existing SIMD-sized READY prefix. Clear PSI/
++             * audio/control slots must not fragment an immutable-key cohort,
++             * but no decrypt or output may look past uncertain ciphertext or
++             * a fail-closed discard boundary. */
++            while (ready < s->batch_size && ready < s->count) {
++                struct astra_ct_packet *item = &s->queue[(s->head + ready) % s->capacity];
++                if (item->run != ASTRA_CT_NONE) {
++                    struct astra_ct_run *run = &s->runs[item->run];
++                    if (!run->present || run->serial != item->run_serial) { s->output_failed = 1; return 0; }
++                    if (!run->confirmed || run->failed ||
++                        (!run->prefix_allowed && item->sequence < run->anchor_slots[0])) break;
++                }
++                ready++;
 +            }
-+            if (!count || !s->batch(s->opaque, s->keys[key_id].word, s->batch_raw, s->batch_clear, count)) {
-+                s->output_failed = 1; return 0;
++            if (!ready) { s->output_failed = 1; return 0; }
++            uint8_t transformed[ASTRA_CT_BATCH_PACKETS] = {0};
++            uint8_t positions[ASTRA_CT_BATCH_PACKETS];
++            for (unsigned int start = 0; start < ready; start++) {
++                struct astra_ct_packet *first = &s->queue[(s->head + start) % s->capacity];
++                if (transformed[start] || first->run == ASTRA_CT_NONE) continue;
++                uint16_t key_id = s->runs[first->run].key; unsigned int count = 0;
++                for (unsigned int at = start; at < ready; at++) {
++                    struct astra_ct_packet *item = &s->queue[(s->head + at) % s->capacity];
++                    if (transformed[at] || item->run == ASTRA_CT_NONE || s->runs[item->run].key != key_id) continue;
++                    positions[count] = at; memcpy(s->batch_raw[count++], item->bytes, 188);
++                }
++                if (!count || !s->batch(s->opaque, s->keys[key_id].word, s->batch_raw, s->batch_clear, count)) {
++                    s->output_failed = 1; return 0;
++                }
++                for (unsigned int i = 0; i < count; i++) if (s->batch_clear[i][3] & 0xc0) { s->output_failed = 1; return 0; }
++                /* Only certified queue entries are transformed. Once any raw
++                 * entry is overwritten, every later decrypt/emit failure is
++                 * sticky: mutated ciphertext can never be re-probed/retried. */
++                for (unsigned int i = 0; i < count; i++) {
++                    unsigned int at = positions[i]; transformed[at] = 1;
++                    memcpy(s->queue[(s->head + at) % s->capacity].bytes, s->batch_clear[i], 188);
++                }
 +            }
-+            for (unsigned int i = 0; i < count; i++) if (s->batch_clear[i][3] & 0xc0) { s->output_failed = 1; return 0; }
-+            for (unsigned int i = 0; i < count; i++) {
-+                if (!s->emit(s->opaque, s->batch_clear[i])) { s->output_failed = 1; return 0; }
-+                p = &s->queue[s->head]; s->stats.packets_out++;
++            for (unsigned int i = 0; i < ready; i++) {
++                p = &s->queue[s->head];
++                if (!s->emit(s->opaque, p->bytes)) { s->output_failed = 1; return 0; }
++                s->stats.packets_out++;
 +                astra_ct_run_release(s, p->run);
 +                s->head = (s->head + 1) % s->capacity; s->count--;
 +            }
@@ -1049,11 +1092,12 @@ index 0000000..8d815b3
 +    if (s->stats.current_held_bytes > s->stats.peak_held_bytes) s->stats.peak_held_bytes = s->stats.current_held_bytes;
 +    if (id != ASTRA_CT_NONE) {
 +        struct astra_ct_run *r = &s->runs[id]; r->references++;
-+        if (packet[1] & 0x40) { r->anchor_count = 0; r->anchor_bytes = 0; r->anchor_complete = 0; r->anchor_cc = packet[3] & 15; }
++        if (packet[1] & 0x40) { r->anchor_count = 0; r->anchor_bytes = 0; r->anchor_complete = 0; r->anchor_cc = packet[3] & 15; r->anchor_revision++; }
 +        if (((packet[1] & 0x40) || (r->anchor_count && (packet[3] & 15) != r->anchor_cc)) && !r->anchor_complete && r->anchor_count < 19) {
 +            unsigned int copy = 188 - offset;
 +            if (copy > 19u - r->anchor_bytes) copy = 19u - r->anchor_bytes;
 +            r->anchor_slots[r->anchor_count++] = q->sequence; r->anchor_bytes += copy;
++            r->anchor_revision++;
 +            r->anchor_cc = packet[3] & 15; r->anchor_complete = r->anchor_bytes == 19;
 +        }
 +        astra_ct_probe(s, r, now_ms);

@@ -23,6 +23,7 @@ test('native CAS verification requires matching policy, source and actual execut
   await writeFile(binary, 'different-binary'); assert.equal(protectedNativeBuild(binary, manifest), false);
   await writeFile(binary, 'fake-native-binary'); await writeFile(manifest, JSON.stringify({ ...value, policyVersion: 1 })); assert.equal(protectedNativeBuild(binary, manifest), false);
   await writeFile(manifest, JSON.stringify({ ...value, policyVersion: 2 })); assert.equal(protectedNativeBuild(binary, manifest), false);
+  await writeFile(manifest, JSON.stringify({ ...value, policyVersion: 5 })); assert.equal(protectedNativeBuild(binary, manifest), false, 'Upgrades must replace the pre-optimization decoder, not reuse policy 5');
   await writeFile(manifest, JSON.stringify({ ...value, sourceRevision: 'wrong' })); assert.equal(protectedNativeBuild(binary, manifest), false);
   await writeFile(manifest, '{broken'); assert.equal(protectedNativeBuild(binary, manifest), false);
 });

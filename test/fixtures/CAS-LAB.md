@@ -75,10 +75,14 @@ with no output pauses and exactly one true semantic ECM identity. A PMT version
 or unrelated descriptor update must not force an unnecessary key refetch or
 leave the existing channel keyless.
 
-## Normal policy 5 ciphertext safety
+## Normal policy 6 ciphertext safety
 
 The helper is embedded in `patches/tsdecrypt-ciphertext-safety.patch`, the seventh
-normal native patch in the installer/Docker policy 5 bundle. The separate
+normal native patch in the installer/Docker policy 6 bundle. It retains the
+policy-5 safety contract while gathering immutable-key cohorts across the
+bounded READY prefix and caching unchanged waiting-anchor evidence. Exact FIFO,
+uncertainty boundaries, candidate pins, terminal failures and the existing
+two-second/8-MiB limits remain mandatory. The separate
 experimental helper copies are no longer needed. This is not promotion of the
 older key-epoch prototype. The decoder retains bounded
 original-order ciphertext, immutable candidate CW halves, and per-PID PES syntax

@@ -11,7 +11,8 @@
 struct oracle {
     uint8_t reference[ORACLE_PACKETS][188];
     size_t references, cursor, emitted, bad;
-    unsigned int ambiguous, fail_emit, batch_calls, maximum_batch;
+    unsigned int ambiguous, fail_emit, batch_calls, maximum_batch, batch_packets, scalar_calls;
+    unsigned int strict_order, fail_after_emits, fail_batch_call, residual_batch_call;
     struct astra_ciphertext *engine;
     unsigned int require_idle_owner_release, idle_release_checks;
 };
@@ -24,7 +25,7 @@ static void packet(uint8_t out[188], unsigned int pid, unsigned int cc, int pusi
         memcpy(out + 4, pes, sizeof(pes));
     }
 }
-static int decrypt(void *opaque, const uint8_t key[8], const uint8_t raw[188], uint8_t clear[188]) {
+static int decrypt_transform(void *opaque, const uint8_t key[8], const uint8_t raw[188], uint8_t clear[188]) {
     struct oracle *o = opaque; memcpy(clear, raw, 188); unsigned int offset = astra_ct_offset(raw);
     for (unsigned int i = offset; i < 188; i++) clear[i] ^= key[(i - offset) & 7];
     clear[3] &= 0x3f;
@@ -34,9 +35,14 @@ static int decrypt(void *opaque, const uint8_t key[8], const uint8_t raw[188], u
     }
     return 1;
 }
+static int decrypt(void *opaque, const uint8_t key[8], const uint8_t raw[188], uint8_t clear[188]) {
+    struct oracle *o = opaque; o->scalar_calls++;
+    return decrypt_transform(opaque, key, raw, clear);
+}
 static int emit(void *opaque, const uint8_t clear[188]) {
     struct oracle *o = opaque;
-    if (o->fail_emit) return 0;
+    if (o->fail_emit || (o->fail_after_emits && o->emitted == o->fail_after_emits)) return 0;
+    if (o->strict_order) assert(o->cursor < o->references && !memcmp(clear, o->reference[o->cursor], 188));
     if (o->require_idle_owner_release) {
         struct astra_ciphertext *s = o->engine;
         unsigned int pid = ((unsigned int)(clear[1] & 31) << 8) | clear[2];
@@ -55,7 +61,10 @@ static int emit(void *opaque, const uint8_t clear[188]) {
 static int decrypt_batch(void *opaque, const uint8_t key[8], const uint8_t (*raw)[188], uint8_t (*clear)[188], size_t count) {
     struct oracle *o = opaque; assert(count > 0 && count <= ASTRA_CT_BATCH_PACKETS);
     o->batch_calls++; if (count > o->maximum_batch) o->maximum_batch = count;
-    for (size_t i = 0; i < count; i++) assert(decrypt(opaque, key, raw[i], clear[i]));
+    if (o->fail_batch_call == o->batch_calls) return 0;
+    o->batch_packets += count;
+    for (size_t i = 0; i < count; i++) assert(decrypt_transform(opaque, key, raw[i], clear[i]));
+    if (o->residual_batch_call == o->batch_calls) clear[0][3] |= 0x80;
     return 1;
 }
 static struct astra_ciphertext *start(size_t bytes, unsigned int wait_ms) {
@@ -374,7 +383,9 @@ static void late_new_candidate_and_exact_retention_references(void) {
     unsigned int added = candidate_index(s, correct); uint64_t both = (UINT64_C(1) << old) | (UINT64_C(1) << added);
     assert(run->retained_mask == both && run->ambiguous_mask == both);
     assert(s->keys[old].references == 1 && s->keys[added].references == 1 && oracle.emitted == 0);
+    unsigned int before_unchanged_probes = oracle.scalar_calls;
     for (unsigned int i = 0; i < 20; i++) assert(astra_ciphertext_pump(s, 1, 0));
+    assert(oracle.scalar_calls == before_unchanged_probes && "unchanged ambiguous anchors and candidate sets need no repeated scalar decryption");
     assert(s->keys[old].references == 1 && s->keys[added].references == 1 && "reprobes cannot duplicate retention references");
     push(s, 256, 1, 1, 0, 1, 2, 2);
     assert(astra_ciphertext_pump(s, 2001, 0));
@@ -383,13 +394,192 @@ static void late_new_candidate_and_exact_retention_references(void) {
     assert(astra_ciphertext_pump(s, 3002, 0)); assert(s->keys[added].references == 0);
     safe_tail(s, 3003, 1);
 }
-int main(void) {
+static void push_clear(struct astra_ciphertext *s, unsigned int pid, unsigned int cc, int pusi, uint64_t now, uint8_t fill) {
+    uint8_t clear[188]; packet(clear, pid, cc, pusi, fill); assert(oracle.references < ORACLE_PACKETS);
+    memcpy(oracle.reference[oracle.references++], clear, 188); assert(astra_ciphertext_push(s, clear, now));
+}
+static void exact_owned_references(struct astra_ciphertext *s) {
+    unsigned int runs[ASTRA_CT_RUN_COUNT] = {0}, keys[ASTRA_CT_KEY_COUNT] = {0};
+    for (unsigned int i = 0; i < ASTRA_CT_PID_COUNT; i++) if (s->pids[i].run != ASTRA_CT_NONE) {
+        assert(s->pids[i].run < ASTRA_CT_RUN_COUNT); runs[s->pids[i].run]++;
+    }
+    for (size_t i = 0; i < s->count; i++) {
+        struct astra_ct_packet *p = &s->queue[(s->head + i) % s->capacity];
+        if (p->run == ASTRA_CT_NONE) continue;
+        assert(p->run < ASTRA_CT_RUN_COUNT && s->runs[p->run].present && s->runs[p->run].serial == p->run_serial); runs[p->run]++;
+    }
+    for (unsigned int i = 0; i < ASTRA_CT_RUN_COUNT; i++) {
+        struct astra_ct_run *r = &s->runs[i]; assert(r->references == runs[i]);
+        if (!r->present) { assert(runs[i] == 0); continue; }
+        if (r->key != ASTRA_CT_NONE) { assert(r->key < ASTRA_CT_KEY_COUNT); keys[r->key]++; }
+        for (unsigned int k = 0; k < ASTRA_CT_KEY_COUNT; k++) if (r->retained_mask & (UINT64_C(1) << k)) keys[k]++;
+    }
+    for (unsigned int i = 0; i < ASTRA_CT_KEY_COUNT; i++) assert(s->keys[i].references == keys[i]);
+}
+static void ready_interleaving(struct astra_ciphertext *s, unsigned int different_keys, unsigned int rounds) {
+    unsigned int cc[3] = {0}; oracle.strict_order = 1;
+    astra_ciphertext_pid(s, 258, 0x03);
+    publish(s, 0, 1, 0); if (different_keys) publish(s, 0, 2, 0);
+    for (unsigned int round = 0; round < rounds; round++) {
+        for (unsigned int i = 0; i < ASTRA_CT_BATCH_PACKETS; i++) {
+            uint64_t now = (uint64_t)round + 1;
+            if (i % 7 == 6) push_clear(s, 8191, i, 0, now, (uint8_t)(i + round));
+            else if (i % 7 == 5) { unsigned int audio = cc[2]++; push_clear(s, 258, audio, audio == 0, now, (uint8_t)(i + round + 20)); }
+            else {
+                unsigned int which = different_keys && ((i - i / 7 * 2) & 1), sequence = cc[which]++;
+                push(s, 256 + which, sequence, sequence == 0, 0, which + 1, now, (uint8_t)(i + round + 50));
+            }
+        }
+        assert(astra_ciphertext_pump(s, round + 1, 0));
+        exact_owned_references(s); assert(s->count == 0 && oracle.cursor == oracle.references);
+    }
+}
+static void ready_prefix_gathers_across_clear_and_other_keys(void) {
+    for (unsigned int different = 0; different < 2; different++) {
+        const unsigned int rounds = 32;
+        struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 2000);
+        assert(astra_ciphertext_batch(s, decrypt_batch, ASTRA_CT_BATCH_PACKETS)); astra_ciphertext_defer(s, 1);
+        ready_interleaving(s, different, rounds);
+        // Each70-slot ready prefix contains50 ciphertexts and20 clear audio/
+        // control packets. Interleaving must not fragment one key into10+ SIMD
+        // calls, nor alternate certified words into per-packet calls.
+        assert(oracle.batch_calls == rounds * (different ? 2u : 1u) && "ready interleaving must retain one SIMD call per immutable word per bounded prefix");
+        assert(oracle.batch_packets == rounds * 50u && oracle.maximum_batch >= (different ? 25u : 50u));
+        assert(oracle.bad == 0 && oracle.emitted == oracle.references && s->stats.packets_dropped == 0);
+        exact(s, rounds + 2);
+    }
+}
+static void unresolved_prefix_blocks_ready_tail(void) {
+    struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 2000); oracle.strict_order = 1;
+    publish(s, 0, 1, 0); assert(astra_ciphertext_batch(s, decrypt_batch, ASTRA_CT_BATCH_PACKETS)); astra_ciphertext_defer(s, 1);
+    push(s, 256, 0, 1, 1, 2, 0, 1); // Unknown odd head, despite ready even tail.
+    for (unsigned int i = 0; i < 31; i++) {
+        if (i % 3 == 2) push_clear(s, 8191, i, 0, 1, i + 2);
+        else push(s, 257, i - i / 3, i == 0, 0, 1, 1, i + 2);
+    }
+    exact_owned_references(s); assert(astra_ciphertext_pump(s, 2, 0));
+    assert(oracle.emitted == 0 && oracle.batch_calls == 0 && "SIMD gather cannot cross unresolved FIFO work, even to pre-decrypt a ready tail");
+    publish(s, 1, 2, 3); assert(astra_ciphertext_pump(s, 3, 0)); exact_owned_references(s);
+    assert(oracle.emitted == oracle.references && oracle.bad == 0); exact(s, 4);
+}
+static void gathered_wrap_stops_at_uncertain_boundary_and_drains_eof(void) {
+    const size_t bytes = sizeof(struct astra_ciphertext) + 128 * sizeof(struct astra_ct_packet);
+    struct astra_ciphertext *s = start(bytes, 2000); oracle.strict_order = 1;
+    astra_ciphertext_pid(s, 258, 0x1b); publish(s, 0, 1, 0);
+    assert(astra_ciphertext_batch(s, decrypt_batch, ASTRA_CT_BATCH_PACKETS)); astra_ciphertext_defer(s, 1);
+    for (unsigned int i = 0; i < 70; i++) push(s, 256, i, i == 0, 0, 1, 0, i + 1);
+    push(s, 258, 0, 1, 1, 2, 1, 90); // Interior uncertainty is a hard gather boundary.
+    unsigned int cc = 0;
+    for (unsigned int i = 0; i < 49; i++) {
+        if (i % 7 == 6) push_clear(s, 8191, i, 0, 1, i + 100);
+        else { unsigned int sequence = cc++; push(s, 257, sequence, sequence == 0, 0, 1, 1, i + 100); }
+    }
+    assert(s->count == 120); assert(astra_ciphertext_pump(s, 2, 0));
+    assert(oracle.emitted == 70 && oracle.batch_packets == 70 && s->head == 70 && s->count == 50);
+    for (unsigned int i = 49; i < 89; i++) {
+        if (i % 7 == 6) push_clear(s, 8191, i, 0, 2, i + 100);
+        else { unsigned int sequence = cc++; push(s, 257, sequence, 0, 0, 1, 2, i + 100); }
+    }
+    assert(s->head + s->count > s->capacity && "the strict case must actually wrap the physical ciphertext ring");
+    assert(astra_ciphertext_pump(s, 2, 0));
+    assert(oracle.emitted == 70 && oracle.batch_packets == 70 && "ready-tail ciphertext cannot be gathered across the blocked interior boundary");
+    exact_owned_references(s); publish(s, 1, 2, 3);
+    assert(astra_ciphertext_finish(s, 4)); exact_owned_references(s);
+    assert(oracle.emitted == oracle.references && oracle.bad == 0 && s->count == 0 && s->stats.packets_dropped == 0);
+    assert(oracle.batch_calls == 4 && "wrapped ready cohorts and the partial EOF tail retain bounded SIMD batching");
+    astra_ciphertext_destroy(s);
+}
+static void gathered_batch_failures_are_terminal(void) {
+    for (unsigned int failure = 0; failure < 3; failure++) {
+        struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 2000); oracle.strict_order = 1;
+        assert(astra_ciphertext_batch(s, decrypt_batch, ASTRA_CT_BATCH_PACKETS)); astra_ciphertext_defer(s, 1);
+        publish(s, 0, 1, 0); publish(s, 0, 2, 0);
+        for (unsigned int i = 0; i < 35; i++) {
+            push(s, 256 + (i & 1), i / 2, i < 2, 0, 1 + (i & 1), 1, i + 1);
+            push_clear(s, 8191, i, 0, 1, i + 100);
+        }
+        if (failure == 0) oracle.fail_batch_call = 2;
+        if (failure == 1) oracle.residual_batch_call = 2;
+        if (failure == 2) oracle.fail_after_emits = 7;
+        assert(!astra_ciphertext_pump(s, 2, 0));
+        assert(s->output_failed && oracle.bad == 0 && oracle.emitted == (failure == 2 ? 7u : 0u));
+        assert(s->stats.packets_out == oracle.emitted && s->count == oracle.references - oracle.emitted);
+        exact_owned_references(s);
+        unsigned int calls = oracle.batch_calls, probes = oracle.scalar_calls; size_t emitted = oracle.emitted;
+        assert(!astra_ciphertext_pump(s, 3, 0) && !astra_ciphertext_finish(s, 4));
+        assert(oracle.batch_calls == calls && oracle.scalar_calls == probes && oracle.emitted == emitted && "partially transformed output must never be retried or emitted twice");
+        astra_ciphertext_destroy(s);
+    }
+    struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 2000);
+    publish(s, 0, 1, 0); assert(astra_ciphertext_batch(s, decrypt_batch, ASTRA_CT_BATCH_PACKETS)); astra_ciphertext_defer(s, 1);
+    push(s, 256, 0, 1, 0, 1, 0, 1);
+    struct astra_ct_run *r = &s->runs[s->pids[256].run]; assert(r->confirmed); r->failed = 2;
+    assert(!astra_ciphertext_pump(s, 1, 0) && s->output_failed && oracle.emitted == 0 && oracle.batch_calls == 0);
+    assert(!astra_ciphertext_finish(s, 2) && "an inconsistent confirmed/failed head must fail terminally, not spin on a zero-length ready prefix");
+    exact_owned_references(s); astra_ciphertext_destroy(s);
+}
+static void completed_anchor_probe_cache_and_fresh_evidence(void) {
+    struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 2000);
+    assert(astra_ciphertext_batch(s, decrypt_batch, ASTRA_CT_BATCH_PACKETS));
+    publish(s, 0, 1, 0); push(s, 256, 0, 1, 0, 2, 0, 1); // Complete PES encrypted with a genuinely late word.
+    unsigned int initial = oracle.scalar_calls; assert(initial > 0 && oracle.emitted == 0);
+    for (unsigned int i = 1; i <= 700; i++) push(s, 256, i, 0, 0, 2, i, i & 255);
+    for (unsigned int i = 0; i < 20; i++) assert(astra_ciphertext_pump(s, 701, 0));
+    publish(s, 0, 1, 702); assert(astra_ciphertext_pump(s, 702, 0)); // Identical publication is not new evidence.
+    assert(oracle.scalar_calls == initial && "one unchanged complete anchor and unchanged candidates must not be decrypted once per continuation");
+    publish(s, 0, 2, 900); assert(astra_ciphertext_pump(s, 900, 0));
+    assert(oracle.scalar_calls > initial && oracle.emitted == oracle.references && oracle.bad == 0 && "a genuinely late correct word must invalidate cached negative syntax evidence");
+    exact_owned_references(s); exact(s, 901);
+
+    s = start(ASTRA_CT_MAX_BYTES, 2000); assert(astra_ciphertext_batch(s, decrypt_batch, ASTRA_CT_BATCH_PACKETS));
+    publish(s, 0, 1, 0); push(s, 256, 0, 1, 0, 2, 0, 1); initial = oracle.scalar_calls;
+    for (unsigned int i = 1; i <= 10; i++) push(s, 256, i, 0, 0, 2, i, i);
+    assert(oracle.scalar_calls == initial); push(s, 256, 11, 1, 0, 2, 11, 12);
+    assert(oracle.scalar_calls > initial && "a new complete PES anchor must be probed even with the same candidate words");
+    assert(astra_ciphertext_finish(s, 12)); assert(oracle.emitted == 0 && oracle.bad == 0); astra_ciphertext_destroy(s);
+
+    s = start(ASTRA_CT_MAX_BYTES, 2000); assert(astra_ciphertext_batch(s, decrypt_batch, ASTRA_CT_BATCH_PACKETS));
+    publish(s, 0, 1, 0);
+    static const uint8_t pes[14] = {0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5, 0x21, 0, 1, 0, 1};
+    for (unsigned int i = 0; i < sizeof(pes); i++) {
+        uint8_t clear[188]; packet(clear, 256, i, i == 0, 0xff); clear[3] |= 0x20; clear[4] = 182; clear[5] = 0; clear[187] = pes[i];
+        unsigned int before = oracle.scalar_calls; push_bytes(s, clear, 0, 1, i);
+        assert(oracle.scalar_calls > before && "each genuinely new PES prefix fragment must invalidate an UNKNOWN probe cache");
+    }
+    assert(oracle.emitted == oracle.references && oracle.bad == 0); exact(s, 15);
+
+    s = start(ASTRA_CT_MAX_BYTES, 2000); assert(astra_ciphertext_batch(s, decrypt_batch, ASTRA_CT_BATCH_PACKETS));
+    for (unsigned int i = 1; i <= ASTRA_CT_KEY_COUNT; i++) publish(s, 0, i, 0);
+    push(s, 256, 0, 1, 0, 101, 0, 1); initial = oracle.scalar_calls; assert(initial == ASTRA_CT_KEY_COUNT);
+    publish(s, 1, 65, 1); assert(astra_ciphertext_pump(s, 1, 0));
+    assert(oracle.scalar_calls > initial && "opposite-parity insertion that evicts a same-parity candidate must invalidate the affected anchor cache");
+    initial = oracle.scalar_calls; publish(s, 0, 101, 2); assert(astra_ciphertext_pump(s, 2, 0));
+    assert(oracle.scalar_calls > initial && oracle.emitted == 1 && oracle.bad == 0); exact_owned_references(s); exact(s, 3);
+
+    s = start(ASTRA_CT_MAX_BYTES, 2000); assert(astra_ciphertext_batch(s, decrypt_batch, ASTRA_CT_BATCH_PACKETS));
+    publish(s, 0, 1, 0); push(s, 256, 0, 1, 0, 2, 0, 1); initial = oracle.scalar_calls;
+    astra_ciphertext_context(s, 2); uint8_t key[8]; word(key, 1); assert(astra_ciphertext_word(s, 2, 0, key, 1));
+    push(s, 256, 1, 1, 0, 1, 1, 2);
+    assert(oracle.scalar_calls > initial && oracle.emitted == 1 && oracle.bad == 0 && "new context/run identity cannot inherit cached rejection from old media");
+    exact_owned_references(s); safe_tail(s, 2, 1);
+}
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--batch-regression")) {
+        ready_prefix_gathers_across_clear_and_other_keys(); unresolved_prefix_blocks_ready_tail(); gathered_wrap_stops_at_uncertain_boundary_and_drains_eof(); gathered_batch_failures_are_terminal();
+        puts("PASS: bounded gathered batches preserve strict FIFO and terminal failure ownership"); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--probe-cache-regression")) {
+        completed_anchor_probe_cache_and_fresh_evidence(); late_new_candidate_and_exact_retention_references();
+        puts("PASS: completed-anchor cache preserves fresh evidence and exact candidate ownership"); return 0;
+    }
+    assert(argc == 1);
     healthy_parity_continuation(); delayed_and_missing_words(); prefetched_same_parity_change(); startup_ambiguous_prefix();
     pid_whole_cycle_gap(1); pid_whole_cycle_gap(0); unchanged_pairs_and_future_opposite_half(); marked_same_parity_changes(); ambiguity_context_and_eof(); bounds_and_output_failure();
     split_pes_prefix_and_cc_gap(); candidate_and_run_exhaustion(); deferred_batches_wrap_and_eof();
     expired_reply_and_ambiguity_eviction(); malformed_selected_and_clear_transition(); complete_ecm_identity(); idle_component_pid_churn();
     idle_certificate_gc_preserves_queued_ownership();
     unknown_only_candidate_eviction(); valid_unknown_candidate_eviction(); late_new_candidate_and_exact_retention_references();
+    ready_prefix_gathers_across_clear_and_other_keys(); unresolved_prefix_blocks_ready_tail(); gathered_wrap_stops_at_uncertain_boundary_and_drains_eof(); gathered_batch_failures_are_terminal(); completed_anchor_probe_cache_and_fresh_evidence();
     puts("PASS: strict ordered ciphertext safety, early-future ambiguity, PID-cycle gaps, delayed/missing keys, exact healthy continuations and bounded EOF ownership");
     return 0;
 }

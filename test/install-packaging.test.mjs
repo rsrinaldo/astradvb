@@ -11,6 +11,13 @@ const install = readFileSync(new URL('../install.sh', import.meta.url), 'utf8');
 const casInstall = readFileSync(new URL('../install-cas.sh', import.meta.url), 'utf8');
 const docker = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
 
+test('application and changed dashboard asset caches identify release 0.8.46', () => {
+  const packageInfo = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
+  assert.equal(packageInfo.version, '0.8.46');
+  assert.match(html, /\/styles\.css\?v=0\.8\.46/); assert.match(html, /\/app\.js\?v=0\.8\.46/);
+});
+
 test('installers and Docker RUN commands parse without executing installation or a container build', () => {
   for (const name of ['install.sh', 'install-cas.sh', 'bin/build-media-tcp.sh', 'bin/run-cas-lab.sh']) {
     const result = spawnSync('bash', ['-n', `${root}${name}`], { encoding: 'utf8' });
@@ -59,7 +66,7 @@ test('socket-scoped helper builds before activation without global TCP changes o
   for (const source of [install, docker, builder]) assert.doesNotMatch(source, /setcap|sysctl|modprobe|CAP_NET_ADMIN/);
 });
 
-test('system and container installations require a verified policy-5 executable and include every normal native patch', () => {
+test('system and container installations require a verified policy-6 executable and include every normal native patch', () => {
   assert.match(install, /protectedNativeBuild\("\/usr\/local\/bin\/tsdecrypt", "\/usr\/local\/share\/licenses\/tsdecrypt\/astra-native-cas\.json"\)/);
   assert.doesNotMatch(install, /\[\[.*astra-ecm-protection\.patch/);
   const patchNames = ['tsdecrypt-emm-pid.patch', 'tsdecrypt-ecm-protection.patch', 'tsdecrypt-stream-io.patch', 'tsdecrypt-cw-threadsafe.patch', 'tsdecrypt-pes-validation.patch', 'tsdecrypt-newcamd-lifetime.patch', 'tsdecrypt-ciphertext-safety.patch'];
@@ -67,8 +74,8 @@ test('system and container installations require a verified policy-5 executable 
   for (const name of patchNames) {
     assert.ok(docker.split(name).length >= 3, `Docker must copy and apply ${name}`);
   }
-  assert.match(casInstall, /"policyVersion":5/); assert.match(casInstall, /"ciphertextSafety":"%s"/); assert.match(casInstall, /\$\{patch_digests\[6\]\}/);
-  assert.match(docker, /policyVersion:5/); assert.match(docker, /binarySha256:hash/); assert.match(docker, /ciphertextSafety:digests\[6\]/);
+  assert.match(casInstall, /"policyVersion":6/); assert.match(casInstall, /"ciphertextSafety":"%s"/); assert.match(casInstall, /\$\{patch_digests\[6\]\}/);
+  assert.match(docker, /policyVersion:6/); assert.match(docker, /binarySha256:hash/); assert.match(docker, /ciphertextSafety:digests\[6\]/);
   for (const text of [casInstall, docker]) assert.doesNotMatch(text, /tsdecrypt-ciphertext-safety\.experimental\.patch/);
   assert.match(docker, /protectedNativeBuild\(\)/); assert.match(docker, /sourceDirectory:"\/usr\/local\/src\/tsdecrypt"/);
   assert.match(install, /protectedOscamBuild\("\/usr\/local\/bin\/oscam", "\/usr\/local\/share\/licenses\/oscam\/astra-native-oscam\.json"\)/);
@@ -77,7 +84,7 @@ test('system and container installations require a verified policy-5 executable 
   assert.match(docker, /policyVersion:2/); assert.match(docker, /semanticPolicyVersion:2/); assert.match(docker, /protectedOscamBuild\(\)/);
 });
 
-test('policy-5 packaging runs portable safety and real scalar CSA probe gates before native publication', () => {
+test('policy-6 packaging runs portable safety and real scalar CSA probe gates before native publication', () => {
   for (const text of [casInstall, docker]) {
     assert.match(text, /for fixture in native-ecm-policy native-cas-io native-pes-validation native-ciphertext-safety; do/);
     assert.match(text, /native-ciphertext-probe\.c[^\n]*astra-ciphertext-probe\.c[^\n]*-ldvbcsa[^\n]*-o[^\n]*native-ciphertext-probe-test/);
