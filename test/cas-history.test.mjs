@@ -20,6 +20,16 @@ test('private CAS history retains only whitelisted numeric observations and boun
   assert.equal(JSON.stringify(value).includes('DO-NOT-RETAIN'), false);
 });
 
+test('private history distinguishes local admission counters from native upstream requests without secrets', () => {
+  const h = new CASRequestHistory(), d = diagnostic();
+  d.casProxy.providerGuards[0].ingress = { forwardedFrames: 200, peakFramesPerSecond: 20, minimumFrameIntervalMs: 51.01,
+    sessions: 77, queuedBytes: 640, transportCloses: 2, address: 'DO-NOT-RETAIN', credentials: 'DO-NOT-RETAIN' };
+  h.record(d); const g = h.snapshot().samples[0].guards[0];
+  assert.equal(g.ingress.forwardedFrames, 200); assert.equal(g.ingress.sessions, 77);
+  assert.equal(g.ingress.minimumFrameIntervalMs, 51.01);
+  assert.equal(JSON.stringify(g).includes('DO-NOT-RETAIN'), false);
+});
+
 test('paused CAS and periodic warning fields do not trigger provider incidents; healthy recovery rearms', () => {
   const history = new CASRequestHistory();
   for (let i = 0; i < 20; i++) history.record({ casProxy: { timeout: i * 100, providerGuards: [{ state: 'paused', semantic: { sent: 32, oldestMs: 99999 }, cwFailures: i * 999 }] } });

@@ -10,6 +10,7 @@ import { ProviderGuard, providerGuardOptions } from './provider-guard.mjs';
 import { protectedOscamBuild } from './oscam-integrity.mjs';
 import { openProviderBudgetStore } from './provider-budget.mjs';
 import { DirectCASController, parseDirectStatus } from './direct-cas-controller.mjs';
+import { CASIngress } from './cas-ingress.mjs';
 
 const LOCAL_HOST = '127.0.0.1';
 const FIRST_LOCAL_PORT = 23000;
@@ -182,12 +183,14 @@ export class CASProxyManager extends EventEmitter {
     this.signature = null;
     this.stopping = false;
     this.guards = new Map();
+    this.ingresses = new Map();
     this.guardedPorts = new Map();
     this.semanticMetrics = new Map();
     this.metrics = { found: 0, rejected: 0, timeout: 0, maxResponseMs: 0 }; this.logBuffer = '';
     this.spawnChild = options.spawnChild || spawn; this.waitForPorts = options.waitForPorts || waitForPorts;
     this.protectedBuild = options.protectedBuild || protectedOscamBuild;
     this.guardFactory = options.guardFactory || ((options) => new ProviderGuard(options));
+    this.ingressFactory = options.ingressFactory || (options => new CASIngress(options));
     this.transport = options.transport || process.env.ASTRA_CAS_TRANSPORT || 'guarded';
     if (!['guarded', 'direct'].includes(this.transport)) throw new Error('CAS transport must be guarded or direct');
     this.setTimer = options.setTimer || setTimeout; this.clearTimer = options.clearTimer || clearTimeout; this.now = options.now || Date.now;
@@ -236,8 +239,16 @@ export class CASProxyManager extends EventEmitter {
         if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
       }
       const generated = buildOscamConfiguration(uniqueProfiles, { guardedPorts, directAccounts, budgetDirectory: this.budgetDirectory });
+      const directPorts = new Map();
       for (const group of groups) {
         const id = group.profile.id; const connection = generated.connections.get(id);
+        if (this.transport === 'direct') {
+          directPorts.set(id, connection.port); // native reports the OSCam listener, not ingress
+          const ingress = this.ingressFactory({ port: connection.port, rate: Math.min(20, providerGuardOptions().rate) });
+          this.ingresses.set(id, ingress);
+          connection.port = await ingress.start();
+          if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
+        }
         Object.defineProperties(connection, {
           scheduleDecoderStart: { value: start => this.guards.get(id).scheduleDecoderStart(start) },
           isAvailable: { value: () => this.ready },
@@ -255,7 +266,7 @@ export class CASProxyManager extends EventEmitter {
       this.stopping = false;
       this.metrics = { found: 0, rejected: 0, timeout: 0, maxResponseMs: 0 };
       this.connections = generated.connections; this.guardedPorts = guardedPorts; this.signature = signature; this.generated = generated; this.profiles = uniqueProfiles; this.recoveryAttempt = 0;
-      this.directPorts = new Map([...directAccounts.keys()].map(id => [id, generated.connections.get(id).port]));
+      this.directPorts = directPorts;
       await this.launch(this.generation);
       if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
     } catch (error) { await this.#stop(); throw error; }
@@ -391,6 +402,7 @@ export class CASProxyManager extends EventEmitter {
     this.guardedPorts = new Map();
     this.semanticMetrics.clear();
     this.signature = null;
+    await Promise.all([...this.ingresses.values()].map(ingress => ingress.stop())); this.ingresses.clear();
     await Promise.all([...this.guards.values()].map(guard => guard.stop())); this.guards.clear();
     const budgetStore = this.budgetStore; this.budgetStore = null;
     await budgetStore?.close();
@@ -403,5 +415,5 @@ export class CASProxyManager extends EventEmitter {
     ]); } finally { clearTimeout(timeout); }
     if (child.exitCode === null) child.kill('SIGKILL');
   }
-  guardMetrics() { return [...this.guards].map(([profile, guard]) => ({ profile, ...guard.snapshot(), ...(this.semanticMetrics.has(profile) ? { semantic: { ...this.semanticMetrics.get(profile) } } : {}) })); }
+  guardMetrics() { return [...this.guards].map(([profile, guard]) => ({ profile, ...guard.snapshot(), ...(this.ingresses.has(profile) ? { ingress: this.ingresses.get(profile).snapshot() } : {}), ...(this.semanticMetrics.has(profile) ? { semantic: { ...this.semanticMetrics.get(profile) } } : {}) })); }
 }

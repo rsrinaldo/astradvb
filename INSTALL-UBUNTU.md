@@ -282,6 +282,25 @@ The credential is encrypted at rest with AES-256-GCM using the secret in `/etc/a
 
 ## 10. Back up and upgrade
 
+### Local admission guard (0.8.55)
+
+With `ASTRA_CAS_TRANSPORT=direct`, decoders now connect through one Node local
+admission guard per shared account before reaching OSCam. OSCam continues to own
+the provider socket and durable protection. The guard connects only to loopback,
+paces all client frames across all decoders, bounds pending work, and forwards
+replies immediately. It can close an overloaded/broken **local** session, but has
+no provider-reset operation. No fixed video buffer is added; key requests can
+wait under load, and a local session exceeding the five-second safety limit is
+closed instead of forwarding stale queued data. Local and provider metrics are
+separate in private diagnostics/history. See README for exact bounds.
+
+Run the latest installer below. The verified v0.8.54 native OSCam/decoder pair is
+unchanged; an older/unverified native installation is still rebuilt by the normal
+installer. Existing direct/guarded mode and explicit pause settings are preserved.
+Do not clear provider budgets. Activating the application needs one service
+restart; Node's new local guard does not eliminate that interruption or genuine
+provider transport failures.
+
 ### Direct OSCam transport (0.8.54)
 
 New installations select `ASTRA_CAS_TRANSPORT=direct`: OSCam connects directly

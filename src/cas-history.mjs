@@ -3,6 +3,7 @@ import { open } from 'node:fs/promises';
 
 const SEMANTIC = ['generation', 'queued', 'aliases', 'sent', 'peak', 'dispatched', 'matched', 'coalesced', 'expired', 'rejected', 'resets', 'abandoned', 'closes', 'oldestMs', 'resetReason'];
 const GUARD = ['framesSent', 'replyFramesReceived', 'connectionResets', 'expiredConnections', 'queuedFrames', 'oldestQueuedAgeMs', 'negativeECMReplies'];
+const INGRESS = ['accepted', 'connected', 'forwardedFrames', 'peakFramesPerSecond', 'minimumFrameIntervalMs', 'sessions', 'queuedFrames', 'queuedBytes', 'capacityCloses', 'expiredCloses', 'protocolCloses', 'transportCloses', 'peerCloses', 'maxQueueAgeMs'];
 const STATES = new Set(['paused', 'idle', 'connecting', 'connected', 'reconnecting']);
 const REASONS = new Set(['reply_wait', 'semantic_reset', 'transport_reset', 'local_failures']);
 const MAX_FILE = 1024 * 1024, RING_BYTES = 256 * 1024, INCIDENT_BYTES = 128 * 1024;
@@ -13,7 +14,8 @@ function safePoint(value) {
   if (!value || !timestamp(value.at) || !Array.isArray(value.guards)) return null;
   return { at: value.at, guards: value.guards.slice(0, 8).map((guard, index) => ({ index: index + 1,
     state: STATES.has(guard.state) ? guard.state : 'idle', ...numeric(guard, GUARD),
-    ...(guard.semantic ? { semantic: numeric(guard.semantic, SEMANTIC) } : {}) })),
+    ...(guard.semantic ? { semantic: numeric(guard.semantic, SEMANTIC) } : {}),
+    ...(guard.ingress ? { ingress: numeric(guard.ingress, INGRESS) } : {}) })),
     ...numeric(value, ['localTimeouts', 'localRejected', 'mainLoopMaxMs']), truncatedProfiles: value.truncatedProfiles === true };
 }
 

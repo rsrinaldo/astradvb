@@ -73,6 +73,41 @@ node src/server.mjs
 
 Open `http://server-address:8000/` and sign in as `admin`. Read the unique initial password from `data/initial-admin-password`, then change it in **Settings → Administrator account**. All example streams are disabled.
 
+## Shared local admission guard (v0.8.55)
+
+In direct mode the complete path is now `tsdecrypt → Node local admission guard
+→ local OSCam → provider`. Equivalent account profiles share one local guard,
+not one allowance per decoder. OSCam still owns the only provider socket and its
+native request/reconnect protection. The legacy `guarded` transport is unchanged.
+No native binary rebuild is needed when upgrading from the verified v0.8.54 pair.
+
+The local guard admits encrypted client frames, including login and keepalive,
+at least 51 ms apart (at most 20/s, or a lower configured rate). Local connection
+creation is separately paced at the same interval. Fair round-robin dispatch
+prevents one decoder from monopolizing the queue. Limits are 256 sessions,
+128 queued frames, 512 KiB total pending/queued payload, 16 queued frames and
+64 KiB per session, and a five-second maximum queue/partial-frame age. These are
+safety ceilings, not additional fixed playback buffers. Overload can delay key
+requests and interrupt the affected channel. An expired/malformed/overflowed
+local session is closed as a whole: encrypted frames are never silently dropped,
+reordered or replayed. Replies bypass request pacing; a stalled local receiver
+has bounded backpressure and cannot grow an unlimited reply queue.
+
+This Node component accepts only a numeric local OSCam port and connects only to
+literal loopback. It has no provider address, credentials, native child handle,
+reader-reset callback or upstream connection-budget lease. Its local disconnects
+do not request a shared reader reset. It **can close local sockets**; it cannot
+directly close OSCam's provider socket. A service/configuration restart or genuine
+native transport/protocol failure can still close/recover that provider socket.
+The existing 32-unanswered ceiling and durable three-attempt/61-second upstream
+budget remain authoritative. Local frame counts include initialization/cache-hit
+traffic and are not provider ECM counts; diagnostics and private incident history
+retain the two measurements separately, with no payloads or keys.
+
+This adds protection against local retry floods. It does not establish the cause
+of the 18 October incident or guarantee a provider's undocumented capacity.
+See [v0.8.55 verification](VERIFICATION-0.8.55.md) for test evidence and limitations.
+
 ## Direct OSCam provider transport (v0.8.54)
 
 The new direct path is `tsdecrypt → local OSCam → provider`. Node manages the

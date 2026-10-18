@@ -14,9 +14,9 @@ import { openProviderBudgetStore } from '../src/provider-budget.mjs';
 import { RingLogger } from '../src/logger.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-test('direct manager never creates a forwarding guard or a Node connection budget owner', async () => {
+test('direct manager shares local ingress across aliases without a WAN proxy or Node budget owner', async () => {
   const directory=mkdtempSync(join(tmpdir(),'astra-direct-manager-')); const old=process.env.ASTRA_SECRET_KEY;
-  let proxy;
+  let proxy, ingressStarts = 0, ingressStops = 0, spawns = 0;
   try {
     process.env.ASTRA_SECRET_KEY='synthetic-direct-manager';
     const child=new EventEmitter();
@@ -24,15 +24,23 @@ test('direct manager never creates a forwarding guard or a Node connection budge
     child.kill=signal=>{child.signalCode=signal;queueMicrotask(()=>child.emit('exit',null,signal));return true;};
     proxy=new CASProxyManager(new RingLogger(),{transport:'direct',runtimeDir:join(directory,'config'),protectedBuild:()=>true,
       guardFactory:()=>{throw new Error('Node forwarding guard must not exist');},
+      ingressFactory:options=>{assert.equal(options.port,23000);assert.equal(options.rate,20);return {
+        start:async()=>{ingressStarts++;return 31000;},stop:async()=>{ingressStops++;},snapshot:()=>({target:'local-oscam-only'})};},
       budgetStoreFactory:()=>{throw new Error('Node must not own the native connection budget');},
-      spawnChild:()=>child,waitForPorts:async()=>{}});
+      spawnChild:()=>{spawns++;return child;},waitForPorts:async ports=>{assert.deepEqual(ports,[23000]);}});
     const profile={id:'p',caid:'0B00',lineEncrypted:encryptSecret('provider.invalid 15000 fake fake 0102030405060708091011121314')};
-    const connections=await proxy.start([profile]); assert.equal(connections.size,1);
+    const profiles=[profile,{...profile,id:'alias'}];
+    const connections=await proxy.start(profiles); assert.equal(connections.size,2);
+    assert.equal(connections.get('p'),connections.get('alias'));assert.equal(connections.get('p').port,31000);
+    assert.equal(proxy.directPorts.get('p'),23000);assert.equal(ingressStarts,1);
+    assert.equal(await proxy.start(profiles),connections);assert.equal(spawns,1);assert.equal(ingressStarts,1);
     assert.equal(proxy.guardedPorts.size,0); assert.equal(proxy.budgetStore,null);
     child.stdout.write('astra direct status: port=23000 ready=1 connections=1 closes=0 frames=2 failures=0 retryMs=0 attempts=1 stableRecoveries=0\n');
     assert.equal(proxy.guardMetrics()[0].readerReady,true);
     assert.equal(proxy.guardMetrics()[0].transport,'direct-oscam');
+    assert.equal(proxy.guardMetrics()[0].ingress.target,'local-oscam-only');
   } finally { await proxy?.stop(); if(old===undefined)delete process.env.ASTRA_SECRET_KEY;else process.env.ASTRA_SECRET_KEY=old;rmSync(directory,{recursive:true,force:true}); }
+  assert.equal(ingressStops,1);
 });
 test('native direct send loops preserve partial writes and bound backpressure without replay', () => {
   const directory=mkdtempSync(join(tmpdir(),'astra-direct-io-'));

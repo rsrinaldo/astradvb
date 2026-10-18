@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createCASLab, runNativeMedia, runNativeSoak } from './fixtures/cas-lab-runner.mjs';
-import { cwForEpoch } from './fixtures/newcamd-provider.mjs';
+import { cwForEpoch, connectNewcamdClient } from './fixtures/newcamd-provider.mjs';
+import { CASIngress } from '../src/cas-ingress.mjs';
 
 const enabled = process.platform === 'linux' && process.env.ASTRA_CAS_LAB_DIRECT === '1';
 async function until(check, timeout = 15000) {
@@ -29,7 +30,49 @@ test('direct OSCam handles 90 simultaneous channels with correct keys and one pa
   assert.equal(s.provider.requests,90); assert.equal(s.guard.transport,'direct-oscam');
   assert.equal(s.provider.peakRequestsPerSecond<=20,true,JSON.stringify({peak:s.provider.peakRequestsPerSecond}));
   assert.equal(s.guard.connectionResets,0);
+  assert.equal(s.ingress.target,'local-oscam-only'); assert.equal(s.ingress.sessions,90);
+  assert.ok(s.ingress.peakFramesPerSecond<=20); assert.ok(s.ingress.minimumFrameIntervalMs>=51);
   console.log(JSON.stringify({case:'direct-90',connections:s.provider.connections,requests:s.provider.requests,peak:s.provider.peakRequestsPerSecond,correctKeys:90}));
+});
+test('local decoder churn and a negative-reply retry flood cannot reset the native provider session', { skip: !enabled, timeout: 35000 }, async t => {
+  let reject=true;
+  const lab=await fixture(t,{policy:()=>({reject})});
+  const clients=[];for(let i=0;i<20;i++)clients.push(await lab.client());
+  const due=Date.now()+5000;
+  const counts=await Promise.all(clients.map(async(c,i)=>{let n=0;while(Date.now()<due){const r=await c.requestECM({channelId:i+1,epoch:7100+n,timeoutMs:5000});assert.equal(r.ok,false);assert.equal(r.closed,undefined);n++;}return n;}));
+  for(const c of clients)c.close();
+  await until(()=>lab.ingress.snapshot().sessions===0);
+  const before=lab.provider.snapshot();assert.equal(before.connections,1);assert.equal(before.activeConnections,1);
+  assert.ok(before.peakRequestsPerSecond<=20);assert.ok(lab.ingress.snapshot().peakFramesPerSecond<=20);
+  reject=false;
+  const c=await lab.client();const r=await c.requestECM({channelId:77,epoch:7200});assert.equal(r.ok,true);
+  assert.deepEqual(r.controlWords,cwForEpoch(77,7200,lab.transportMode));
+  assert.equal(lab.provider.snapshot().connections,1);assert.equal(lab.snapshot().guard.connectionResets,0);
+  console.log(JSON.stringify({case:'local-retry-churn',localRequests:counts.reduce((a,b)=>a+b,0),providerConnections:1,localPeak:lab.ingress.snapshot().peakFramesPerSecond,providerPeak:lab.provider.snapshot().peakRequestsPerSecond,recoveredFreshKey:true}));
+});
+test('many delayed replies retain one provider session without a local queue-pressure reset', { skip: !enabled, timeout: 25000 }, async t => {
+  const lab=await fixture(t,{policy:()=>({delayMs:4000})}),clients=[];
+  for(let i=0;i<40;i++)clients.push(await lab.client());
+  const replies=await Promise.all(clients.map((c,i)=>c.requestECM({channelId:i+1,epoch:7300,timeoutMs:10000})));
+  assert.ok(replies.every(r=>r.ok),JSON.stringify(replies.map(r=>({ok:r.ok,timedOut:r.timedOut,closed:r.closed}))));
+  for(let i=0;i<40;i++)assert.deepEqual(replies[i].controlWords,cwForEpoch(i+1,7300,lab.transportMode));
+  const s=lab.snapshot();assert.equal(s.provider.connections,1);assert.equal(s.guard.connectionResets,0);
+  assert.equal(s.ingress.expiredCloses+s.ingress.capacityCloses+s.ingress.transportCloses,0);
+  console.log(JSON.stringify({case:'local-delayed-40',correctKeys:40,providerConnections:1,providerPeak:s.provider.peakRequestsPerSecond,localPeak:s.ingress.peakFramesPerSecond}));
+});
+test('closing and replacing the Node local guard with work in flight leaves the provider socket alive', { skip: !enabled, timeout: 20000 }, async t => {
+  const lab=await fixture(t,{policy:()=>({delayMs:2000})});
+  const old=await lab.client(),pending=old.requestECM({channelId:1,epoch:7400});
+  await until(()=>lab.provider.snapshot().requests===1);
+  await lab.ingress.stop();assert.equal((await pending).closed,true);
+  assert.equal(lab.provider.snapshot().connections,1);assert.equal(lab.provider.snapshot().activeConnections,1);
+  const replacement=new CASIngress({port:lab.backendPort});t.after(()=>replacement.stop());
+  const port=await replacement.start();
+  const c=await connectNewcamdClient({...lab.credentials,port,transportMode:lab.transportMode});t.after(()=>c.close());
+  const r=await c.requestECM({channelId:2,epoch:7401});assert.equal(r.ok,true);
+  assert.deepEqual(r.controlWords,cwForEpoch(2,7401,lab.transportMode));
+  assert.equal(lab.provider.snapshot().connections,1);assert.equal(lab.snapshot().guard.connectionResets,0);
+  console.log(JSON.stringify({case:'local-guard-replacement',providerConnections:1,freshKeyAfterReplacement:true}));
 });
 test('direct OSCam tolerates delayed complete replies and local controller shutdown cannot close its provider socket', { skip: !enabled, timeout: 20000 }, async t => {
   const lab = await fixture(t,{policy:()=>({delayMs:4000})});

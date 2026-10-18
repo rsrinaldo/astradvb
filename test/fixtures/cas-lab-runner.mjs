@@ -16,6 +16,7 @@ import { MPEGTSAnalyzer, TransportStreamFramer } from '../../src/mpegts.mjs';
 import { protectedOscamBuild } from '../../src/oscam-integrity.mjs';
 import { ProviderGuard } from '../../src/provider-guard.mjs';
 import { DirectCASController, parseDirectStatus } from '../../src/direct-cas-controller.mjs';
+import { CASIngress } from '../../src/cas-ingress.mjs';
 import { openProviderBudgetStore } from '../../src/provider-budget.mjs';
 import { encryptSecret } from '../../src/secrets.mjs';
 import { protectedNativeBuild, tsdecryptArgs } from '../../src/softcam.mjs';
@@ -96,7 +97,7 @@ export function parseLabSemanticStatus(line) {
   return value;
 }
 
-export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fragmentDelayMs = 0, transportMode, pendingSlots = 128, guardQueueMs = 1500, semanticScheduler = true, directTransport = false } = {}) {
+export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fragmentDelayMs = 0, transportMode, pendingSlots = 128, guardQueueMs = 1500, semanticScheduler = true, directTransport = false, localIngress = directTransport } = {}) {
   assert.equal(typeof semanticScheduler, 'boolean', 'Isolated semanticScheduler must be boolean');
   const parameters = labCapacityOptions({ pendingSlots, guardQueueMs });
   const binaries = labRequirements();
@@ -132,10 +133,11 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
   }
   const metrics = { found: 0, cached: 0, rejected: 0, timeout: 0, childErrors: 0 };
   const semanticStatus = { samples: 0, latest: null, maxSent: 0, maxPeak: 0, maxQueued: 0, events: [] };
-  let closed = false, oscam = null, logBytes = 0, logRemainder = '';
+  let closed = false, oscam = null, logBytes = 0, logRemainder = '', ingress = null;
   const close = async () => {
     if (closed) return; closed = true;
     for (const client of clients) client.close();
+    await ingress?.stop();
     await Promise.allSettled([...children].map(terminate));
     await guard.stop(); await provider.close(); await rm(directory, { recursive: true, force: true });
   };
@@ -171,9 +173,13 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
       }
     });
     await waitFor(() => { if (oscam.exitCode !== null || oscam.signalCode !== null || metrics.childErrors) throw new Error('Isolated OSCam failed before ready'); return guard.snapshot().readerReady; });
-    return { directory, binaries, parameters, provider, guard, credentials: configuration.connections.get('fixture'), transportMode: provider.credentials.transportMode, children, nativeChildren,
+    if (localIngress) {
+      ingress = new CASIngress({ port: firstPort });
+      configuration.connections.get('fixture').port = await ingress.start();
+    }
+    return { directory, binaries, parameters, provider, guard, ingress, backendPort: firstPort, credentials: configuration.connections.get('fixture'), transportMode: provider.credentials.transportMode, children, nativeChildren,
       async client({ timeoutMs = 10000 } = {}) { const client = await connectNewcamdClient({ ...configuration.connections.get('fixture'), transportMode: provider.credentials.transportMode, timeoutMs }); clients.add(client); return client; },
-      snapshot: () => ({ provider: provider.snapshot(), guard: guard.snapshot(), oscam: { ...metrics, diagnosticBytesObservedCapped: logBytes,
+      snapshot: () => ({ provider: provider.snapshot(), guard: guard.snapshot(), ingress: ingress?.snapshot() || null, oscam: { ...metrics, diagnosticBytesObservedCapped: logBytes,
         semanticScheduler: { ...semanticStatus, latest: semanticStatus.latest && { ...semanticStatus.latest }, events: semanticStatus.events.map(event => ({ ...event })) } }, nativeChildren: [...nativeChildren].filter(child => child.exitCode === null && child.signalCode === null).length, resets: [...resets] }),
       close };
   } catch (error) { await close(); throw error; }
