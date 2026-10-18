@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { createCASLab, labCapacityOptions, labInitializationOptions, labNativeArgs, labReaderConfiguration, labRequirements, nativeSoakTiming, orderedReference, parseLabSemanticStatus, providerSummary, reportLab, runClientLoad, runNativeMedia, runNativeSoak, runPersistentGuardRestartObservation, runSemanticBurst, runSemanticClientGC, runSemanticLateReplies, runSemanticOrphanAge, runSemanticPartialRecovery, runSemanticProgress, runSemanticReadStall, runSemanticSilentRecovery, runSemanticSlowBacklog } from './fixtures/cas-lab-runner.mjs';
+import { createCASLab, labCapacityOptions, labInitializationOptions, labNativeArgs, labReaderConfiguration, labRequirements, nativeSoakTiming, orderedReference, parseLabSemanticStatus, providerSummary, reportLab, runClientLoad, runNativeMedia, runNativeSoak, runPersistentGuardRestartObservation, runSemanticBurst, runSemanticClientGC, runSemanticLateReplies, runSemanticOrphanAge, runSemanticPartialRecovery, runSemanticProgress, runSemanticReadStall, runSemanticSilentRecovery, runSemanticSlowBacklog, runSemanticDisconnectRecovery } from './fixtures/cas-lab-runner.mjs';
 import { connectNewcamdClient, cwForEpoch, startNewcamdProvider } from './fixtures/newcamd-provider.mjs';
 
 const enabled = process.env.ASTRA_CAS_LAB === '1';
@@ -190,7 +190,7 @@ test('actual pinned OSCam/guard/native CAS fault simulation laboratory', { skip:
   labRequirements();
   assert.ok(Number.isSafeInteger(configuredChannels) && configuredChannels >= 1 && configuredChannels <= 90, 'ASTRA_CAS_LAB_CHANNELS must be1..90');
   assert.ok(Number.isSafeInteger(configuredLatencyChannels) && configuredLatencyChannels >= 1 && configuredLatencyChannels <= 90, 'ASTRA_CAS_LAB_LOAD_CHANNELS must be 1..90');
-  assert.ok([...scenarios].every(name => ['on-time', 'load', 'semantic-burst', 'semantic-burst-capacity', 'semantic-scheduled', 'semantic-scheduled-drop', 'semantic-recovery-silent', 'semantic-recovery-unmatched', 'semantic-recovery-progress', 'semantic-recovery-late', 'semantic-readstall', 'semantic-recovery-gc', 'semantic-recovery-partial', 'semantic-recovery-slow-backlog', 'semantic-recovery-orphan-age', 'delayed', 'missing', 'stale-late', 'continuation-late', 'continuation-missing', 'out-of-order', 'negative', 'native', 'native-buffered', 'native-buffered-init-repeated', 'native-latency'].includes(name)), 'Unknown synthetic lab scenario');
+  assert.ok([...scenarios].every(name => ['on-time', 'load', 'semantic-burst', 'semantic-burst-capacity', 'semantic-scheduled', 'semantic-scheduled-drop', 'semantic-recovery-silent', 'semantic-recovery-rst', 'semantic-recovery-unmatched', 'semantic-recovery-progress', 'semantic-recovery-late', 'semantic-readstall', 'semantic-recovery-gc', 'semantic-recovery-partial', 'semantic-recovery-slow-backlog', 'semantic-recovery-orphan-age', 'delayed', 'missing', 'stale-late', 'continuation-late', 'continuation-missing', 'out-of-order', 'negative', 'native', 'native-buffered', 'native-buffered-init-repeated', 'native-latency'].includes(name)), 'Unknown synthetic lab scenario');
   if (selected('on-time')) await t.test('on-time rotating synthetic keys preserve exact native A/V and decode cleanly', { timeout: 60000 }, async t => {
     progress('on-time');
     const lab = await createCASLab(); cleanup(t, lab, 'on-time');
@@ -251,6 +251,11 @@ test('actual pinned OSCam/guard/native CAS fault simulation laboratory', { skip:
     const lab = await createCASLab({ pendingSlots: 128, semanticScheduler: true, policy: request => ({ drop: request.connectionId === 1 }) });
     cleanup(t, lab, 'release-semantic-drop-recovery');
     t.diagnostic(JSON.stringify(await runSemanticSilentRecovery(lab, { count: 85 }))); safety(lab);
+  });
+  if (selected('semantic-recovery-rst')) await t.test('real TCP RST recovers an idle guarded reader promptly without new ECM jobs or replay', { timeout: 15000 }, async t => {
+    progress('semantic-recovery-rst');
+    const lab = await createCASLab({ semanticScheduler: true }); cleanup(t, lab, 'semantic-recovery-rst');
+    t.diagnostic(JSON.stringify(await runSemanticDisconnectRecovery(lab))); safety(lab);
   });
   if (selected('semantic-recovery-silent')) await t.test('wholly silent provider resets once and recovers fresh requests without replay', { timeout: 35000 }, async t => {
     progress('semantic-recovery-silent');
@@ -324,7 +329,9 @@ test('actual pinned OSCam/guard/native CAS fault simulation laboratory', { skip:
       if (request.epoch === 1) { exercised++; return scenario.action; }
       return {};
     } }); cleanup(t, lab, scenario.name);
-    const result = await runNativeMedia(lab, { durationSeconds: scenario.durationSeconds, allowSuppression: true, epochBoundaryContinuation: scenario.epochBoundaryContinuation });
+    const recoverable = scenario.name === 'delayed' || scenario.name === 'continuation-late';
+    const result = await runNativeMedia(lab, { durationSeconds: scenario.durationSeconds, allowSuppression: !recoverable, epochBoundaryContinuation: scenario.epochBoundaryContinuation });
+    if (recoverable) assert.equal(result.exactAV, true, 'A correct reply inside the retention window must preserve all original A/V');
     assert.ok(exercised > 0, 'Requested fault must actually occur at the fake provider');
     const boundary = result.fixture.metadata.epochBoundaryContinuation;
     if (scenario.epochBoundaryContinuation) {

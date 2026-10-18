@@ -89,7 +89,7 @@ install -o root -g root -m 0644 "$installer_dir/patches/tsdecrypt-emm-pid.patch"
 install -o root -g root -m 0644 "$installer_dir/patches/tsdecrypt-ecm-protection.patch" "$tsdecrypt_license_stage/astra-ecm-protection.patch"
 manifest_stage="$tsdecrypt_license_stage/astra-native-cas.json"
 binary_digest="$(sha256sum "$binary_stage" | cut -d ' ' -f 1)"
-printf '{"policyVersion":8,"sourceRevision":"%s","binarySha256":"%s","patchSetSha256":"%s","sourceDirectory":"%s","buildTarget":"ffdecsa","patches":{"ecm":"%s","streamIO":"%s","controlWords":"%s","pesValidation":"%s","newcamdLifetime":"%s","ciphertextSafety":"%s"}}\n' \
+printf '{"policyVersion":10,"sourceRevision":"%s","binarySha256":"%s","patchSetSha256":"%s","sourceDirectory":"%s","buildTarget":"ffdecsa","patches":{"ecm":"%s","streamIO":"%s","controlWords":"%s","pesValidation":"%s","newcamdLifetime":"%s","ciphertextSafety":"%s"}}\n' \
   "$revision" "$binary_digest" "$patch_set_digest" "$source_dir" "${patch_digests[1]}" "${patch_digests[2]}" "${patch_digests[3]}" "${patch_digests[4]}" "${patch_digests[5]}" "${patch_digests[6]}" > "$manifest_stage"
 chmod 0644 "$manifest_stage"
 
@@ -100,7 +100,7 @@ install -o root -g root -m 0644 "$oscam_source_dir/COPYING" "$oscam_license_stag
 install -o root -g root -m 0644 "$oscam_patch" "$oscam_license_stage/oscam-newcamd-stream-io.patch"
 install -o root -g root -m 0644 "$oscam_scheduler_patch" "$oscam_license_stage/oscam-semantic-scheduler.patch"
 oscam_binary_digest="$(sha256sum "$oscam_stage" | cut -d ' ' -f 1)"
-printf '{"policyVersion":3,"semanticPolicyVersion":3,"sourceRevision":"%s","binarySha256":"%s","patchSha256":"%s","semanticSchedulerSha256":"%s","sourceDirectory":"%s"}\n' \
+printf '{"policyVersion":4,"semanticPolicyVersion":4,"sourceRevision":"%s","binarySha256":"%s","patchSha256":"%s","semanticSchedulerSha256":"%s","sourceDirectory":"%s"}\n' \
   "$oscam_revision" "$oscam_binary_digest" "$oscam_patch_digest" "$oscam_scheduler_digest" "$oscam_source_dir" > "$oscam_license_stage/astra-native-oscam.json"
 chmod 0644 "$oscam_license_stage/astra-native-oscam.json"
 
@@ -160,5 +160,5 @@ done
 mv "$tsdecrypt_license_stage" /usr/local/share/licenses/tsdecrypt
 mv "$oscam_license_stage" /usr/local/share/licenses/oscam
 trap - ERR INT TERM
-echo "Native CAS policy 8 installed. Corresponding source: $source_dir and $oscam_source_dir"
+echo "Native CAS policy 10 installed. Corresponding source: $source_dir and $oscam_source_dir"
 echo "Previous native binaries retained in $rollback_dir"

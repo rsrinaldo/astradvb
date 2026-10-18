@@ -149,6 +149,63 @@ function joinOnContinuation(plain, encrypted, clearAudioFirst = false) {
   return Buffer.concat([...metadata, encrypted.subarray(start)]);
 }
 
+function staggeredParity(plain, encrypted) {
+  // Interleave one audio PUSI into the preceding video PES, preserving each
+  // PID's packet/CC order. FFmpeg ordinarily groups whole PESs, hiding overlap.
+  // The public constant fixture has identical physical even/odd halves.
+  const pidAt = at => ((plain[at + 1] & 31) << 8) | plain[at + 2];
+  let audioAt = -1, boundary = -1;
+  for (let at = Math.floor(plain.length / 4 / 188) * 188; at < plain.length / 2; at += 188) {
+    if (pidAt(at) !== 257 || !(plain[at + 1] & 0x40)) continue;
+    for (let previous = at - 188; previous >= Math.max(0, at - 188 * 300); previous -= 188) {
+      if (pidAt(previous) === 257) break;
+      if (pidAt(previous) === 256 && !(plain[previous + 1] & 0x40)) {
+        audioAt = at; boundary = previous; break;
+      }
+    }
+    if (boundary >= 0) break;
+  }
+  assert.ok(boundary >= 0, 'Fixture needs a video continuation before audio PUSI');
+  const interleave = bytes => Buffer.concat([bytes.subarray(0, boundary), bytes.subarray(audioAt, audioAt + 188), bytes.subarray(boundary, audioAt), bytes.subarray(audioAt + 188)]);
+  const output = interleave(encrypted); let oldVideoContinuations = 0;
+  for (let at = 0; at < output.length; at += 188) {
+    const pid = ((output[at + 1] & 31) << 8) | output[at + 2];
+    if ((output[at + 3] >> 6) > 1 && ((pid === 257 && at >= boundary) || (pid === 256 && at >= boundary + 300 * 188))) output[at + 3] = (output[at + 3] & 0x3f) | 0xc0;
+    if (pid === 256 && at > boundary && at < boundary + 300 * 188 && !(output[at + 1] & 0x40)) oldVideoContinuations++;
+  }
+  assert.ok(oldVideoContinuations > 0);
+  return { encrypted: output, expected: avPackets(interleave(plain)) };
+}
+
+function clearShortParity(plain, encrypted) {
+  // Preserve the broadcast pattern seen in numeric live headers: short clear
+  // tails inside an encrypted PES/parity prefix. The public scalar encryptor
+  // leaves these sub-block payload bytes unchanged; verify that fact here.
+  const output = Buffer.from(encrypted);
+  let boundary = -1, previousVideo = -1, shortPackets = 0;
+  for (let at = 0; at < plain.length; at += 188) {
+    const pid = ((plain[at + 1] & 31) << 8) | plain[at + 2];
+    if (pid !== 256) continue;
+    const offset = plain[at + 3] & 0x20 ? 5 + plain[at + 4] : 4;
+    if (boundary < 0 && at > plain.length / 4 && offset > 180 && offset < 188 && !(plain[at + 1] & 0x40) && previousVideo >= 0 && !(plain[previousVideo + 1] & 0x40)) {
+      const previousOffset = plain[previousVideo + 3] & 0x20 ? 5 + plain[previousVideo + 4] : 4;
+      if (188 - previousOffset >= 8) boundary = previousVideo;
+    }
+    previousVideo = at;
+  }
+  assert.ok(boundary >= 0, 'Generated fixture needs a natural short video tail preceded by encrypted continuation');
+  for (let at = 0; at < output.length; at += 188) {
+    const pid = ((output[at + 1] & 31) << 8) | output[at + 2];
+    if ((pid !== 256 && pid !== 257) || (output[at + 3] >> 6) < 2) continue;
+    const offset = output[at + 3] & 0x20 ? 5 + output[at + 4] : 4;
+    if (offset > 180 && offset < 188) {
+      assert.deepEqual(output.subarray(at + offset, at + 188), plain.subarray(at + offset, at + 188));
+      output[at + 3] &= 0x3f; shortPackets++;
+    } else if (at >= boundary) output[at + 3] = (output[at + 3] & 0x3f) | 0xc0;
+  }
+  assert.ok(shortPackets > 0); return output;
+}
+
 test('real native CSA preserves all A/V packets with fragmented stdin and slow output', { timeout: 90000 }, async t => {
   if (!nativeBinary) return t.skip('Set ASTRA_TEST_TSDECRYPT to an isolated patched Linux build');
   for (const command of ['cc', 'ffmpeg']) if (spawnSync(command, ['-version']).error) return t.skip(`${command} unavailable`);
@@ -161,6 +218,13 @@ test('real native CSA preserves all A/V packets with fragmented stdin and slow o
     const expected = avPackets(plain);
     const expectedHash = createHash('sha256').update(expected).digest('hex');
     assert.ok(expected.length > 188 * 100);
+    const shortOutput = avPackets(await streamDecode(clearShortParity(plain, encrypted), true, false));
+    assert.equal(shortOutput.length, expected.length, 'Short clear tails must not discard an otherwise recoverable encrypted parity prefix');
+    assert.equal(createHash('sha256').update(shortOutput).digest('hex'), expectedHash, 'Every original A/V byte must survive short clear tails');
+    const overlap = staggeredParity(plain, encrypted);
+    const overlapOutput = avPackets(await streamDecode(overlap.encrypted, true, false));
+    assert.equal(overlapOutput.length, overlap.expected.length, 'Asynchronous component parity changes must not discard certified old video');
+    assert.deepEqual(overlapOutput, overlap.expected, 'Every ordered A/V byte must survive audio/video parity overlap');
     const retired = checked(encryptor, [], { input: retiredHeaderlessVideoPrefix(plain) }).stdout;
     const retiredOutput = avPackets(await streamDecode(retired, false, false, false, { firstAVDeadlineMs: 1500, firstAVLabel: 'Retired headerless video blocked A/V before EOF' }));
     assert.equal(retiredOutput.length, expected.length, 'Retired headerless tail must not lose valid A/V');

@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
-export const NATIVE_CAS_POLICY_VERSION = 8;
+export const NATIVE_CAS_POLICY_VERSION = 10;
 export const NATIVE_CAS_SOURCE_REVISION = 'f4876e84cf1866645f84b93f830af67193c85f69';
 const nativeVerification = new Map();
 

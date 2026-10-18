@@ -415,6 +415,18 @@ test('guard diagnostics retain bounded reasons/times and protocol counts, never 
   assert.equal(JSON.stringify(snapshot).includes('provider.test'), false);
 });
 
+test('TCP error telemetry is a bounded enum, never raw error details or a mutable snapshot', async t => {
+  for (const [code, expected] of [['ECONNRESET', 'ECONNRESET'], ['private-provider-address-secret', 'UNKNOWN']]) {
+    const s = await fakeTransport(t); const local = s.accept(); s.advance(0); s.authenticate(local);
+    s.upstreams[0].emit('error', Object.assign(new Error('DO-NOT-RETAIN provider address or credentials'), { code }));
+    assert.deepEqual(s.resets, ['provider TCP error']);
+    const snap = s.guard.snapshot(); assert.equal(snap.lastTCPError.code, expected);
+    snap.lastTCPError.code = 'mutated'; assert.equal(s.guard.snapshot().lastTCPError.code, expected);
+    assert.equal(JSON.stringify(s.guard.snapshot()).includes('DO-NOT-RETAIN'), false);
+    assert.equal(JSON.stringify(s.guard.snapshot()).includes('private-provider'), false);
+  }
+});
+
 test('synchronous connection failures consume and report the same bounded upstream attempt budget', async t => {
   const s = await fakeTransport(t, { createConnection() { throw new Error('private endpoint details'); } });
   s.accept(); s.advance(0); let snapshot = s.guard.snapshot();

@@ -4,6 +4,7 @@ import { performance } from 'node:perf_hooks';
 // Terminal socket errors may already be queued when a rejected/canceled local
 // peer is destroyed. This sink retains no guard/session state or payloads.
 const ignoreLocalSocketError = () => {};
+const tcpErrorCodes = new Set(['ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'ECONNABORTED', 'EADDRNOTAVAIL', 'ENETDOWN']);
 
 export function providerGuardOptions(env = process.env) {
   const number = (name, fallback, min, max) => {
@@ -70,7 +71,7 @@ export class ProviderGuard {
     this.replyTimeoutMs = bounded(replyTimeoutMs, 10000, 1000, 10000);
     this.wallNow = wallNow;
     this.attemptTimes = []; this.reconnectNotBefore = -Infinity; this.reconnectFailures = budget?.snapshot().failureCount || 0;
-    this.resetHistory = []; this.resetReasons = {}; this.lastResetAt = null;
+    this.resetHistory = []; this.resetReasons = {}; this.lastResetAt = null; this.lastTCPError = null;
     this.lastConnectionAt = null; this.lastReaderReadyAt = null; this.lastPositiveECMAt = null; this.lastNegativeECMAt = null;
     this.readerReady = false;
     this.negativeReplies = 0;
@@ -130,7 +131,7 @@ export class ProviderGuard {
     const reconnectAfterMs = state?.connected || this.paused ? 0 : Math.max(0, this.#connectionDue(now) - now);
     return { ...this.stats, measurement: 'encrypted-frame-write-admission-not-provider-receipt', framesLastSecond: this.recentFrames.length, connectionsLastSecond: this.recentConnections.length, negativeReplies: this.negativeReplies, rate: this.rate, maxQueueMs: this.maxQueueMs, queuedDecoderStarts: this.starts.queue.length, startSpacingMs: this.starts.spacingMs, startWindowMs: this.starts.windowMs, readerReady: this.readerReady, state: this.paused ? 'paused' : state?.connected ? 'connected' : reconnectAfterMs ? 'reconnecting' : state ? 'connecting' : 'idle', retryAfterMs: 0,
       reconnectAfterMs, reconnectFailures: this.budget ? this.budget.snapshot().failureCount : this.reconnectFailures, reconnectBaseMs: this.reconnectBaseMs, reconnectMaxMs: this.reconnectMaxMs, reconnectWindowMs: this.reconnectWindowMs, maxReconnectAttempts: this.reconnectAttempts, attemptsLastWindow: this.attemptTimes.length, stableMs: this.stableMs,
-      lastConnectionAt: this.lastConnectionAt, lastReaderReadyAt: this.lastReaderReadyAt, lastPositiveECMAt: this.lastPositiveECMAt, lastNegativeECMAt: this.lastNegativeECMAt, lastResetAt: this.lastResetAt, resetReasons: { ...this.resetReasons }, resetHistory: this.resetHistory.map(item => ({ ...item })),
+      lastConnectionAt: this.lastConnectionAt, lastReaderReadyAt: this.lastReaderReadyAt, lastPositiveECMAt: this.lastPositiveECMAt, lastNegativeECMAt: this.lastNegativeECMAt, lastResetAt: this.lastResetAt, resetReasons: { ...this.resetReasons }, resetHistory: this.resetHistory.map(item => ({ ...item })), lastTCPError: this.lastTCPError ? { ...this.lastTCPError } : null,
       queuedFrames: state?.queue.length || 0, queuedBytes: state?.bytes || 0, partialRequestBytes: state?.pending.length || 0, oldestQueuedAgeMs: oldest === null || oldest === undefined ? 0 : Math.max(0, now - oldest), partialReplyBytes: state?.replyPending.length || 0, outstandingClientFramesEstimate: state ? Math.max(0, state.clientFrames - state.replyFrames) : 0, upstreamWritableBytes: Number.isFinite(state?.upstream?.writableLength) ? state.upstream.writableLength : 0, writeBackpressured: Boolean(state?.writeBlocked), ...(this.budget ? { accountBudget: this.budget.snapshot() } : {}),
       waitingLocalHandoff: Boolean(this.waitingLocal),
     };
@@ -158,7 +159,7 @@ export class ProviderGuard {
       this.reconnectNotBefore = Math.max(this.reconnectNotBefore, this.now() + delay);
     }
     this.#dispose(state);
-    this.onReset(reason);
+    this.onReset(reason, reason === 'provider TCP error' ? { tcpCode: this.lastTCPError?.code || 'UNKNOWN' } : undefined);
   }
   #dispose(state) {
     if (!state) return;
@@ -284,7 +285,11 @@ export class ProviderGuard {
         state.handshakeTimer = this.setTimer(() => this.#reset(state, 'provider handshake timed out'), 10000);
         state.handshakeTimer?.unref?.(); this.#arm(state);
       });
-      upstream.on('error', () => fail('provider TCP error')); upstream.on('close', () => fail('provider TCP closed'));
+      upstream.on('error', error => {
+        if (state.closed || this.active !== state) return;
+        this.lastTCPError = { time: this.#timestamp(), code: tcpErrorCodes.has(error?.code) ? error.code : 'UNKNOWN' };
+        fail('provider TCP error');
+      }); upstream.on('close', () => fail('provider TCP closed'));
       upstream.on('drain', () => { if (state.closed || this.active !== state) return; state.writeBlocked = false; this.#arm(state); });
       upstream.on('data', chunk => {
         if (state.closed || this.active !== state) return;

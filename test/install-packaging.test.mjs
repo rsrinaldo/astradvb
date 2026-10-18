@@ -11,11 +11,11 @@ const install = readFileSync(new URL('../install.sh', import.meta.url), 'utf8');
 const casInstall = readFileSync(new URL('../install-cas.sh', import.meta.url), 'utf8');
 const docker = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
 
-test('application and changed dashboard asset caches identify release 0.8.50', () => {
+test('application and changed dashboard asset caches identify release 0.8.52', () => {
   const packageInfo = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
-  assert.equal(packageInfo.version, '0.8.50');
-  assert.match(html, /\/styles\.css\?v=0\.8\.50/); assert.match(html, /\/app\.js\?v=0\.8\.50/);
+  assert.equal(packageInfo.version, '0.8.52');
+  assert.match(html, /\/styles\.css\?v=0\.8\.52/); assert.match(html, /\/app\.js\?v=0\.8\.52/);
 });
 
 test('installers and Docker RUN commands parse without executing installation or a container build', () => {
@@ -74,14 +74,14 @@ test('system and container installations require a verified policy-8 executable 
   for (const name of patchNames) {
     assert.ok(docker.split(name).length >= 3, `Docker must copy and apply ${name}`);
   }
-  assert.match(casInstall, /"policyVersion":8/); assert.match(casInstall, /"ciphertextSafety":"%s"/); assert.match(casInstall, /\$\{patch_digests\[6\]\}/);
-  assert.match(docker, /policyVersion:8/); assert.match(docker, /binarySha256:hash/); assert.match(docker, /ciphertextSafety:digests\[6\]/);
+  assert.match(casInstall, /"policyVersion":10/); assert.match(casInstall, /"ciphertextSafety":"%s"/); assert.match(casInstall, /\$\{patch_digests\[6\]\}/);
+  assert.match(docker, /policyVersion:10/); assert.match(docker, /binarySha256:hash/); assert.match(docker, /ciphertextSafety:digests\[6\]/);
   for (const text of [casInstall, docker]) assert.doesNotMatch(text, /tsdecrypt-ciphertext-safety\.experimental\.patch/);
   assert.match(docker, /protectedNativeBuild\(\)/); assert.match(docker, /sourceDirectory:"\/usr\/local\/src\/tsdecrypt"/);
   assert.match(install, /protectedOscamBuild\("\/usr\/local\/bin\/oscam", "\/usr\/local\/share\/licenses\/oscam\/astra-native-oscam\.json"\)/);
   assert.match(install, /oscam_verified \|\| \{[^\n]*rollback_install 1;/);
   assert.match(docker, /oscam-newcamd-stream-io\.patch/);
-  assert.match(docker, /policyVersion:3/); assert.match(docker, /semanticPolicyVersion:3/); assert.match(docker, /protectedOscamBuild\(\)/);
+  assert.match(docker, /policyVersion:4/); assert.match(docker, /semanticPolicyVersion:4/); assert.match(docker, /protectedOscamBuild\(\)/);
 });
 
 test('policy-8 packaging runs portable safety and real scalar CSA probe gates before native publication', () => {

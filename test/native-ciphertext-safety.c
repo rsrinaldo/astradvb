@@ -101,6 +101,45 @@ static void healthy_parity_continuation(void) {
     assert(oracle.emitted == 1 && "headerless parity prefix must await its independent PES anchor");
     push(s, 256, 21, 1, 1, 2, 21, 23); exact(s, 22);
 }
+static void late_word_does_not_retire_physical_parity_prefix(void) {
+    struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 2000);
+    publish(s, 0, 1, 0); push(s, 256, 0, 1, 0, 1, 0, 1);
+    // The broadcast has switched before the matching key reply arrives.
+    // Retain the raw prefix until its own PES independently certifies it.
+    push(s, 256, 1, 0, 1, 2, 10, 2);
+    publish(s, 1, 2, 20);
+    push(s, 256, 2, 0, 1, 2, 21, 3);
+    assert(oracle.emitted == 1 && s->stats.packets_dropped == 0);
+    push(s, 256, 3, 1, 1, 2, 22, 4);
+    exact(s, 23);
+}
+static void asynchronous_pid_parity_preserves_certified_old_tail(void) {
+    struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 2000);
+    publish(s, 0, 1, 0); publish(s, 1, 2, 0);
+    push(s, 256, 0, 1, 0, 1, 0, 1); push(s, 257, 0, 1, 0, 1, 0, 2);
+    push(s, 257, 1, 1, 1, 2, 10, 3); // Other component changes first.
+    push(s, 256, 1, 0, 0, 1, 11, 4); // Certified, continuous old parity.
+    assert(oracle.emitted == 4 && s->count == 0 && s->stats.packets_dropped == 0);
+    push(s, 256, 2, 0, 0, 1, 12, 5); push(s, 256, 3, 1, 0, 1, 13, 6);
+    push(s, 256, 4, 0, 1, 2, 14, 7); push(s, 257, 2, 0, 1, 2, 15, 8);
+    push(s, 256, 5, 1, 1, 2, 16, 9); exact(s, 17);
+}
+static void overlap_does_not_waive_own_invalidation(void) {
+    for (unsigned int fault=0; fault<4; fault++) {
+        struct astra_ciphertext *s=start(ASTRA_CT_MAX_BYTES,2000);
+        publish(s,0,1,0); publish(s,1,2,0);
+        push(s,256,0,1,0,1,0,1); push(s,257,0,1,0,1,0,2);
+        push(s,257,1,1,1,2,10,3);
+        uint64_t now=fault==1 ? 2101 : 11;
+        uint8_t clear[188]; packet(clear,256,fault==0 ? 2 : 1,0,4);
+        if (fault==2) { clear[3]|=0x20; clear[4]=1; clear[5]=0x80; }
+        if (fault==3) clear[1]|=0x80;
+        push_bytes(s,clear,0,1,now);
+        assert(oracle.emitted==3 && oracle.bad==0 && "opposite-PID overlap cannot certify an own gap, silence, discontinuity or TEI");
+        push(s,256,fault==0 ? 3 : 2,1,0,1,now+1,5);
+        assert(s->stats.packets_dropped>0); safe_tail(s,now+2,4);
+    }
+}
 static void delayed_and_missing_words(void) {
     struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 2000); publish(s, 0, 1, 0);
     push(s, 256, 0, 1, 0, 1, 0, 1);
@@ -400,6 +439,58 @@ static void push_clear(struct astra_ciphertext *s, unsigned int pid, unsigned in
     uint8_t clear[188]; packet(clear, pid, cc, pusi, fill); assert(oracle.references < ORACLE_PACKETS);
     memcpy(oracle.reference[oracle.references++], clear, 188); assert(astra_ciphertext_push(s, clear, now));
 }
+static void push_short_clear(struct astra_ciphertext *s, unsigned int cc, unsigned int size, uint64_t now) {
+    uint8_t clear[188]; assert(size>0 && size<8); packet(clear,256,cc,0,0xff);
+    clear[3]|=0x20; clear[4]=183-size; clear[5]=0;
+    assert(oracle.references<ORACLE_PACKETS); memcpy(oracle.reference[oracle.references++],clear,188);
+    assert(astra_ciphertext_push(s,clear,now));
+}
+static void short_clear_tail_preserves_pending_parity_prefix(void) {
+    for (unsigned int size=1; size<8; size++) for (unsigned int late=0; late<2; late++) {
+        struct astra_ciphertext *s=start(ASTRA_CT_MAX_BYTES,2000);
+        publish(s,0,1,0); if(!late)publish(s,1,2,0);
+        push(s,256,0,1,0,1,0,1); push(s,256,1,0,1,2,10,2);
+        uint16_t before=s->pids[256].run;
+        push_short_clear(s,2,size,11);
+        assert(s->pids[256].run==before && "short clear continuation must not retire the pending physical-parity run");
+        push(s,256,3,0,1,2,12,3); if(late)publish(s,1,2,13);
+        push(s,256,4,1,1,2,14,4); exact(s,15);
+    }
+    // Clear tails cannot extend the last encrypted-payload freshness window.
+    struct astra_ciphertext *s=start(ASTRA_CT_MAX_BYTES,2000); publish(s,0,1,0);
+    push(s,256,0,1,0,1,0,1); push_short_clear(s,1,7,1500);
+    push(s,256,2,0,0,1,2100,3); assert(oracle.emitted==2);
+    push(s,256,3,1,0,1,2101,4); assert(s->stats.packets_dropped==1); safe_tail(s,2102,3);
+
+    // A clear tail must never release ciphertext encrypted with a missing CW.
+    s=start(ASTRA_CT_MAX_BYTES,2000); publish(s,0,1,0); publish(s,1,3,0);
+    push(s,256,0,1,0,1,0,1); push(s,256,1,0,1,2,10,2);
+    push_short_clear(s,2,7,11); push(s,256,3,1,1,2,12,3);
+    assert(oracle.emitted==1); assert(astra_ciphertext_pump(s,2015,0));
+    assert(oracle.emitted==2 && oracle.bad==0 && s->stats.timeout_drops>0);
+    publish(s,1,4,2016); push(s,256,4,1,1,4,2017,4); safe_tail(s,2018,3);
+}
+static void short_clear_exclusions_remain_fail_closed(void) {
+    for(unsigned int fault=0;fault<4;fault++) {
+        struct astra_ciphertext *s=start(ASTRA_CT_MAX_BYTES,2000); publish(s,0,1,0); publish(s,1,2,0);
+        push(s,256,0,1,0,1,0,1); push(s,256,1,0,1,2,10,2);
+        uint8_t clear[188]; packet(clear,256,fault==0 ? 3 : 2,fault==2,0xff);
+        clear[3]|=0x20; clear[4]=183-(fault==3 ? 8 : 7); clear[5]=fault==1 ? 0x80 : 0;
+        memcpy(oracle.reference[oracle.references++],clear,188); assert(astra_ciphertext_push(s,clear,11));
+        assert(!s->pids[256].seen && oracle.emitted==2 && oracle.bad==0);
+        push(s,256,fault==0 ? 4 : 3,1,1,2,12,4); assert(s->stats.packets_dropped>0); safe_tail(s,13,3);
+    }
+}
+static void deferred_reply_is_validated_before_continuation_boundary(void) {
+    struct astra_ciphertext *s=start(ASTRA_CT_MAX_BYTES,2000);
+    publish(s,0,1,0); push(s,256,0,1,0,1,0,1);
+    astra_ciphertext_defer(s,1);
+    push(s,256,1,1,1,2,10,2); // Native FIFO is deliberately deferred for SIMD.
+    publish(s,1,2,11); // Correct evidence becomes available before next packet.
+    push(s,256,2,0,1,2,12,3); push(s,256,3,1,1,2,13,4);
+    assert(oracle.emitted==1 && "evidence validation must not bypass deferred FIFO emission");
+    astra_ciphertext_defer(s,0); exact(s,14);
+}
 static void exact_owned_references(struct astra_ciphertext *s) {
     unsigned int runs[ASTRA_CT_RUN_COUNT] = {0}, keys[ASTRA_CT_KEY_COUNT] = {0};
     for (unsigned int i = 0; i < ASTRA_CT_PID_COUNT; i++) if (s->pids[i].run != ASTRA_CT_NONE) {
@@ -631,9 +722,9 @@ static void unreachable_headerless_runs_retire_without_a_timer(void) {
     push(s, 256, 0, 1, 0, 1, 0, 1);
     push(s, 256, 1, 0, 1, 2, 10, 2); // Current unanchored parity run can still gain a PUSI.
     assert(s->count == 1 && oracle.emitted == 1);
-    publish(s, 1, 3, 20); // A new distinct candidate splits that uncertified run.
-    push(s, 256, 2, 0, 1, 2, 21, 3);
-    push(s, 256, 3, 1, 1, 2, 22, 4); // Only the new run receives this valid anchor.
+    publish(s, 1, 3, 20);
+    push(s, 256, 3, 0, 1, 2, 21, 3); // An actual CC gap retires the uncertified prefix.
+    push(s, 256, 4, 1, 1, 2, 22, 4); // Only the new run receives this valid anchor.
     assert(s->count == 0 && oracle.emitted == 2 && oracle.bad == 0 &&
         "a retired headerless run cannot gain a future anchor and must not hold certified A/V until timeout");
     assert(s->stats.timeout_drops == 0 && s->stats.packets_dropped == 2);
@@ -655,6 +746,14 @@ static void unreachable_headerless_runs_retire_without_a_timer(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--short-clear-regression")) {
+        short_clear_tail_preserves_pending_parity_prefix();
+        puts("PASS: short clear tails preserve raw parity prefixes without extending encrypted freshness"); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--late-prefix-regression")) {
+        late_word_does_not_retire_physical_parity_prefix();
+        puts("PASS: late candidate publication preserves a physical parity prefix pending its own PES evidence"); return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--orphan-regression")) {
         unreachable_headerless_runs_retire_without_a_timer();
         puts("PASS: retired headerless runs retire immediately; anchored late-key recovery remains safe"); return 0;
@@ -672,13 +771,16 @@ int main(int argc, char **argv) {
         puts("PASS: completed-anchor cache preserves fresh evidence and exact candidate ownership"); return 0;
     }
     assert(argc == 1);
-    healthy_parity_continuation(); delayed_and_missing_words(); prefetched_same_parity_change(); startup_ambiguous_prefix();
+    healthy_parity_continuation(); late_word_does_not_retire_physical_parity_prefix(); asynchronous_pid_parity_preserves_certified_old_tail(); overlap_does_not_waive_own_invalidation(); delayed_and_missing_words(); prefetched_same_parity_change(); startup_ambiguous_prefix();
     pid_whole_cycle_gap(1); pid_whole_cycle_gap(0); unchanged_pairs_and_future_opposite_half(); marked_same_parity_changes(); ambiguity_context_and_eof(); bounds_and_output_failure();
     split_pes_prefix_and_cc_gap(); candidate_and_run_exhaustion(); deferred_batches_wrap_and_eof();
     expired_reply_and_ambiguity_eviction(); malformed_selected_and_clear_transition(); complete_ecm_identity(); idle_component_pid_churn();
     idle_certificate_gc_preserves_queued_ownership();
     unknown_only_candidate_eviction(); valid_unknown_candidate_eviction(); late_new_candidate_and_exact_retention_references();
     unanchored_private_pes_cannot_block_av();
+    short_clear_tail_preserves_pending_parity_prefix();
+    short_clear_exclusions_remain_fail_closed();
+    deferred_reply_is_validated_before_continuation_boundary();
     unreachable_headerless_runs_retire_without_a_timer();
     ready_prefix_gathers_across_clear_and_other_keys(); unresolved_prefix_blocks_ready_tail(); gathered_wrap_stops_at_uncertain_boundary_and_drains_eof(); gathered_batch_failures_are_terminal(); completed_anchor_probe_cache_and_fresh_evidence();
     puts("PASS: strict ordered ciphertext safety, early-future ambiguity, PID-cycle gaps, delayed/missing keys, exact healthy continuations and bounded EOF ownership");

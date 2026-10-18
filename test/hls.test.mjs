@@ -51,6 +51,22 @@ function clockPacket(milliseconds, { pid = 256, keyframe = false, discontinuity 
   return value;
 }
 
+test('three-second target retains exact A/V and a fifteen-second live window at keyframe boundaries', () => {
+  const emitted = [], expected = [];
+  const hls = new HLSSegmenter({ segmentSeconds: 3, windowSegments: 5, onSegment: s => emitted.push(s.data) });
+  hls.push(Buffer.concat([pat(), pmt()]), 0);
+  for (let time = 0; time < 120000; time += 40) {
+    const data = clockPacket(time, { keyframe: time % 1000 === 0 });
+    expected.push(data); hls.push(data, time);
+  }
+  assert.equal(hls.targetDuration, 5); assert.equal(hls.segments.length, 5);
+  assert.equal(hls.playlistSeconds, 15);
+  hls.flush(120000);
+  const av = []; for (const data of emitted) for (let o = 0; o < data.length; o += 188) if ((((data[o + 1] & 31) << 8) | data[o + 2]) === 256) av.push(data.subarray(o, o + 188));
+  assert.deepEqual(Buffer.concat(av), Buffer.concat(expected));
+  assert.ok(hls.segments.every(s => s.duration <= 5));
+});
+
 test('keeps TARGETDURATION fixed when longer segments age out and across restarts', () => {
   const hls = new HLSSegmenter();
   const targets = new Set([hls.playlist('/hls/test').match(/TARGETDURATION:(\d+)/)[1]]);

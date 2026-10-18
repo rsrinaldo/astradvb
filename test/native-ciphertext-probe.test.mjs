@@ -41,3 +41,21 @@ test('actual Linux scalar probe round-trips real CSA with independent bounded ca
     assert.match(run.stdout, /^PASS: actual scalar libdvbcsa A\/B\/A/);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('real CSA late publication preserves raw physical-parity prefix without accepting a wrong candidate', { skip: process.platform !== 'linux', timeout: 60000 }, () => {
+  const { sources, patch } = actualProbeSources(), directory = mkdtempSync(join(tmpdir(), 'astra-ciphertext-late-csa-'));
+  try {
+    for (const [name, source] of Object.entries(sources)) writeFileSync(join(directory, name), source);
+    for (const [name, text] of [['astra-ciphertext-safety.h', patch], ['astra-pes-validation.h', readFileSync(join(root, 'patches/tsdecrypt-pes-validation.patch'), 'utf8')]]) {
+      const addition = text.split(`+++ b/${name}\n`)[1]?.split('\ndiff --git ')[0]; assert.ok(addition);
+      writeFileSync(join(directory, name), addition.split('\n').filter(line => line.startsWith('+')).map(line => line.slice(1)).join('\n') + '\n');
+    }
+    const binary = join(directory, 'late-csa-test');
+    const sanitizers = process.env.ASTRA_CIPHER_TEST_SANITIZERS === '1' ? ['-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-g'] : [];
+    const build = spawnSync('cc', ['-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', ...sanitizers, '-I', directory,
+      join(root, 'test/native-ciphertext-late-csa.c'), join(directory, 'astra-ciphertext-probe.c'), '-ldvbcsa', '-o', binary], { encoding: 'utf8', timeout: 30000 });
+    assert.equal(build.status, 0, build.stderr);
+    const run = spawnSync(binary, [], { encoding: 'utf8', timeout: 20000 }); assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stdout, /^PASS: real CSA late-key prefix recovery/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

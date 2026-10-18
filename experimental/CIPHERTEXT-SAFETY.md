@@ -1,4 +1,26 @@
-# Native ciphertext safety — design baseline and policy 8
+# Native ciphertext safety — design baseline and policy 10
+
+Policy 10 additionally preserves recent run ownership/CC across a non-PUSI
+clear continuation with 1–7 payload bytes. It never extends last-encrypted
+freshness, changes parity or relaxes an own gap/discontinuity/context boundary.
+Incomplete encrypted anchors retain the existing fail-closed path. Clear
+packets remain untransformed FIFO entries; pending encrypted prefixes still
+require their independent PES evidence. No queue or retained object is added.
+The live numeric-header trace and corresponding real generated-media oracle
+are documented in `../VERIFICATION-0.8.52.md`.
+
+Policy 9 does not retire a still-owned, headerless raw run merely because a
+candidate word arrives. No previous PES certificate exists on that run to
+invalidate; its first future PES still independently selects the word. This
+preserves physical-parity prefix eligibility without adding a key inference,
+timer, queue or fixed delay. A single other-PID switch to the opposite parity
+also preserves a still-certified continuous old-parity run. Two observed
+transitions or a same-phase return still reanchor, as do own CC, silence,
+discontinuity, TEI, context and parity boundaries. Startup and uncertain runs
+gain no exemption. The existing anchored-run publication boundary is unchanged.
+The strict oracle reproduces the old packet loss, and a real-libdvbcsa fixture
+checks byte-exact late-prefix recovery and withholding a wrong candidate.
+Current evidence is recorded in `../VERIFICATION-0.8.51.md`.
 
 Policy 8 retires unconfirmed headerless runs immediately if their PID owner has
 already moved elsewhere. Such runs cannot receive future header evidence.

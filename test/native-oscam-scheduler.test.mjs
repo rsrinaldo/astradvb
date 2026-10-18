@@ -38,8 +38,8 @@ test('normal installers include verified semantic policy while the reader remain
     assert.equal(content.includes('native-oscam-scheduler.c'), true);
     assert.equal(content.includes('semanticSchedulerSha256'), true);
   }
-  assert.match(readFileSync(join(root, 'install-cas.sh'), 'utf8'), /"policyVersion":3,"semanticPolicyVersion":3/);
-  assert.match(readFileSync(join(root, 'Dockerfile'), 'utf8'), /policyVersion:3,semanticPolicyVersion:3/);
+  assert.match(readFileSync(join(root, 'install-cas.sh'), 'utf8'), /"policyVersion":4,"semanticPolicyVersion":4/);
+  assert.match(readFileSync(join(root, 'Dockerfile'), 'utf8'), /policyVersion:4,semanticPolicyVersion:4/);
   assert.match(patch, /DEF_OPT_INT8\("astra_ecm_scheduler".*OFS\(astra_ecm_scheduler\),\s*0\)/);
   assert.match(patch, /reader->astra_ecm_scheduler == 1 && \(reader->typ != R_NEWCAMD \|\| cfg.max_pending > 256\)/);
   assert.match(patch, /if\(reader->client && reader->client->astra_scheduler\)/);
@@ -48,7 +48,9 @@ test('normal installers include verified semantic policy while the reader remain
   assert.match(patch, /Retained SENT slots can outlive REQUEST_ANSWERED/);
   assert.match(patch, /if\(ea->reader && ea->reader->client &&\n\+\s*astra_semantic_detach_parent/);
   assert.match(patch, /cl->ecmtask\[i\]\.parent = NULL/);
-  assert.match(patch, /ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 3/);
+  assert.match(patch, /ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 4/);
+  assert.match(patch, /rdr->tcp_ito == -1 && rdr->tcp_connected == 0 && !cl->thread_active && time_diff >= 1/);
+  assert.match(patch, /if\(guarded_reconnect \|\| time_diff > 60/);
   assert.match(patch, /if\(cl->ecmtask\[i\]\.idx == idx\)/);
   assert.match(patch, /astra_semantic_reply_progress\(reader, i, \(uint16_t\)idx\)/);
   assert.match(patch, /if\(!idx && cl->astra_scheduler\) \{ break; \}\n\s*if\(!idx\) \{ idx = cl->last_idx; \}/);

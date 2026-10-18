@@ -13,7 +13,7 @@ index 0000000..ab1486a
 + * deadline plus absence of matched complete ECM reply progress permits reset. */
 +#include <stdint.h>
 +#include <stddef.h>
-+#define ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 3
++#define ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 4
 +
 +enum astra_semantic_state { ASTRA_EMPTY, ASTRA_QUEUED, ASTRA_SENT, ASTRA_ALIAS };
 +struct astra_semantic_slot
@@ -279,6 +279,20 @@ diff --git a/oscam-client.c b/oscam-client.c
 index a264f2f..3c50710 100644
 --- a/oscam-client.c
 +++ b/oscam-client.c
+@@ -758,7 +758,12 @@ void client_check_status(struct s_client *cl)
+ 				time_t now = time(NULL);
+ 				int32_t time_diff = llabs(now - rdr->last_check);
+ 
+-				if(time_diff > 60 || (time_diff > 12 && (rdr->typ == R_CCCAM || rdr->typ == R_CAMD35 || rdr->typ == R_CS378X)) || ((time_diff > (rdr->tcp_rto?rdr->tcp_rto:60)) && rdr->typ == R_RADEGAST))     //check 1x per minute or every 10s for cccam/camd35 or reconnecttimeout radegast if 0 defaut 60s
++				/* Wake only an idle, disconnected guarded Newcamd reader. The
++				 * account guard still owns durable connection admission/backoff;
++				 * healthy sessions and an active handshake must not be disturbed. */
++				int32_t guarded_reconnect = rdr->astra_ecm_scheduler == 1 && rdr->typ == R_NEWCAMD &&
++					rdr->tcp_ito == -1 && rdr->tcp_connected == 0 && !cl->thread_active && time_diff >= 1;
++				if(guarded_reconnect || time_diff > 60 || (time_diff > 12 && (rdr->typ == R_CCCAM || rdr->typ == R_CAMD35 || rdr->typ == R_CS378X)) || ((time_diff > (rdr->tcp_rto?rdr->tcp_rto:60)) && rdr->typ == R_RADEGAST))
+ 				{
+ 					add_job(rdr->client, ACTION_READER_IDLE, NULL, 0);
+ 					rdr->last_check = now;
 @@ -890,6 +890,7 @@ void free_client(struct s_client *cl)
  
  	if(cl->ecmtask)

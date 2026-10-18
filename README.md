@@ -46,6 +46,42 @@ node src/server.mjs
 
 Open `http://server-address:8000/` and sign in as `admin`. Read the unique initial password from `data/initial-admin-password`, then change it in **Settings → Administrator account**. All example streams are disabled.
 
+## Short clear continuation safety (v0.8.52)
+
+Native policy 10 preserves recent encrypted-run ownership across a clear
+continuation carrying only 1–7 payload bytes. Its CC is tracked, but it cannot
+refresh the last encrypted timestamp or bypass a PUSI, gap, discontinuity,
+incomplete encrypted PES anchor or context change. The clear packet is emitted
+unchanged in FIFO order. Pending ciphertext still requires independent PES
+evidence with the correct word. This prevents short clear tails from retiring
+recoverable video prefixes. No new buffer, copy, fixed delay or provider
+request is added. Install the matching application/policy-10 decoder together
+with `sudo ./install.sh`; existing OSCam policy 4 remains valid.
+Fresh key evidence is also validated before a waiting run's boundary decision
+inside deferred SIMD input batches, without emitting ahead of the FIFO pump.
+See [v0.8.52 verification](VERIFICATION-0.8.52.md).
+
+## Late-key prefix recovery and idle reconnect (v0.8.51)
+
+Native policy 9 keeps an unanchored raw parity prefix when a new candidate key
+arrives. It still waits for that PID's independent PES evidence before emitting
+anything; startup ambiguity, gaps, context changes and invalid words remain
+fail-closed. A still-certified continuous PID also retains its old-parity tail
+when another component makes one switch to the opposite parity. A whole-cycle
+absence, same-phase return or any own boundary still requires reanchoring.
+These changes avoid invalidating valid overlap or recoverable raw prefixes.
+The adaptive two-second/eight-MiB bounds and zero
+fixed input delay are unchanged. OSCam policy 4 also wakes an idle disconnected
+guarded Newcamd reader promptly, using its existing worker and durable account
+budget, without replay. TCP errors expose only a bounded errno code.
+
+Upgrade the application, verified decoder policy 9 and OSCam policy 4 together
+using `sudo ./install.sh`. Existing HLS settings remain configurable; a
+three-second segment target with five segments halves the nominal six-second
+target/window, not necessarily the downstream player's total latency. Media
+boundaries and the minimum playlist-duration rule still apply.
+See [v0.8.51 verification](VERIFICATION-0.8.51.md).
+
 ## Progress-safe shared CAS recovery (v0.8.50)
 
 Expired caller requests and a live backlog no longer reset a shared connection

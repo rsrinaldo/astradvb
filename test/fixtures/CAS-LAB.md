@@ -75,7 +75,30 @@ with no output pauses and exactly one true semantic ECM identity. A PMT version
 or unrelated descriptor update must not force an unnecessary key refetch or
 leave the existing channel keyless.
 
-## Normal policy 8 ciphertext safety
+## Normal policy 10 ciphertext safety
+
+Policy 10 models natural short clear tails (1–7 payload bytes) inside a pending
+encrypted parity prefix. The portable oracle covers every size, on-time/late
+keys, missing/wrong keys, own invalidation exclusions and encrypted freshness.
+The real native clip keeps natural TS tails clear, verifies their public CSA
+fixture payload was unchanged, and moves the physical parity boundary before
+such a tail. All original clear A/V bytes must survive exactly. Existing
+startup, wrong-CW, split-PES, capacity, EOF and full-cycle safety tests remain.
+
+Policy 9 retains an owned headerless raw run across candidate publication, so
+the first independent PES can still certify its physical-parity prefix. The
+portable regression failed on policy 8, then passes without allowing wrong
+words, gap/context inference or unbounded retention. A real-libdvbcsa fixture
+requires all original packets byte-for-byte, including a wrong-first-candidate
+case that must remain withheld until the correct word arrives. These are
+provider-free tests, not a guarantee of loss-free production playback.
+
+A second regression covers asynchronous component parity: one other-PID switch
+to the opposite parity must not invalidate a certified old tail. Whole-cycle
+absence and own CC/silence/discontinuity/TEI cases must still fail closed. The
+real native finite-media test staggers audio/video TSC boundaries using the
+public constant fixture's identical even/odd halves and requires every original
+clear A/V byte in order. No provider or captured broadcast keys are used.
 
 Policy 8 adds retired-headerless-run progress: only an unconfirmed run with no
 anchor and no remaining PID owner retires immediately. Anchored late-key work

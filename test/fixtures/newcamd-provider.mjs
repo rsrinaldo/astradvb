@@ -287,6 +287,7 @@ export async function startNewcamdProvider({ host = '127.0.0.1', port = 0, polic
     pauseReads(connectionId = null) { const selected = controlledPeers(connectionId); for (const peer of selected) peer.pause(); return selected.length; },
     resumeReads(connectionId = null) { const selected = controlledPeers(connectionId); for (const peer of selected) peer.resume(); return selected.length; },
     disconnect(connectionId = null) { const selected = controlledPeers(connectionId); for (const peer of selected) peer.destroy(); return selected.length; },
+    reset(connectionId = null) { const selected = controlledPeers(connectionId); for (const peer of selected) { assert.equal(typeof peer.resetAndDestroy, 'function'); peer.resetAndDestroy(); } return selected.length; },
     // The reserved zero ID cannot match an ordinary fixture request. Its
     // valid encrypted frame is deliberately NOT a semantic completion.
     async sendZeroIdReply(connectionId) {

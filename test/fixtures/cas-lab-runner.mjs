@@ -102,8 +102,8 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
   if (semanticScheduler) {
     assert.ok(process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, 'Semantic dispatch requires its explicit lab manifest');
     const manifest = JSON.parse(await readFile(process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, 'utf8'));
-    assert.equal(manifest.policyVersion, 3, 'Semantic dispatch requires the policy3 reader');
-    assert.equal(manifest.semanticPolicyVersion, 3);
+    assert.equal(manifest.policyVersion, 4, 'Semantic dispatch requires the policy4 reader');
+    assert.equal(manifest.semanticPolicyVersion, 4);
     assert.notEqual(manifest.experimental, true, 'Release tests must use the normal protected reader');
     assert.match(manifest.semanticSchedulerSha256 || '', /^[a-f0-9]{64}$/, 'Semantic dispatch requires its normal patch digest');
   }
@@ -290,6 +290,26 @@ export async function runSemanticReadStall(lab, { count = 64, pauseMs = 4000 } =
       elapsedMs: Math.round(performance.now() - began), originFramesDuringReadPause: paused.guard.framesSent - before.guard.framesSent,
       parserPeakRequestsPerSecond: after.provider.peakRequestsPerSecond, limitation: 'application-read-backlog-not-wire-packet-arrival-measurement', ...after };
   } finally { lab.provider.resumeReads(); for (const client of clients) client.close(); }
+}
+
+export async function runSemanticDisconnectRecovery(lab) {
+  const client = await lab.client();
+  try {
+    correctSyntheticReply(await client.requestECM({ channelId: 1, epoch: 5900 }), 1, 5900, lab.transportMode);
+    await sleep(2100); // Ensure the legacy idle check was recently serviced.
+    const began = performance.now();
+    assert.equal(lab.provider.reset(1), 1, 'Force RST only on the disposable fixture provider');
+    // No new ECM/client job wakes the reader: its idle recovery must do so.
+    await waitFor(() => { const s = lab.snapshot(); return s.guard.connections === 2 && s.guard.readerReady; }, 6000);
+    const recoveredElapsedMs = Math.round(performance.now() - began);
+    correctSyntheticReply(await client.requestECM({ channelId: 1, epoch: 5901 }), 1, 5901, lab.transportMode);
+    const after = semanticEvidence(lab, { allowResets: true });
+    assert.equal(after.guard.connections, 2); assert.equal(after.guard.connectionResets, 1);
+    assert.equal(after.provider.requests, 2, 'No old request may be replayed on reconnect');
+    assert.equal(after.provider.protocolErrors, 0); assert.ok(after.guard.peakFramesPerSecond <= 20);
+    assert.equal(after.guard.lastTCPError?.code, 'ECONNRESET');
+    return { scenario: 'semantic-idle-rst-recovery', recoveredElapsedMs, freshCorrectReplies: 1, automaticClientRetries: 0, ...after };
+  } finally { client.close(); }
 }
 
 export async function runSemanticSilentRecovery(lab, { count = 5, unmatchedEveryMs = 0 } = {}) {

@@ -649,8 +649,8 @@ new file mode 100644
 index 0000000..e8fc54b
 --- /dev/null
 +++ b/astra-ciphertext-safety.h
-@@ -0,0 +1,513 @@
-+/* Normal native decoder safety (policy 8). READY-prefix SIMD cohorts preserve
+@@ -0,0 +1,539 @@
++/* Normal native decoder safety (policy 10). READY-prefix SIMD cohorts preserve
 + * original TS order and adaptive retention bounds without fixed input delay.
 + * Copyright AstraDVB contributors, GPL-2.0-only.
 + *
@@ -1103,11 +1103,28 @@ index 0000000..e8fc54b
 +         * still queued. It is a candidate, not a physical key boundary.
 +         * Preserve an already certified continuous run until its own TSC/
 +         * context boundary or next PUSI; that PUSI independently reprobes. */
++        /* Native SIMD batching defers pumping. Validate newly available PES
++         * evidence before a matching reply is mistaken for a word boundary.
++         * This changes no FIFO/decryption emission or expiry rule. */
++        if (s->probe_dirty && p->run != ASTRA_CT_NONE)
++            astra_ct_probe(s, &s->runs[p->run], now_ms);
++        /* A headerless raw prefix has no certificate to invalidate: a late
++         * candidate must remain eligible for its first future PES anchor.
++         * Preserve physical-parity prefix eligibility, but never relax a
++         * context, CC-gap, silence, phase or anchored-run invalidation. */
 +        int word_split = p->word_revision != s->word_revision[parity] &&
-+            (p->run == ASTRA_CT_NONE || !s->runs[p->run].confirmed);
++            (p->run == ASTRA_CT_NONE || (!s->runs[p->run].confirmed && s->runs[p->run].anchor_count));
++        /* One other-PID switch to the opposite parity is overlap, not an
++         * observed whole cycle on this still-certified continuous PID.
++         * Two transitions, a same-phase return or any own boundary reanchor. */
++        int phase_split = p->transition_revision != s->transition_revision;
++        if (phase_split && s->transition_revision - p->transition_revision == 1 &&
++            s->phase != parity && p->seen && p->parity == parity &&
++            p->run != ASTRA_CT_NONE && s->runs[p->run].confirmed && !s->runs[p->run].failed)
++            phase_split = 0;
 +        int split = !p->seen || p->run == ASTRA_CT_NONE || parity != p->parity || discontinuity ||
 +            now_ms - p->seen_ms >= s->wait_ms || word_split ||
-+            p->transition_revision != s->transition_revision || (cc != p->cc && cc != ((p->cc + 1) & 15));
++            phase_split || (cc != p->cc && cc != ((p->cc + 1) & 15));
 +        if (!split && s->runs[p->run].failed) split = 1;
 +        if (!split && !s->runs[p->run].confirmed && now_ms - s->runs[p->run].first_ms >= s->wait_ms) split = 1;
 +        if (!split && (packet[1] & 0x40) && s->runs[p->run].confirmed) split = 1;
@@ -1123,8 +1140,17 @@ index 0000000..e8fc54b
 +        /* Never send a malformed/TEI encrypted selected packet as clear. */
 +        s->stats.packets_in++; s->stats.packets_dropped++; return 1;
 +    } else if (p->type && offset < 188 && p->seen) {
-+        /* A clear/encrypted transition must not inherit an old certificate. */
-+        astra_ct_run_release(s, p->run); p->run = ASTRA_CT_NONE; p->seen = 0;
++        /* Short clear continuations carry no encrypted block and are not a
++         * key boundary. Keep raw ownership/CC, but never refresh the last
++         * encrypted timestamp or inherit across a PUSI/gap/discontinuity.
++         * Incomplete encrypted PES anchors keep the old fail-closed path. */
++        unsigned int cc = packet[3] & 15;
++        int discontinuity = ((packet[3] & 0x20) && packet[4] && (packet[5] & 0x80));
++        struct astra_ct_run *r = p->run == ASTRA_CT_NONE ? NULL : &s->runs[p->run];
++        if (188 - offset < 8 && !(packet[1] & 0x40) && !discontinuity && r && !r->failed &&
++            (r->confirmed || !r->anchor_count || r->anchor_complete) &&
++            now_ms - p->seen_ms < s->wait_ms && (cc == p->cc || cc == ((p->cc + 1) & 15))) p->cc = cc;
++        else { astra_ct_run_release(s, p->run); p->run = ASTRA_CT_NONE; p->seen = 0; }
 +    }
 +    /* A private-PES continuation without an anchor cannot be validated by
 +     * waiting for more keys. Do not admit it to the shared ordered FIFO.
