@@ -120,7 +120,7 @@ native_verified() {
   "$node_binary" --input-type=module -e 'import { pathToFileURL } from "node:url"; const { protectedNativeBuild } = await import(pathToFileURL(process.argv[1])); process.exit(protectedNativeBuild("/usr/local/bin/tsdecrypt", "/usr/local/share/licenses/tsdecrypt/astra-native-cas.json") ? 0 : 1);' "$installer_dir/src/softcam.mjs"
 }
 oscam_verified() {
-  "$node_binary" --input-type=module -e 'import { pathToFileURL } from "node:url"; const { protectedOscamBuild } = await import(pathToFileURL(process.argv[1])); process.exit(protectedOscamBuild("/usr/local/bin/oscam", "/usr/local/share/licenses/oscam/astra-native-oscam.json") ? 0 : 1);' "$installer_dir/src/oscam-integrity.mjs"
+  "$node_binary" --input-type=module -e 'import { pathToFileURL } from "node:url"; const { protectedOscamBuild } = await import(pathToFileURL(process.argv[1])); process.exit(protectedOscamBuild("/usr/local/bin/oscam", "/usr/local/share/licenses/oscam/astra-native-oscam.json", {direct:true}) ? 0 : 1);' "$installer_dir/src/oscam-integrity.mjs"
 }
 if ! oscam_verified || ! native_verified; then
   backup_native
@@ -153,7 +153,7 @@ if [[ ! -f /var/lib/astra-linux/config.json ]]; then
 fi
 if [[ ! -f /etc/astra-linux/environment ]]; then
   secret="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
-  printf 'ASTRA_SECRET_KEY=%s\nASTRA_TSDECRYPT=/usr/local/bin/tsdecrypt\nASTRA_OSCAM=/usr/local/bin/oscam\n' "$secret" > /etc/astra-linux/environment
+  printf 'ASTRA_SECRET_KEY=%s\nASTRA_TSDECRYPT=/usr/local/bin/tsdecrypt\nASTRA_OSCAM=/usr/local/bin/oscam\nASTRA_CAS_TRANSPORT=direct\n' "$secret" > /etc/astra-linux/environment
   chmod 0600 /etc/astra-linux/environment
 fi
 

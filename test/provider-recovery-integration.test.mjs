@@ -97,6 +97,56 @@ test('actual TCP fragmented provider replies remain private until each complete 
   assert.equal(s.guard.snapshot().framesSent, 2);
 });
 
+test('actual TCP RST after mixed key results returns to baseline backoff without replay or extra connection credit', { timeout: 15000 }, async t => {
+  const s = await fixture(t, { onFrame: (item, peer) => { if (!peer.destroyed) peer.write(item.data); } });
+  async function connect() {
+    const local = s.client(), state = { greeting: 14, pending: Buffer.alloc(0), replies: 0 };
+    local.on('data', bytes => {
+      if (state.greeting) {
+        const take = Math.min(state.greeting, bytes.length); state.greeting -= take; bytes = bytes.subarray(take);
+        if (!state.greeting) local.write(Buffer.concat([frame(1), frame(2)]));
+      }
+      state.pending = Buffer.concat([state.pending, bytes]);
+      while (state.pending.length >= 2 && state.pending.length >= state.pending.readUInt16BE(0) + 2) {
+        const length = state.pending.readUInt16BE(0) + 2;
+        state.pending = state.pending.subarray(length); state.replies++;
+      }
+    });
+    await until(() => state.replies === 2);
+    assert.equal(s.guard.setReaderReady(true), true);
+    return { local, state };
+  }
+  await connect(); s.accepted[0].peer.resetAndDestroy();
+  await until(() => s.guard.snapshot().connectionResets === 1);
+  assert.equal(s.guard.snapshot().lastTCPError.code, 'ECONNRESET');
+  const second = await connect(), started = s.now();
+  let count = 0;
+  // At 20x clock acceleration, a final observation can fall just short of
+  // 30s even though the loop's later sleep crosses 31s. Wait for actual fresh
+  // health evidence, with a strict upper bound that still catches regressions.
+  while (s.now() - started < 31000 || s.guard.snapshot().stableRecoveries === 0) {
+    assert.ok(s.now() - started < 45000, 'fresh mixed results must establish bounded stable health');
+    const before = second.state.replies;
+    second.local.write(frame(10 + count % 200)); count++;
+    await until(() => second.state.replies === before + 1);
+    s.guard.result(true); s.guard.result(false);
+    await delay(50);
+  }
+  assert.equal(s.guard.snapshot().stableRecoveries, 1);
+  assert.equal(s.guard.snapshot().reconnectFailures, 0);
+  assert.equal(s.guard.snapshot().attemptsLastWindow, 2);
+  assert.equal(s.arrivals.filter(x => x.connection === 2).length, 2 + count);
+  s.accepted[1].peer.resetAndDestroy();
+  await until(() => s.guard.snapshot().connectionResets === 2);
+  const lostAt = s.now();
+  assert.ok(s.guard.snapshot().reconnectAfterMs <= 1000);
+  await connect();
+  assert.ok(s.now() - lostAt < 8000, 'healthy mixed-result session must not retain escalated transport backoff');
+  assert.equal(s.accepted.length, 3); assert.equal(s.guard.snapshot().attemptsLastWindow, 3);
+  assert.equal(s.arrivals.filter(x => x.connection === 3).length, 2, 'only new login frames, no replayed previous-generation request');
+  assert.equal(s.guard.snapshot().peakFramesPerSecond <= 20, true);
+});
+
 test('actual authenticated fast-close recovery retains the three-per-minute attempt budget, then admits eighty channels without negative-key cooldown', { timeout: 20000 }, async t => {
   let negative = false;
   const s = await fixture(t, { onFrame: (item, peer) => { if (!peer.destroyed) peer.write(item.data); } });

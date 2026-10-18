@@ -354,18 +354,56 @@ test('only sustained fresh current-session CW replies reset transport failures; 
   assert.equal(early.guard.snapshot().reconnectFailures, 0); assert.equal(early.guard.snapshot().attemptsLastWindow, 2);
 });
 
-test('negative ECMs reset only stability evidence, never block healthy traffic or decoder admissions', async t => {
+test('negative ECMs do not erase fresh positive transport health or block admissions', async t => {
   const s = await fakeTransport(t); const first = s.accept(); s.advance(0); first.destroy();
   const local = s.accept(); s.advance(1000); s.authenticate(local);
   for (const at of [1100, 16100]) { s.advance(at); s.upstreams.at(-1).emit('data', frame(9)); s.guard.result(true); }
   s.guard.result(false); assert.equal(local.destroyed, false); assert.equal(s.guard.snapshot().reconnectAfterMs, 0);
   s.advance(31100); s.upstreams.at(-1).emit('data', frame(9)); s.guard.result(true);
-  assert.equal(s.guard.snapshot().reconnectFailures, 1);
+  assert.equal(s.guard.snapshot().reconnectFailures, 0);
   let starts = 0; s.guard.scheduleDecoderStart(() => starts++); s.advance(31100); assert.equal(starts, 1);
   local.emit('data', frame(9)); s.advance(31100); assert.equal(s.writes.at(-1).at, 31100);
   for (let index = 0; index < 100; index++) s.guard.result(false);
   assert.equal(s.guard.snapshot().connections, 2); assert.equal(s.guard.snapshot().connectionResets, 1);
   assert.equal(s.guard.snapshot().negativeECMReplies, 101); assert.equal(s.guard.snapshot().retryAfterMs, 0);
+});
+
+test('mixed valid keys and negative channel results recover the normal delay without clearing the rolling attempt budget', async t => {
+  const s = await fakeTransport(t); const first = s.accept(); s.advance(0); first.destroy();
+  const local = s.accept(); s.advance(1000); s.authenticate(local);
+  for (const at of [1100, 16100, 31100]) {
+    s.advance(at); s.guard.result(false);
+    s.upstreams.at(-1).emit('data', frame(9)); s.guard.result(true);
+    s.guard.result(false);
+  }
+  assert.equal(s.guard.snapshot().stableRecoveries, 1);
+  assert.equal(s.guard.snapshot().reconnectFailures, 0);
+  assert.equal(s.guard.snapshot().attemptsLastWindow, 2);
+  s.upstreams.at(-1).emit('error', Object.assign(new Error('synthetic reset'), { code: 'ECONNRESET' }));
+  assert.equal(s.guard.snapshot().reconnectAfterMs, 1000);
+  const third = s.accept(); s.advance(32099); assert.equal(s.connections.length, 2);
+  s.advance(32100); assert.equal(s.connections.length, 3);
+  third.destroy(); s.accept(); s.advance(59999);
+  assert.equal(s.connections.length, 3, 'health cannot replenish the durable rolling connection allowance');
+  s.advance(60000); assert.equal(s.connections.length, 4);
+});
+
+test('NOK-only, cached positives and long gaps cannot establish sustained positive transport health', async t => {
+  const s = await fakeTransport(t); const first = s.accept(); s.advance(0); first.destroy();
+  const local = s.accept(); s.advance(1000); s.authenticate(local);
+  for (const at of [1100, 16100, 31100, 46100]) {
+    s.advance(at); s.upstreams.at(-1).emit('data', frame(9));
+    s.guard.result(false); s.guard.result(true, { fresh: false });
+  }
+  assert.equal(s.guard.snapshot().reconnectFailures, 1);
+  s.guard.result(true);
+  s.advance(76101); s.upstreams.at(-1).emit('data', frame(9)); s.guard.result(true);
+  assert.equal(s.guard.snapshot().reconnectFailures, 1, 'a gap longer than the health window starts new evidence');
+  for (const at of [91101, 106101]) {
+    s.advance(at); s.guard.result(false); s.upstreams.at(-1).emit('data', frame(9)); s.guard.result(true);
+  }
+  assert.equal(s.guard.snapshot().reconnectFailures, 0);
+  assert.equal(s.guard.snapshot().stableRecoveries, 1);
 });
 
 test('encrypted reply headers and bodies are withheld until the entire frame is assembled', async t => {
@@ -425,6 +463,29 @@ test('TCP error telemetry is a bounded enum, never raw error details or a mutabl
     assert.equal(JSON.stringify(s.guard.snapshot()).includes('DO-NOT-RETAIN'), false);
     assert.equal(JSON.stringify(s.guard.snapshot()).includes('private-provider'), false);
   }
+});
+
+test('each TCP incident freezes its own code and bounded queue/progress evidence before disposal', async t => {
+  const s = await fakeTransport(t); const local = s.accept(); s.advance(0); s.authenticate(local);
+  local.emit('data', Buffer.concat([frame(8), frame(9), frame(10)])); s.advance(120);
+  s.upstreams[0].emit('data', frame(9).subarray(0, 1));
+  s.upstreams[0].writableLength = 123;
+  s.upstreams[0].emit('error', Object.assign(new Error('PRIVATE endpoint and payload'), { code: 'ECONNRESET' }));
+  const first = s.guard.snapshot().resetHistory[0];
+  assert.equal(first.tcpCode, 'ECONNRESET'); assert.equal(first.connectionAgeMs, 120);
+  assert.equal(first.clientFrames, 3); assert.equal(first.replyFrames, 2);
+  assert.equal(first.framesLastSecond, 3); assert.equal(first.queuedFrames, 2);
+  assert.equal(first.queuedBytes, 8); assert.equal(first.oldestQueuedAgeMs, 20);
+  assert.equal(first.partialReplyBytes, 1); assert.equal(first.lastReplyAgeMs, 20);
+  assert.equal(first.upstreamWritableBytes, 123); assert.equal(first.writeBackpressured, false);
+  assert.equal(s.guard.snapshot().queuedFrames, 0);
+  const next = s.accept(); s.advance(1120); s.authenticate(next);
+  s.upstreams.at(-1).emit('error', Object.assign(new Error('PRIVATE'), { code: 'ETIMEDOUT' }));
+  const snap = s.guard.snapshot();
+  assert.equal(snap.resetHistory[0].tcpCode, 'ECONNRESET'); assert.equal(snap.resetHistory[1].tcpCode, 'ETIMEDOUT');
+  snap.resetHistory[0].queuedFrames = 999;
+  assert.equal(s.guard.snapshot().resetHistory[0].queuedFrames, 2);
+  assert.equal(JSON.stringify(s.guard.snapshot()).includes('PRIVATE'), false);
 });
 
 test('synchronous connection failures consume and report the same bounded upstream attempt budget', async t => {
@@ -495,7 +556,9 @@ test('a live persistent lease releases exactly once and failures/health persist 
   assert.equal(budget.snapshot().releases, 1); assert.equal(budget.snapshot().failureCount, 1);
   const local = s.accept(); s.advance(1000); await microtasks(); s.advance(1000); s.authenticate(local);
   for (let i = 0; i < 100; i++) s.guard.result(false); assert.equal(budget.snapshot().failureCount, 1);
-  for (const at of [1100, 16100, 31100]) { s.advance(at); s.upstreams.at(-1).emit('data', frame(9)); s.guard.result(true); }
+  for (const at of [1100, 16100, 31100]) {
+    s.advance(at); s.guard.result(false); s.upstreams.at(-1).emit('data', frame(9)); s.guard.result(true); s.guard.result(false);
+  }
   assert.equal(budget.snapshot().healthy, 1); assert.equal(budget.snapshot().failureCount, 0);
   assert.equal(local.destroyed, false); assert.equal(s.guard.snapshot().retryAfterMs, 0);
   await s.guard.stop(); assert.equal(budget.snapshot().releases, 2);

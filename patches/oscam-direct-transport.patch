@@ -1,0 +1,329 @@
+diff --git a/astra-newcamd-io.h b/astra-newcamd-io.h
+index 7d9baa61..bbffe68d 100644
+--- a/astra-newcamd-io.h
++++ b/astra-newcamd-io.h
+@@ -61,4 +61,36 @@ static inline ssize_t astra_newcamd_read_exact(int fd, void *buffer, size_t leng
+     return (ssize_t)received;
+ }
+ #define ASTRA_OSCAM_STREAM_IO_POLICY_VERSION 1
++/* Direct WAN writes cannot assume send() accepts a complete framed message.
++ * Never resend a whole partial frame or let a stalled write block indefinitely. */
++#ifndef ASTRA_NEWCAMD_SEND
++#define ASTRA_NEWCAMD_SEND send
++#endif
++static inline ssize_t astra_newcamd_write_exact(int fd, const void *buffer, size_t length)
++{
++    if(length > SSIZE_MAX || (!buffer && length)) { errno = EINVAL; return -1; }
++    size_t written = 0;
++    int64_t now = astra_newcamd_now_ms();
++    if(now < 0) { return -1; }
++    int64_t deadline = now + 2000;
++    while(written < length)
++    {
++        now = astra_newcamd_now_ms();
++        if(now < 0 || now >= deadline) { errno = EAGAIN; return -1; }
++        ssize_t n = ASTRA_NEWCAMD_SEND(fd, (const uint8_t *)buffer + written, length - written, MSG_DONTWAIT | MSG_NOSIGNAL);
++        if(n > 0) { written += (size_t)n; continue; }
++        if(n < 0 && errno == EINTR) { continue; }
++        if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
++        {
++            struct pollfd event = { .fd = fd, .events = POLLOUT };
++            int ready = ASTRA_NEWCAMD_POLL(&event, 1, (int)(deadline - now));
++            if(ready < 0 && errno == EINTR) { continue; }
++            if(ready <= 0) { if(!ready) { errno = EAGAIN; } return -1; }
++            continue;
++        }
++        if(!n) { errno = EPIPE; }
++        return -1;
++    }
++    return (ssize_t)written;
++}
+ #endif
+diff --git a/globals.h b/globals.h
+index e8bbcafd..4e29d6d9 100644
+--- a/globals.h
++++ b/globals.h
+@@ -1565,6 +1565,10 @@ typedef struct cmd_packet_t
+ struct s_reader										// contains device info, reader info and card info
+ {
+ 	int8_t astra_ecm_scheduler;
++	int8_t astra_direct;
++	uint32_t astra_report_port;
++	uint32_t astra_frame_interval;
++	char *astra_budget_directory, *astra_budget_account;
+ 	uint8_t			keepalive;
+ 	uint8_t			changes_since_shareupdate;
+ 	int32_t			resetcycle;						// ECM until reset
+diff --git a/module-newcamd.c b/module-newcamd.c
+index 8fafaba9..f2b09bc4 100644
+--- a/module-newcamd.c
++++ b/module-newcamd.c
+@@ -172,6 +172,14 @@ static int32_t network_message_send(int32_t handle, uint16_t *netMsgId, uint8_t
+ 	netbuf[0] = (len - 2) >> 8;
+ 	netbuf[1] = (len - 2) & 0xFF;
+ 
++	if(commType == COMMTYPE_CLIENT && cl->reader && cl->reader->astra_direct == 1)
++	{
++		if(!astra_direct_frame(cl->reader)) { return -1; }
++		ssize_t written = astra_newcamd_write_exact(handle, netbuf, (size_t)len);
++		if(written != len) { network_tcp_connection_close(cl->reader, "provider frame write failed"); return -1; }
++		astra_direct_frame_complete(cl->reader);
++		return (int32_t)written;
++	}
+ 	return send(handle, netbuf, len, 0);
+ }
+ 
+@@ -475,7 +483,7 @@ void newcamd_reply_ka(void)
+ 	network_cmd_no_data_send(cl->udp_fd, &cl->ncd_msgid, MSG_KEEPALIVE, cl->ncd_skey, COMMTYPE_SERVER);
+ }
+ 
+-static int32_t connect_newcamd_server(void)
++static int32_t connect_newcamd_server_inner(void)
+ {
+ 	int32_t i;
+ 	uint8_t buf[CWS_NETMSGSIZE];
+@@ -501,6 +509,12 @@ static int32_t connect_newcamd_server(void)
+ 	{
+ 		return -1;
+ 	}
++	if(cl->reader->astra_direct == 1)
++	{
++		struct timeval timeout = { .tv_sec = 10, .tv_usec = 0 };
++		if(setsockopt(handle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)))
++			{ network_tcp_connection_close(cl->reader, "provider handshake timeout setup failed"); return -1; }
++	}
+ 
+ 	// 2. Get init sequence
+ 	cl->ncd_msgid = 0;
+@@ -616,6 +630,25 @@ static int32_t connect_newcamd_server(void)
+ 	return 0;
+ }
+ 
++static int32_t connect_newcamd_server(void)
++{
++	struct s_reader *reader = cur_client()->reader;
++	if(!astra_direct_admit(reader)) { return -1; }
++	int32_t result = connect_newcamd_server_inner();
++	if(result < 0) { astra_direct_failed(reader); }
++	else
++	{
++		if(reader->astra_direct == 1)
++		{
++			struct timeval timeout = { .tv_sec = 20, .tv_usec = 0 };
++			if(setsockopt(reader->client->udp_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)))
++				{ network_tcp_connection_close(reader, "provider receive timeout setup failed"); return -1; }
++		}
++		astra_direct_authenticated(reader);
++	}
++	return result;
++}
++
+ static int32_t newcamd_connect(void)
+ {
+ 	struct s_client *cl = cur_client();
+diff --git a/oscam-config-reader.c b/oscam-config-reader.c
+index 402137a8..92f4c8ad 100644
+--- a/oscam-config-reader.c
++++ b/oscam-config-reader.c
+@@ -1157,6 +1157,11 @@ static const struct config_list reader_opts[] =
+ #endif
+ 	DEF_OPT_INT8("enable"                         , OFS(enable),                          1),
+ 	DEF_OPT_INT8("astra_ecm_scheduler"            , OFS(astra_ecm_scheduler),              0),
++	DEF_OPT_INT8("astra_direct"                   , OFS(astra_direct),                     0),
++	DEF_OPT_UINT32("astra_report_port"            , OFS(astra_report_port),                0),
++	DEF_OPT_UINT32("astra_frame_interval"         , OFS(astra_frame_interval),             50),
++	DEF_OPT_STR("astra_budget_directory"          , OFS(astra_budget_directory),           NULL),
++	DEF_OPT_STR("astra_budget_account"            , OFS(astra_budget_account),             NULL),
+ 	DEF_OPT_FUNC("protocol"                       , 0,                                    protocol_fn),
+ 	DEF_OPT_FUNC("device"                         , 0,                                    device_fn),
+ 	DEF_OPT_UINT8("ipv4force"                     , OFS(ipv4force),                       0),
+diff --git a/oscam-reader.c b/oscam-reader.c
+index 0164e218..3dbcc0d6 100644
+--- a/oscam-reader.c
++++ b/oscam-reader.c
+@@ -20,6 +20,7 @@
+ #include "reader-common.h"
+ #include "oscam-config.h"
+ #include "astra-semantic-scheduler.h"
++#include "astra-provider-budget.h"
+ 
+ /* Guarded Newcamd policy, disabled unless this reader explicitly opts in.
+  * The reader worker owns metadata; GC may only detach a parent under lock.
+@@ -29,6 +30,8 @@ struct astra_semantic_scheduler
+ 	pthread_mutex_t lock;
+ 	struct astra_semantic_core core;
+ 	uint64_t next_report_ms, reported_revision;
++	struct astra_provider_budget provider;
++	uint64_t next_direct_report_ms, direct_open_retry_ms;
+ 	struct astra_semantic_slot slots[];
+ };
+ /* GC may race reader cleanup. Publish/acquire/destroy the optional context
+@@ -42,6 +45,94 @@ static uint64_t astra_semantic_now(void)
+ 	return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+ }
+ 
++/* OS uptime matches the legacy durable budget's clock, including suspend. */
++static uint64_t astra_direct_uptime(void)
++{
++	struct timespec ts;
++	if(clock_gettime(CLOCK_BOOTTIME, &ts)) { return 0; }
++	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
++}
++static uint64_t astra_direct_wall(void)
++{
++	struct timespec ts;
++	if(clock_gettime(CLOCK_REALTIME, &ts)) { return 0; }
++	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
++}
++static struct astra_semantic_scheduler *astra_direct_context(struct s_reader *reader)
++{
++	return reader && reader->astra_direct == 1 && reader->client ? reader->client->astra_scheduler : NULL;
++}
++static void astra_direct_report(struct s_reader *reader, int force)
++{
++	struct astra_semantic_scheduler *s = astra_direct_context(reader);
++	if(!s) { return; }
++	uint64_t now = astra_direct_uptime();
++	if(!force && now < s->next_direct_report_ms) { return; }
++	s->next_direct_report_ms = now + 5000;
++	struct astra_provider_budget *b = &s->provider;
++	rdr_log(reader, "astra direct status: port=%u ready=%u connections=%"PRIu64" closes=%"PRIu64" frames=%"PRIu64" failures=%"PRIu64" retryMs=%"PRIu64" attempts=%"PRIu64" stableRecoveries=%"PRIu64,
++		(unsigned)reader->astra_report_port, (unsigned)b->ready, b->connections, b->closes, b->frames,
++		b->failures, astra_provider_delay(b, now), b->count, b->stable_recoveries);
++}
++int astra_direct_admit(struct s_reader *reader)
++{
++	if(!reader || reader->astra_direct != 1) { return 1; }
++	struct astra_semantic_scheduler *s = astra_direct_context(reader);
++	if(!s) { return 0; } /* no unprotected early connect, even during init */
++	uint64_t now = astra_direct_uptime(), wall = astra_direct_wall();
++	if(!now || !wall || now < s->direct_open_retry_ms) { return 0; }
++	if(s->provider.dirfd < 0)
++	{
++		char boot[37] = {0};
++		int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
++		ssize_t length = fd >= 0 ? read(fd, boot, 36) : -1;
++		if(fd >= 0) { close(fd); }
++		if(length != 36 || !astra_provider_open(&s->provider, reader->astra_budget_directory, reader->astra_budget_account, boot, now, wall))
++			{ s->direct_open_retry_ms = now + 5000; return 0; }
++	}
++	s->provider.frame_interval_ms = reader->astra_frame_interval;
++	int allowed = astra_provider_reserve(&s->provider, now, wall);
++	astra_direct_report(reader, 0);
++	return allowed;
++}
++void astra_direct_failed(struct s_reader *reader)
++{
++	struct astra_semantic_scheduler *s = astra_direct_context(reader);
++	if(!s || !s->provider.attempted) { return; }
++	astra_provider_failed(&s->provider, astra_direct_uptime(), astra_direct_wall());
++	astra_direct_report(reader, 1);
++}
++void astra_direct_authenticated(struct s_reader *reader)
++{
++	struct astra_semantic_scheduler *s = astra_direct_context(reader);
++	if(!s) { return; }
++	s->provider.ready = 1;
++	astra_direct_report(reader, 1);
++}
++int astra_direct_frame(struct s_reader *reader)
++{
++	struct astra_semantic_scheduler *s = astra_direct_context(reader);
++	if(!s) { return reader && reader->astra_direct != 1; }
++	struct astra_provider_budget *b = &s->provider;
++	while(b->attempted && !reader->client->kill)
++	{
++		uint64_t now = astra_direct_uptime();
++		if(!astra_provider_owned(b)) { return 0; }
++		if(astra_provider_take_frame(b, now)) { return 1; }
++		uint64_t wait = b->next_frame > now ? b->next_frame - now : 1;
++		if(wait > 1000) { return 0; }
++		struct timespec pause = { .tv_sec = (time_t)(wait / 1000), .tv_nsec = (long)(wait % 1000) * 1000000 };
++		while(nanosleep(&pause, &pause) && errno == EINTR) { if(reader->client->kill) { return 0; } }
++	}
++	return 0;
++}
++void astra_direct_frame_complete(struct s_reader *reader)
++{
++	struct astra_semantic_scheduler *s = astra_direct_context(reader);
++	if(s && s->provider.attempted)
++		{ s->provider.next_frame = astra_direct_uptime() + reader->astra_frame_interval; }
++}
++
+ /* Numeric private diagnostics only: no account names, ECM hashes, IDs or CWs.
+  * Status is bounded to once per five seconds plus explicit reset transitions. */
+ static void astra_semantic_report(struct s_reader *reader, int reset)
+@@ -64,7 +155,7 @@ static void astra_semantic_report(struct s_reader *reader, int reset)
+ 	s->next_report_ms = now + 5000;
+ 	s->reported_revision = revision;
+ 	pthread_mutex_unlock(&s->lock);
+-	uint32_t port = (!strcmp(reader->device, "127.0.0.1") || !strcmp(reader->device, "::1")) ? (uint32_t)reader->r_port : 0;
++	uint32_t port = reader->astra_direct == 1 ? reader->astra_report_port : (!strcmp(reader->device, "127.0.0.1") || !strcmp(reader->device, "::1")) ? (uint32_t)reader->r_port : 0;
+ 	rdr_log(reader, "astra semantic %s: port=%u generation=%"PRIu64" queued=%u aliases=%u sent=%u peak=%u dispatched=%"PRIu64" matched=%"PRIu64" coalesced=%"PRIu64" expired=%"PRIu64" rejected=%"PRIu64" resets=%"PRIu64" abandoned=%"PRIu64" closes=%"PRIu64" oldestMs=%"PRIu64" resetReason=%u",
+ 		reset ? "reset" : "status", port, q.generation, queued, aliases, q.sent, q.peak_sent, q.dispatched, q.matched, q.coalesced, q.expired, q.rejected, q.resets, q.abandoned, q.closes, oldest, (unsigned)q.last_reset_reason);
+ }
+@@ -87,6 +178,7 @@ void astra_semantic_destroy(struct s_client *cl)
+ 	pthread_mutex_lock(&s->lock);
+ 	pthread_mutex_unlock(&s->lock);
+ 	pthread_mutex_destroy(&s->lock);
++	astra_provider_close(&s->provider);
+ 	add_garbage(s);
+ 	pthread_mutex_unlock(&astra_scheduler_lifetime_lock);
+ }
+@@ -159,6 +251,7 @@ static void astra_semantic_complete(struct s_reader *reader, int idx, int rc, ui
+ 	struct s_client *cl = reader->client;
+ 	struct astra_semantic_scheduler *s = cl->astra_scheduler;
+ 	uint64_t now = astra_semantic_now();
++	if(reader->astra_direct == 1 && rc == 1) { astra_provider_positive(&s->provider, astra_direct_uptime(), astra_direct_wall()); }
+ 	pthread_mutex_lock(&s->lock);
+ 	uint16_t caid = cl->ecmtask[idx].caid;
+ 	uint8_t hash[CS_ECMSTORESIZE];
+@@ -186,6 +279,7 @@ void astra_semantic_tick(struct s_reader *reader)
+ 	if(!reader || !reader->client || reader->client->kill || !reader->client->astra_scheduler) { return; }
+ 	struct s_client *cl = reader->client;
+ 	struct astra_semantic_scheduler *s = cl->astra_scheduler;
++	astra_direct_report(reader, 0);
+ 	uint64_t now = astra_semantic_now();
+ 	pthread_mutex_lock(&s->lock);
+ 	int n;
+@@ -1279,6 +1373,7 @@ void network_tcp_connection_close(struct s_reader *reader, char *reason)
+ 
+ 	struct s_client *cl = reader->client;
+ 	if(!cl) { return; }
++	astra_direct_failed(reader);
+ 	int32_t fd = cl->udp_fd;
+ 
+ 	int32_t i;
+@@ -1531,6 +1626,8 @@ int32_t reader_init(struct s_reader *reader)
+ {
+ 	struct s_client *client = reader->client;
+ 	if(reader->astra_ecm_scheduler == 1 && (reader->typ != R_NEWCAMD || cfg.max_pending > 256)) { return 0; }
++	if(reader->astra_direct == 1 && (reader->astra_ecm_scheduler != 1 || !reader->astra_report_port || reader->astra_report_port > 65535 || !reader->astra_budget_directory || !reader->astra_budget_account)) { return 0; }
++	if(reader->astra_direct == 1 && (reader->astra_frame_interval < 50 || reader->astra_frame_interval > 1000)) { return 0; }
+ 
+ 	if(is_cascading_reader(reader))
+ 	{
+@@ -1567,6 +1664,7 @@ int32_t reader_init(struct s_reader *reader)
+ 			if(!cs_malloc(&s, sizeof(*s) + (size_t)cfg.max_pending * sizeof(*s->slots))) { return 0; }
+ 			if(pthread_mutex_init(&s->lock, NULL) != 0) { free(s); return 0; }
+ 			astra_semantic_init(&s->core, s->slots, (size_t)cfg.max_pending);
++			s->provider.dirfd = s->provider.ownerfd = s->provider.accountfd = -1;
+ 			pthread_mutex_lock(&astra_scheduler_lifetime_lock);
+ 			client->astra_scheduler = s;
+ 			pthread_mutex_unlock(&astra_scheduler_lifetime_lock);
+diff --git a/oscam-reader.h b/oscam-reader.h
+index 5fc4fc6f..97d224f6 100644
+--- a/oscam-reader.h
++++ b/oscam-reader.h
+@@ -26,6 +26,11 @@ int astra_semantic_poll_ms(struct s_reader *reader, int normal_ms);
+ int astra_semantic_remote_priority(struct s_reader *reader);
+ int astra_semantic_detach_parent(struct s_client *cl, ECM_REQUEST *parent);
+ void astra_semantic_destroy(struct s_client *cl);
++int astra_direct_admit(struct s_reader *reader);
++void astra_direct_failed(struct s_reader *reader);
++void astra_direct_authenticated(struct s_reader *reader);
++int astra_direct_frame(struct s_reader *reader);
++void astra_direct_frame_complete(struct s_reader *reader);
+ void reader_do_card_info(struct s_reader *reader);
+ int32_t reader_slots_available(struct s_reader *reader, ECM_REQUEST *er);
+ 

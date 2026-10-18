@@ -2,6 +2,33 @@
 
 A clean-room Linux broadcast control and MPEG-TS relay service. It does not contain a licensing subsystem and does not use Cesbo source code.
 
+## Install or upgrade Ubuntu Server — latest published version
+
+Start with the [Ubuntu installation guide](INSTALL-UBUNTU.md). This is the native
+systemd installation, including DVB/CAS components and automatic startup after a
+reboot. After installing the prerequisites in that guide (including Node.js 20+
+at `/usr/bin/node`, Git and curl), use:
+
+```bash
+cd "$HOME"
+curl --fail --show-error --location --proto '=https' \
+  https://raw.githubusercontent.com/rsrinaldo/astradvb/main/install-latest.sh \
+  -o astra-install-latest.sh
+bash astra-install-latest.sh
+```
+
+Review downloaded scripts before running them. The entry point fetches a fresh
+copy of GitHub `main` **on every run**, prints its commit, then invokes that copy's
+native installer with `sudo`. It never installs an old local checkout or resets
+your working files. Reuse these commands to upgrade: configuration, passwords,
+encryption keys, saved EPG and provider retry budgets are preserved. An upgrade
+briefly interrupts streams during activation. Existing environment overrides
+remain unchanged; see the guide for the direct-transport migration.
+
+“Latest” means the code published on `main` at download time, not an unreleased
+local build. This does not enable unattended updates of a running server. For an
+intentionally pinned/offline source checkout, use `sudo ./install.sh` instead.
+
 ## Implemented
 
 - UDP multicast/unicast and RTP MPEG-TS inputs with per-group socket isolation
@@ -31,11 +58,11 @@ A clean-room Linux broadcast control and MPEG-TS relay service. It does not cont
 
 Paste source URLs directly into the stream editor. The engine automatically selects native transport handling or its managed FFmpeg bridge; no external bridge process is required. The service also detects frontends exposed as `/dev/dvb/adapterN/frontendN`. A tuner must be visible there before Linux can control physical hardware.
 
-## Quick start on Linux
+## Manual development launch (not the server installer)
 
 Node.js 20 or newer is required.
 
-Run these commands from the directory containing this README (`astradvb` when cloned from GitHub).
+For development only, run these commands from the directory containing this README (`astradvb` when cloned from GitHub). This does not build native DVB/CAS helpers or configure automatic startup; use the Ubuntu guide above for a full server.
 
 ```bash
 mkdir -p data
@@ -45,6 +72,75 @@ node src/server.mjs
 ```
 
 Open `http://server-address:8000/` and sign in as `admin`. Read the unique initial password from `data/initial-admin-password`, then change it in **Settings → Administrator account**. All example streams are disabled.
+
+## Direct OSCam provider transport (v0.8.54)
+
+The new direct path is `tsdecrypt → local OSCam → provider`. Node manages the
+configuration and paced decoder startup, but has no provider-data socket and
+cannot close it through a proxy timeout. OSCam retains duplicate suppression,
+semantic request scheduling and a 32-unanswered limit. Its direct transport also
+paces **all** encrypted upstream frames (including login/keepalive), finishes
+partial writes without replay, and owns the persistent per-account reconnect
+budget. No new media buffer is added.
+
+The direct native policy is an additional verified capability on the pinned
+policy-4 OSCam, not permission to use an arbitrary upstream binary. Rebuild with
+`sudo ./install-cas.sh` (or run the normal `sudo ./install.sh` upgrade). Both Linux
+and Docker builds include the direct patch, native budget source, tests, manifest
+digests and corresponding GPL source/license information. Fresh installations
+and Docker select `ASTRA_CAS_TRANSPORT=direct`. Existing environment files remain
+untouched during upgrade: after rebuilding, set that variable in
+`/etc/astra-linux/environment`, then restart `astra-linux` once. The compatibility
+setting `ASTRA_CAS_TRANSPORT=guarded` retains the previous proxy path.
+
+Native and previous Node budget formats are interoperable; never delete or
+restore an older copy of the `cas-proxy-budgets` directory when switching or
+rolling back. One native reader owns each opaque account lock. Native shared
+directory locks exclude the legacy Node store; the same account cannot open a
+second native reader. Attempts are committed and synced **before** network
+connection, with at most three in a conservative 61-second rolling window
+(including the previous policy's one-second restoration margin). Backoff is
+1/2/4/8/15 seconds, reset only by sustained fresh positive replies over 30 seconds,
+not by a login, cached response or a negative channel result. Unknown/corrupt or
+clock-inconsistent state gets one persisted safety window; unavailable storage
+fails closed. Process death releases locks, not consumed attempt credit.
+
+Default direct frame spacing is 51 ms after a completed write, below the
+20-frame/s ceiling with margin for the integral-ms native clock. Lower configured
+rates remain supported; higher values cannot raise the direct ceiling above 20.
+Pacing describes local writes, not a guarantee about TCP delivery timing or the
+provider's allowed capacity. `ASTRA_CAS_PROVIDER_PAUSED=1` disables direct readers
+as well as pending decoder starts. Direct status uses numeric native counters
+without endpoints, credentials, request bodies or control words. Existing
+transport-error incident history remains historical; this redesign does not
+establish the cause of an earlier `ECONNRESET` or prevent genuine remote resets.
+
+Direct encrypted protocol/media tests are opt-in under the same isolated-lab
+preflight: `ASTRA_CAS_LAB_DIRECT=1 node --test
+test/direct-cas-integration.test.mjs`; add `ASTRA_CAS_LAB_DIRECT_SOAK=1` for 85
+overlapping actual native decoders. Explicit candidate/native paths and verified
+manifests are required. Never run fault injection against a real provider.
+
+See [v0.8.54 verification](VERIFICATION-0.8.54.md) for isolated test results,
+production socket ownership, the post-startup counter window and limitations.
+
+## Shared-provider recovery health (v0.8.53)
+
+A negative channel result no longer erases successful key-reply evidence for
+other services sharing the connection. Recovery to the normal one-second
+backoff still requires at least three fresh positive observations spanning
+30 seconds, on the authenticated current transport, with no positive-reply
+gap longer than 30 seconds. Cached answers and negative-only traffic cannot
+qualify. The durable three-attempt rolling minute, single connection lease,
+20-frame/second write-admission ceiling and paced decoder startup are unchanged.
+Failure history now freezes a bounded error code and numeric queue/progress
+metadata per incident, without endpoints, payloads or keys. This does not claim
+to prevent a remote TCP reset or establish its original cause.
+
+This is an application-only update; the verified policy-10 decoder and policy-4
+OSCam from v0.8.52 remain unchanged. Use `sudo ./install.sh` to upgrade while
+retaining configuration, guide publication, authentication and provider budgets.
+See [v0.8.53 verification and remaining reset investigation](VERIFICATION-0.8.53.md).
 
 ## Short clear continuation safety (v0.8.52)
 

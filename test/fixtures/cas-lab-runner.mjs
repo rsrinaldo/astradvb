@@ -15,6 +15,7 @@ import { buildOscamConfiguration, parseSemanticStatus } from '../../src/cas-prox
 import { MPEGTSAnalyzer, TransportStreamFramer } from '../../src/mpegts.mjs';
 import { protectedOscamBuild } from '../../src/oscam-integrity.mjs';
 import { ProviderGuard } from '../../src/provider-guard.mjs';
+import { DirectCASController, parseDirectStatus } from '../../src/direct-cas-controller.mjs';
 import { openProviderBudgetStore } from '../../src/provider-budget.mjs';
 import { encryptSecret } from '../../src/secrets.mjs';
 import { protectedNativeBuild, tsdecryptArgs } from '../../src/softcam.mjs';
@@ -95,10 +96,11 @@ export function parseLabSemanticStatus(line) {
   return value;
 }
 
-export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fragmentDelayMs = 0, transportMode, pendingSlots = 128, guardQueueMs = 1500, semanticScheduler = true } = {}) {
+export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fragmentDelayMs = 0, transportMode, pendingSlots = 128, guardQueueMs = 1500, semanticScheduler = true, directTransport = false } = {}) {
   assert.equal(typeof semanticScheduler, 'boolean', 'Isolated semanticScheduler must be boolean');
   const parameters = labCapacityOptions({ pendingSlots, guardQueueMs });
   const binaries = labRequirements();
+  if (directTransport) assert.ok(protectedOscamBuild(binaries.oscam, process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, { direct: true }), 'Direct lab requires its verified native policy');
   if (semanticScheduler) {
     assert.ok(process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, 'Semantic dispatch requires its explicit lab manifest');
     const manifest = JSON.parse(await readFile(process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, 'utf8'));
@@ -112,16 +114,19 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
   const provider = await startNewcamdProvider({ policy, fragmentSizes, fragmentDelayMs, transportMode });
   loopback(provider.credentials.host);
   const resets = [];
-  const guard = new ProviderGuard({ host: '127.0.0.1', port: provider.port, maxQueueMs: parameters.guardQueueMs, onReset: reason => { resets.push(reason); if (resets.length > 32) resets.shift(); } });
-  const guardPort = await guard.start();
   const firstPort = await reservePort();
+  const onReset = reason => { resets.push(reason); if (resets.length > 32) resets.shift(); };
+  const guard = directTransport ? new DirectCASController({ reportPort: firstPort, onClose: () => onReset('native provider closed') }) : new ProviderGuard({ host: '127.0.0.1', port: provider.port, maxQueueMs: parameters.guardQueueMs, onReset });
+  const guardPort = directTransport ? firstPort : await guard.start();
   const previousSecret = process.env.ASTRA_SECRET_KEY;
   let configuration;
   try {
     process.env.ASTRA_SECRET_KEY = 'synthetic-testbed-key-not-a-production-secret';
     const c = provider.credentials;
     const profile = { id: 'fixture', name: 'Synthetic only', caid: c.caid, lineEncrypted: encryptSecret(`${c.host} ${c.port} ${c.username} ${c.password} ${c.desKey}`) };
-    configuration = labReaderConfiguration(buildOscamConfiguration([profile], { firstPort, guardedPorts: new Map([['fixture', guardPort]]) }), semanticScheduler);
+    const mode = directTransport ? { directAccounts: new Map([['fixture', 'a'.repeat(64)]]), budgetDirectory: join(directory, 'budgets') } : { guardedPorts: new Map([['fixture', guardPort]]) };
+    if (directTransport) await mkdir(join(directory, 'budgets'), { mode: 0o700 });
+    configuration = labReaderConfiguration(buildOscamConfiguration([profile], { firstPort, ...mode }), semanticScheduler);
   } finally {
     if (previousSecret === undefined) delete process.env.ASTRA_SECRET_KEY; else process.env.ASTRA_SECRET_KEY = previousSecret;
   }
@@ -142,6 +147,7 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
     oscam.stdout.on('data', bytes => {
       const lines = `${logRemainder}${bytes}`.split(/\r?\n/); logRemainder = lines.pop().slice(-16384);
       for (const line of lines) {
+        if (directTransport) { const status = parseDirectStatus(line); if (status) guard.update(status); }
         const status = parseLabSemanticStatus(line);
         if (status) {
           const previous = semanticStatus.latest;

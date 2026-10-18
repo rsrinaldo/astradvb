@@ -17,6 +17,13 @@ test('OSCam trust requires matching installed hash, source and receive policy', 
     const data = { policyVersion: 4, semanticPolicyVersion: 4, semanticSchedulerSha256: 'a'.repeat(64), sourceRevision: OSCAM_SOURCE_REVISION, binarySha256: hash };
     writeFileSync(manifest, JSON.stringify(data));
     assert.equal(protectedOscamBuild(binary, manifest), true);
+    assert.equal(protectedOscamBuild(binary, manifest, { direct: true }), false, 'Legacy verified readers cannot silently enable direct transport');
+    const direct = { ...data, directTransportPolicyVersion: 1, directTransportSha256: 'b'.repeat(64), providerBudgetSha256: 'c'.repeat(64) };
+    writeFileSync(manifest, JSON.stringify(direct));
+    assert.equal(protectedOscamBuild(binary, manifest, { direct: true }), true);
+    writeFileSync(manifest, JSON.stringify({ ...direct, providerBudgetSha256: '' }));
+    assert.equal(protectedOscamBuild(binary, manifest, { direct: true }), false);
+    writeFileSync(manifest, JSON.stringify(data));
     writeFileSync(manifest, JSON.stringify({ ...data, experimental: true }));
     assert.equal(protectedOscamBuild(binary, manifest), false, 'Production must reject experimental reader binaries');
     assert.equal(protectedOscamBuild(binary, manifest, { allowExperimental: true }), true, 'Only explicit isolated-lab checks may opt in');

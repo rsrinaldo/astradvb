@@ -20,13 +20,13 @@ Update Ubuntu and install the download tools:
 
 ```bash
 sudo apt update
-sudo apt install -y ca-certificates curl
+sudo apt install -y ca-certificates curl git
 ```
 
 Check the installed Node.js version:
 
 ```bash
-node --version
+/usr/bin/node --version
 ```
 
 If the command is missing or reports a version below 20, install Node.js 22 from the NodeSource Ubuntu repository:
@@ -36,30 +36,37 @@ cd /tmp
 curl -fsSL https://deb.nodesource.com/setup_22.x -o nodesource_setup.sh
 sudo -E bash nodesource_setup.sh
 sudo apt install -y nodejs
-node --version
+/usr/bin/node --version
 ```
 
 Review downloaded setup scripts before executing them if that is required by your security policy.
 
-## 2. Download the release
+## 2. Download the latest-version installer
 
-Install directly from GitHub:
+Download the installation entry point from the published GitHub `main` branch:
 
 ```bash
 cd "$HOME"
-git clone https://github.com/rsrinaldo/astradvb.git
-cd astradvb
+curl --fail --show-error --location --proto '=https' \
+  https://raw.githubusercontent.com/rsrinaldo/astradvb/main/install-latest.sh \
+  -o astra-install-latest.sh
 ```
 
-For a reproducible installation, check out the release commit or tag specified with the release instead of following a moving branch.
+Review `astra-install-latest.sh` before running it. On every run it clones the
+current `main` into a fresh temporary directory and prints the exact commit being
+installed. It does not reuse, reset or alter an existing source checkout. A failed
+download stops before installation and leaves the running service untouched.
+The latest published code is selected when the clone completes; later GitHub
+changes require another upgrade. There is no unattended auto-update service.
 
 ## 3. Run the native installer
 
 ```bash
-sudo ./install.sh
+bash astra-install-latest.sh
 ```
 
-The installer:
+The entry point requests `sudo` when necessary and runs the native installer from
+the newly downloaded source. The installer:
 
 - installs FFmpeg and Linux DVB tools when missing
 - builds pinned tsdecrypt and OSCam components when missing
@@ -69,6 +76,12 @@ The installer:
 - stores the CAS credential encryption key in `/etc/astra-linux/environment`
 - installs and starts the `astra-linux.service` systemd unit
 
+The unit is enabled at boot and restarts automatically after a process failure.
+For an intentionally pinned source installation, clone the repository, check out
+the required commit/tag, then run `sudo ./install.sh` in that checkout instead.
+That lower-level command installs exactly its local source, not necessarily the
+latest published version.
+
 An upgrade preserves both the persistent JSON configuration and encryption key. Version 0.6.0 also removes any legacy `ASTRA_ADMIN_TOKEN` line from the environment file.
 
 ## 4. Verify the service
@@ -76,10 +89,12 @@ An upgrade preserves both the persistent JSON configuration and encryption key. 
 ```bash
 sudo systemctl status astra-linux --no-pager
 curl -fsS http://127.0.0.1:8000/healthz
-curl -fsS http://127.0.0.1:8000/api/status
+sudo systemctl is-enabled astra-linux
 ```
 
-The health endpoint should return an `ok` response. Open the dashboard at:
+The health endpoint should return `ok`, and `is-enabled` should return `enabled`.
+`/api/status` requires a signed-in management session; an unauthenticated request
+returning HTTP 401 is expected. Open the dashboard at:
 
 ```text
 http://SERVER-IP:8000/
@@ -222,13 +237,23 @@ sudo journalctl -u astra-linux -n 200 --no-pager
 
 ## 9. Configure an authorized Newcamd profile
 
+Version 0.8.53 is an application-only recovery update and retains the verified
+policy-10 decoder/policy-4 OSCam from 0.8.52. Install normally with
+`sudo ./install.sh`; no manual native rebuild or budget reset is needed when
+those builds already verify. Negative channel results no longer erase valid
+key-reply health for other channels on the shared connection. Returning to
+baseline backoff still requires sustained fresh positive replies; cached or
+negative-only responses cannot qualify. Rolling connection/rate limits remain
+unchanged. Each transport incident now retains its own bounded error code and
+numeric queue/progress metadata; this cannot itself prevent a remote TCP reset.
+
 Version 0.8.52 requires native CAS bundle policy v10 and OSCam policy v4 (including semantic policy v4). Native v10 preserves recent ownership/CC across non-PUSI clear continuations carrying 1–7 payload bytes, without refreshing encrypted freshness or weakening gap/discontinuity/context safeguards. It also preserves a still-owned raw parity prefix across candidate publication until its first independent PES can certify it; it does not emit an uncertain prefix. OSCam v4 promptly wakes an idle disconnected guarded Newcamd reader through the existing worker and durable account budget, without replay. Future TCP failures retain only a bounded errno code. Rebuild older OSCam readers for progress-safe recovery: expired caller deadlines or a backlog no longer reset a connection that is completing matched replies. Silence recovery measures a full response interval from actual dispatch; original answer deadlines, hard orphan lifetime and provider budgets remain unchanged. Policy v8 retains the subtitle/teletext safety fix and retires unreachable headerless runs immediately, counting them separately as decoder.ciphertext.orphan. Anchored or still-owned runs keep bounded late-key recovery. It discards unanchored encrypted subtitle/teletext tails immediately instead of blocking the shared A/V queue; these are counted separately as `decoder.ciphertext.ancillary`. Only valid type-0x06 DVB subtitle/teletext descriptors opt in: private audio, unknown private data and malformed/conflicting metadata retain their existing handling. A later complete or split PES header restores ordinary bounded validation/recovery. Marked ancillary parity does not drive the A/V phase clock. Ancillary tails can be lost; uncertain ciphertext is never emitted, and anchored missing-key cases can still wait up to the existing two-second deadline. Normal verification requires the executable hash, pinned source, policy 10, ordered patch-set hash and `patches.ciphertextSafety`; even a verified policy-v9 decoder must be rebuilt for this upgrade. Install the application and native binary/manifest as a matching release, using `sudo ./install.sh`; it invokes the native installer when verification requires it. The same seven normal decoder patches/source pins, optimized SIMD batching, bounded stream I/O, synchronized words, stale-work/PES checks and borrowed Newcamd password-hash cleanup remain. Both installers run the portable ciphertext oracle and real scalar libdvbcsa probe before native publication. Older/experimental builds and marker files alone are not accepted. OSCam retains exact-read protection and bounded semantic dispatch/recovery.
 
 No larger buffer, higher CAS rate, reset connection budget or increased production CPU quota is part of this optimization. Before deployment, release testing must preserve exact packet/order and fault oracles and measure CPU, source-feed lateness, pipe backpressure and A/V delivery gaps on comparable inputs/channel counts/key timing/resource limits. Synthetic performance results are not a guarantee of production capacity or a comparison with another product. There is no additional runtime package requirement beyond the existing build/libdvbcsa dependencies.
 
 Fresh changed ECMs are not suppressed by a failed-key cooldown. The shared guard admits decoders only after validated reader authentication. Transport failures use exponential backoff and at most three real upstream connection attempts per rolling minute; healthy negative key replies do not enter that backoff. Equivalent account profiles share one reader and queue. Connection budgets persist outside the generated OSCam configuration in `/var/lib/astra-linux/cas-proxy-budgets` (or beside a custom runtime directory); preserve this directory and `ASTRA_SECRET_KEY` during upgrades. State contains timing/counters, not keys or credentials. Corrupt state/reboot can add a bounded safety hold; unwritable state prevents new provider attempts until storage recovers. The normal installer does not remove this directory. Consult the provider for an allowed rate before enabling a large lineup: 20 local encrypted frame writes/s is neither an arrival guarantee nor an allowance. See README → Provider protection and Isolated CAS fault laboratory. To pause upstream requests, set `ASTRA_CAS_PROVIDER_PAUSED=1` in `/etc/astra-linux/environment` and restart; changing the file alone does not pause a running process. Saved channels/credentials remain and clear channels remain available.
 
-The shared OSCam reader uses 128 local storage slots, but allows at most 32 unanswered provider ECMs and dispatches at most 20/s without catch-up. Timed-out dispatched IDs remain reserved until a matching reply or whole-connection retirement; old exchanges are never replayed. Silence, expired-slot pressure and a hard unanswered lifetime retire a stuck connection through the same durable reconnect budget. These are protection bounds, not provider-approved limits. A private bounded `cas-request-history.json` beside the configuration retains numeric pre/post-incident observations only; preserve it for diagnosis, not as a substitute for provider-side measurements. Tuner capture capacity and the legacy fixed input-delay default are unchanged; ciphertext safety has a separate adaptive hold.
+The shared OSCam reader uses 128 local storage slots, but allows at most 32 unanswered provider ECMs and dispatches at most 20/s without catch-up. Timed-out dispatched IDs remain reserved until a matching reply or whole-connection retirement; old exchanges are never replayed. Silence or a hard unanswered lifetime can retire a stuck connection through the same durable reconnect budget; expired caller deadlines or backlog alone do not reset a transport completing matched replies. These are protection bounds, not provider-approved limits. A private bounded `cas-request-history.json` beside the configuration retains numeric pre/post-incident observations only; preserve it for diagnosis, not as a substitute for provider-side measurements. Tuner capture capacity and the legacy fixed input-delay default are unchanged; ciphertext safety has a separate adaptive hold.
 
 OSCam is an integral part of the native and Docker installations. The installer builds and installs it automatically alongside tsdecrypt; Astra starts and stops the proxy itself, including after reboot. No separate manual OSCam installation or service configuration is needed. One upstream Newcamd TCP connection per shared account carries individual channel ECM exchanges.
 
@@ -257,6 +282,28 @@ The credential is encrypted at rest with AES-256-GCM using the secret in `/etc/a
 
 ## 10. Back up and upgrade
 
+### Direct OSCam transport (0.8.54)
+
+New installations select `ASTRA_CAS_TRANSPORT=direct`: OSCam connects directly
+to the provider; Node only manages configuration and paced decoder startup.
+The native reader retains duplicate suppression, a bounded unanswered window,
+all-frame pacing and a synced, per-account retry budget. Rebuild the verified
+native components with the release's installer before selecting this mode.
+An arbitrary system OSCam binary does not provide these protections.
+
+Upgrades preserve existing environment settings. After `sudo ./install.sh`
+finishes, set `ASTRA_CAS_TRANSPORT=direct` in `/etc/astra-linux/environment` with
+`sudoedit`, then perform one planned `sudo systemctl restart astra-linux`.
+If already running direct mode, no extra restart is needed beyond the normal
+installer activation. The old `guarded` setting remains available for rollback.
+
+Keep the current `cas-proxy-budgets` directory in place across any switch or
+rollback. Never restore an older budget snapshot or delete its lock files.
+Native/Node retry formats interoperate; clock/schema inconsistency can impose
+one conservative safety window. Playback recovers through the existing paced
+startup queue. There is no additional media buffer, and genuine provider-side
+TCP failures can still interrupt key delivery.
+
 Create a protected backup before upgrading:
 
 ```bash
@@ -265,13 +312,27 @@ sudo cp -a /var/lib/astra-linux/config.json /root/astra-linux-backup/
 sudo cp -a /etc/astra-linux/environment /root/astra-linux-backup/
 ```
 
-To upgrade a GitHub installation:
+To upgrade to the latest published GitHub version, use the same entry point
+(even if an older local checkout exists):
 
 ```bash
-cd "$HOME/astradvb"
-git pull --ff-only
-sudo ./install.sh
+cd "$HOME"
+curl --fail --show-error --location --proto '=https' \
+  https://raw.githubusercontent.com/rsrinaldo/astradvb/main/install-latest.sh \
+  -o astra-install-latest.sh
+bash astra-install-latest.sh
 ```
+
+This preserves configuration, authentication, the encryption key, daily guide and
+current provider budgets. Activation briefly interrupts streams, followed by paced
+decoder recovery. Do not delete or rewind `cas-proxy-budgets` during an upgrade.
+Do not schedule unattended restarts on a live broadcast server without planning
+for that interruption.
+
+If maintaining a source checkout instead, switch to a clean `main` branch, run
+`git pull --ff-only origin main`, then `sudo ./install.sh`. Resolve local changes or
+divergence explicitly; do not use a hard reset to discard them. For reproducible
+installs, deliberately check out a published commit/tag rather than using latest.
 
 Verify the version in the signed-in dashboard and the service after the upgrade (`/api/status` requires a management session):
 

@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { createHmac, randomBytes } from 'node:crypto';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { decryptSecret } from './secrets.mjs';
@@ -9,6 +9,7 @@ import { parseNewcamdLine } from './softcam.mjs';
 import { ProviderGuard, providerGuardOptions } from './provider-guard.mjs';
 import { protectedOscamBuild } from './oscam-integrity.mjs';
 import { openProviderBudgetStore } from './provider-budget.mjs';
+import { DirectCASController, parseDirectStatus } from './direct-cas-controller.mjs';
 
 const LOCAL_HOST = '127.0.0.1';
 const FIRST_LOCAL_PORT = 23000;
@@ -61,7 +62,8 @@ export function groupCasProfiles(profiles) {
   return groups;
 }
 
-export function buildOscamConfiguration(profiles, { firstPort = FIRST_LOCAL_PORT, random = randomBytes, guardedPorts = new Map() } = {}) {
+export function buildOscamConfiguration(profiles, { firstPort = FIRST_LOCAL_PORT, random = randomBytes, guardedPorts = new Map(), directAccounts = new Map(), budgetDirectory } = {}) {
+  if (directAccounts.size && (typeof budgetDirectory !== 'string' || !budgetDirectory.startsWith('/') || /[\r\n\0]/.test(budgetDirectory))) throw new Error('Direct OSCam requires an absolute private budget directory');
   const key = random(14).toString('hex');
   const connections = new Map();
   const ports = [];
@@ -76,6 +78,9 @@ export function buildOscamConfiguration(profiles, { firstPort = FIRST_LOCAL_PORT
     const label = `profile_${index + 1}`;
     const username = `astra_${index + 1}`;
     const password = random(18).toString('hex');
+    const directAccount = directAccounts.get(profile.id);
+    const directOptions = providerGuardOptions();
+    if (directAccount && (!/^[a-f0-9]{64}$/.test(directAccount) || guardedPorts.has(profile.id))) throw new Error('Invalid direct OSCam account configuration');
     // OSCam's current Newcamd parser only assigns the CAID when the port
     // includes an explicit provider component. 000000 means any/default
     // provider and keeps the listener usable for the whole CAID.
@@ -93,7 +98,9 @@ export function buildOscamConfiguration(profiles, { firstPort = FIRST_LOCAL_PORT
       'inactivitytimeout = -1',
       'connectoninit = 1',
       'audisabled = 1',
-      ...(guardedPorts.has(profile.id) ? ['astra_ecm_scheduler = 1'] : []),
+      ...(guardedPorts.has(profile.id) || directAccount ? ['astra_ecm_scheduler = 1'] : []),
+      // Extra millisecond avoids early credit from the native integral-ms clock.
+      ...(directAccount ? ['astra_direct = 1', 'reconnectdelay = 1000', `enable = ${directOptions.paused ? 0 : 1}`, `astra_frame_interval = ${Math.min(1000, Math.max(51, Math.ceil(1000 / directOptions.rate) + 1))}`, `astra_report_port = ${port}`, `astra_budget_directory = ${budgetDirectory}`, `astra_budget_account = ${directAccount}`] : []),
     ].join('\n'));
     accounts.push([
       '[account]',
@@ -120,10 +127,11 @@ export function buildOscamConfiguration(profiles, { firstPort = FIRST_LOCAL_PORT
       'fallbacktimeout = 4000',
       'clientmaxidle = 0',
       'lb_mode = 0',
-      // The guard and downstream decoders intentionally share loopback.
+      // Managed readers (including isolated direct loopback providers) and
+      // downstream decoders can intentionally share loopback.
       // OSCam's default same-IP loop check otherwise rejects every ECM before
       // it reaches this reader. Keep the listener restricted to loopback below.
-      ...(guardedPorts.size ? ['block_same_ip = 0'] : []),
+      ...(guardedPorts.size || directAccounts.size ? ['block_same_ip = 0'] : []),
       '',
       '[newcamd]',
       `key = ${key}`,
@@ -180,6 +188,8 @@ export class CASProxyManager extends EventEmitter {
     this.spawnChild = options.spawnChild || spawn; this.waitForPorts = options.waitForPorts || waitForPorts;
     this.protectedBuild = options.protectedBuild || protectedOscamBuild;
     this.guardFactory = options.guardFactory || ((options) => new ProviderGuard(options));
+    this.transport = options.transport || process.env.ASTRA_CAS_TRANSPORT || 'guarded';
+    if (!['guarded', 'direct'].includes(this.transport)) throw new Error('CAS transport must be guarded or direct');
     this.setTimer = options.setTimer || setTimeout; this.clearTimer = options.clearTimer || clearTimeout; this.now = options.now || Date.now;
     this.recoveryTimer = null; this.recovering = false; this.recoveryAttempt = 0; this.generation = 0; this.ready = false;
     this.lifecycleQueue = Promise.resolve(); this.lifecycleEpoch = 0; this.cancelLaunch = null;
@@ -199,21 +209,33 @@ export class CASProxyManager extends EventEmitter {
     // Validate/group before stopping a working proxy. Conflicting aliases must
     // not open competing provider sessions or replace a healthy configuration.
     const groups = groupCasProfiles(profiles);
+    if (groups.length > 128) throw new Error('Provider account limit reached');
+    if (this.transport === 'direct' && !this.protectedBuild(this.binary, undefined, { direct: true })) throw new Error('Install the verified direct-transport OSCam build before enabling direct CAS');
     const uniqueProfiles = groups.map(group => group.profile);
     await this.#stop();
     if (epoch !== this.lifecycleEpoch) return this.connections;
     const guardedPorts = new Map();
+    const directAccounts = new Map();
     try {
-      this.budgetStore = await this.budgetStoreFactory({ directory: this.budgetDirectory, onWarning: () => this.logger.warn('cas', 'Provider retry-budget storage unavailable; upstream connection attempts remain protected') });
+      if (this.transport === 'direct') {
+        await mkdir(this.budgetDirectory, { recursive: true, mode: 0o700 });
+        await chmod(this.budgetDirectory, 0o700);
+      } else this.budgetStore = await this.budgetStoreFactory({ directory: this.budgetDirectory, onWarning: () => this.logger.warn('cas', 'Provider retry-budget storage unavailable; upstream connection attempts remain protected') });
       if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
       for (const { profile, upstream, accountId } of groups) {
+        if (this.transport === 'direct') {
+          const reportPort = FIRST_LOCAL_PORT + directAccounts.size;
+          const controller = new DirectCASController({ reportPort, onClose: () => this.logger.warn('cas', `Provider connection closed for profile ${profile.name || profile.id}; native OSCam handles paced recovery`) });
+          this.guards.set(profile.id, controller); directAccounts.set(profile.id, accountId);
+          continue;
+        }
         const budget = await this.budgetStore.account(accountId);
         if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
         const guard = this.guardFactory({ ...upstream, ...providerGuardOptions(), budget, onReset: (reason, detail) => this.logger.warn('cas', `Provider connection reset for profile ${profile.name || profile.id}: ${reason}${detail?.tcpCode ? ` [${detail.tcpCode}]` : ''}`) });
         this.guards.set(profile.id, guard); guardedPorts.set(profile.id, await guard.start());
         if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
       }
-      const generated = buildOscamConfiguration(uniqueProfiles, { guardedPorts });
+      const generated = buildOscamConfiguration(uniqueProfiles, { guardedPorts, directAccounts, budgetDirectory: this.budgetDirectory });
       for (const group of groups) {
         const id = group.profile.id; const connection = generated.connections.get(id);
         Object.defineProperties(connection, {
@@ -233,6 +255,7 @@ export class CASProxyManager extends EventEmitter {
       this.stopping = false;
       this.metrics = { found: 0, rejected: 0, timeout: 0, maxResponseMs: 0 };
       this.connections = generated.connections; this.guardedPorts = guardedPorts; this.signature = signature; this.generated = generated; this.profiles = uniqueProfiles; this.recoveryAttempt = 0;
+      this.directPorts = new Map([...directAccounts.keys()].map(id => [id, generated.connections.get(id).port]));
       await this.launch(this.generation);
       if (epoch !== this.lifecycleEpoch) { await this.#stop(); return this.connections; }
     } catch (error) { await this.#stop(); throw error; }
@@ -242,9 +265,10 @@ export class CASProxyManager extends EventEmitter {
 
   async launch(generation) {
     if (this.stopping || generation !== this.generation) return;
-    if (!this.protectedBuild(this.binary)) throw new Error('Install the verified OSCam semantic-recovery policy v4 build with install-cas.sh before enabling CAS');
+    if (!this.protectedBuild(this.binary, undefined, { direct: this.transport === 'direct' })) throw new Error('Install the verified OSCam semantic-recovery policy v4 build with install-cas.sh before enabling CAS');
     const profiles = this.profiles; const startedAt = this.now(); let ready = false; let logBuffer = '';
     this.semanticMetrics.clear();
+    for (const controller of this.guards.values()) controller.beginGeneration?.();
     const child = this.spawnChild(this.binary, ['-p', '128', '--config-dir', this.runtimeDir, '--temp-dir', this.runtimeDir, '--pidfile', join(this.runtimeDir, 'oscam.pid')], { stdio: ['ignore', 'pipe', 'ignore'] });
     this.child = child;
     let rejectStartup;
@@ -268,10 +292,13 @@ export class CASProxyManager extends EventEmitter {
       const lines = String(chunk).split(/\r?\n/);
       lines[0] = logBuffer + lines[0]; logBuffer = lines.pop().slice(-16384);
       for (const line of lines) {
+        const direct = parseDirectStatus(line);
+        if (direct) for (const [id, port] of this.directPorts || []) if (direct.port === port) this.guards.get(id)?.update(direct);
         const semantic = parseSemanticStatus(line);
         if (semantic) {
           const { port, ...values } = semantic;
           for (const [id, guardedPort] of this.guardedPorts) if (guardedPort === port) this.semanticMetrics.set(id, { ...values, sampledAt: this.now() });
+          for (const [id, directPort] of this.directPorts || []) if (directPort === port) this.semanticMetrics.set(id, { ...values, sampledAt: this.now() });
         }
         // OSCam emits this only after LOGIN_ACK and a validated CARD_DATA
         // response. Listening ports alone do not mean an upstream reader is

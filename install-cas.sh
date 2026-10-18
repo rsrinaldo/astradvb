@@ -22,6 +22,11 @@ oscam_patch_digest="$(sha256sum "$oscam_patch" | cut -d ' ' -f 1)"
 oscam_scheduler_patch="$installer_dir/patches/oscam-semantic-scheduler.patch"
 [[ -f "$oscam_scheduler_patch" ]] || { echo "Missing OSCam semantic recovery patch." >&2; exit 1; }
 oscam_scheduler_digest="$(sha256sum "$oscam_scheduler_patch" | cut -d ' ' -f 1)"
+oscam_direct_patch="$installer_dir/patches/oscam-direct-transport.patch"
+oscam_provider_header="$installer_dir/native/astra-provider-budget.h"
+[[ -f "$oscam_direct_patch" && -f "$oscam_provider_header" ]] || { echo "Missing native direct-transport protection." >&2; exit 1; }
+oscam_direct_digest="$(sha256sum "$oscam_direct_patch" | cut -d ' ' -f 1)"
+oscam_provider_digest="$(sha256sum "$oscam_provider_header" | cut -d ' ' -f 1)"
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates git libdvbcsa-dev libssl-dev pkg-config
 install -d -o root -g root -m 0755 /usr/local/src
@@ -58,6 +63,13 @@ git -C "$oscam_source_dir" apply --check "$oscam_patch"
 git -C "$oscam_source_dir" apply "$oscam_patch"
 git -C "$oscam_source_dir" apply --check "$oscam_scheduler_patch"
 git -C "$oscam_source_dir" apply "$oscam_scheduler_patch"
+git -C "$oscam_source_dir" apply --check "$oscam_direct_patch"
+git -C "$oscam_source_dir" apply "$oscam_direct_patch"
+install -m 0644 "$oscam_provider_header" "$oscam_source_dir/astra-provider-budget.h"
+for fixture in native-provider-budget native-oscam-direct-io; do
+  cc -std=c11 -Wall -Wextra -Werror -I "$oscam_source_dir" "$installer_dir/test/$fixture.c" -o "$oscam_source_dir/$fixture-test"
+  "$oscam_source_dir/$fixture-test"
+done
 cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pthread -I "$oscam_source_dir" "$installer_dir/test/native-oscam-io.c" -o "$oscam_source_dir/native-oscam-io-test"
 "$oscam_source_dir/native-oscam-io-test"
 cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pthread -I "$oscam_source_dir" "$installer_dir/test/native-oscam-scheduler.c" -o "$oscam_source_dir/native-oscam-scheduler-test"
@@ -99,9 +111,11 @@ install -o root -g root -m 0755 "$oscam_source_dir/Distribution/oscam" "$oscam_s
 install -o root -g root -m 0644 "$oscam_source_dir/COPYING" "$oscam_license_stage/COPYING"
 install -o root -g root -m 0644 "$oscam_patch" "$oscam_license_stage/oscam-newcamd-stream-io.patch"
 install -o root -g root -m 0644 "$oscam_scheduler_patch" "$oscam_license_stage/oscam-semantic-scheduler.patch"
+install -o root -g root -m 0644 "$oscam_direct_patch" "$oscam_license_stage/oscam-direct-transport.patch"
+install -o root -g root -m 0644 "$oscam_provider_header" "$oscam_license_stage/astra-provider-budget.h"
 oscam_binary_digest="$(sha256sum "$oscam_stage" | cut -d ' ' -f 1)"
-printf '{"policyVersion":4,"semanticPolicyVersion":4,"sourceRevision":"%s","binarySha256":"%s","patchSha256":"%s","semanticSchedulerSha256":"%s","sourceDirectory":"%s"}\n' \
-  "$oscam_revision" "$oscam_binary_digest" "$oscam_patch_digest" "$oscam_scheduler_digest" "$oscam_source_dir" > "$oscam_license_stage/astra-native-oscam.json"
+printf '{"policyVersion":4,"semanticPolicyVersion":4,"sourceRevision":"%s","binarySha256":"%s","patchSha256":"%s","semanticSchedulerSha256":"%s","sourceDirectory":"%s","directTransportPolicyVersion":1,"directTransportSha256":"%s","providerBudgetSha256":"%s"}\n' \
+  "$oscam_revision" "$oscam_binary_digest" "$oscam_patch_digest" "$oscam_scheduler_digest" "$oscam_source_dir" "$oscam_direct_digest" "$oscam_provider_digest" > "$oscam_license_stage/astra-native-oscam.json"
 chmod 0644 "$oscam_license_stage/astra-native-oscam.json"
 
 # Both builds and all checks completed before either executable is published.

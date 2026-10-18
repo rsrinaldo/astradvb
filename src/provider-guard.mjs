@@ -110,7 +110,10 @@ export class ProviderGuard {
     else { this.negativeReplies++; this.stats.negativeECMReplies++; this.lastNegativeECMAt = this.#timestamp(); }
     const state = this.active;
     if (!state || state.closed || !state.connected || !this.readerReady) return;
-    if (!success) { state.positiveSince = null; state.lastFreshPositiveAt = null; state.positiveObservations = 0; return; }
+    // Per-channel entitlement/NOK results do not invalidate valid keys for
+    // other services on this shared transport. Only sustained fresh positives
+    // establish health; negatives, cached answers and a silent gap cannot.
+    if (!success) return;
     // Cache-only replies and buffered old log lines cannot establish a new
     // session's health without actual complete replies on its current socket.
     if (!fresh || state.replyFrames <= state.positiveReplyBaseline) return;
@@ -150,7 +153,18 @@ export class ProviderGuard {
     if (!state || state.closed || this.active !== state) return;
     this.stats.connectionResets++;
     this.lastResetAt = this.#timestamp(); this.resetReasons[reason] = (this.resetReasons[reason] || 0) + 1;
-    this.resetHistory.push({ time: this.lastResetAt, reason, phase: state.connected ? this.readerReady ? 'ready' : state.greetingBytes ? 'greeting' : 'handshake' : state.attempted ? 'connecting' : 'waiting-for-admission' });
+    this.#trimRecent(this.now());
+    const oldest = state.queue[0]?.createdAt ?? state.pendingAt;
+    // Freeze bounded metadata at the failure, before disposal clears queues.
+    // No raw error text, endpoint, frame bytes, ECM identity or keys retained.
+    this.resetHistory.push({ time: this.lastResetAt, reason, phase: state.connected ? this.readerReady ? 'ready' : state.greetingBytes ? 'greeting' : 'handshake' : state.attempted ? 'connecting' : 'waiting-for-admission',
+      ...(reason === 'provider TCP error' ? { tcpCode: this.lastTCPError?.code || 'UNKNOWN' } : {}),
+      connectionAgeMs: state.connectedAt === null ? 0 : Math.max(0, this.now() - state.connectedAt),
+      clientFrames: state.clientFrames, replyFrames: state.replyFrames, framesLastSecond: this.recentFrames.length,
+      queuedFrames: state.queue.length, queuedBytes: state.bytes, oldestQueuedAgeMs: oldest === null || oldest === undefined ? 0 : Math.max(0, this.now() - oldest),
+      partialReplyBytes: state.replyPending.length, lastReplyAgeMs: state.lastReplyAt === null ? null : Math.max(0, this.now() - state.lastReplyAt),
+      upstreamWritableBytes: Number.isFinite(state.upstream?.writableLength) ? state.upstream.writableLength : 0, writeBackpressured: state.writeBlocked,
+    });
     if (this.resetHistory.length > 16) this.resetHistory.shift();
     if (state.attempted) {
       this.budget?.recordFailure().catch(() => {});
@@ -219,7 +233,7 @@ export class ProviderGuard {
       this.stats.blockedConnections++; local.destroy(); return;
     }
     if (this.active) { this.#waitForLocalHandoff(local); return; }
-    const state = { local, upstream: null, queue: [], pending: Buffer.alloc(0), pendingAt: null, connected: false, closed: false, attempted: false, budgetLease: null, reservePromise: null, bytes: 0, timer: null, timerAt: Infinity, connectTimer: null, handshakeTimer: null, replyTimer: null, replyPendingAt: null, writeBlocked: false, readerReadyAt: null, positiveSince: null, lastFreshPositiveAt: null, positiveObservations: 0, positiveReplyBaseline: 0, clientFrames: 0, replyFrames: 0, greetingBytes: 14, greeting: Buffer.alloc(14), replyPending: Buffer.alloc(0) };
+    const state = { local, upstream: null, queue: [], pending: Buffer.alloc(0), pendingAt: null, connected: false, connectedAt: null, lastReplyAt: null, closed: false, attempted: false, budgetLease: null, reservePromise: null, bytes: 0, timer: null, timerAt: Infinity, connectTimer: null, handshakeTimer: null, replyTimer: null, replyPendingAt: null, writeBlocked: false, readerReadyAt: null, positiveSince: null, lastFreshPositiveAt: null, positiveObservations: 0, positiveReplyBaseline: 0, clientFrames: 0, replyFrames: 0, greetingBytes: 14, greeting: Buffer.alloc(14), replyPending: Buffer.alloc(0) };
     this.active = state;
     const fail = reason => {
       if (state.closed) return;
@@ -281,7 +295,7 @@ export class ProviderGuard {
       upstream.setTimeout(10000, () => fail('provider connection timed out'));
       upstream.once('connect', () => {
         if (state.closed || this.active !== state) return;
-        state.connected = true; upstream.setTimeout(0);
+        state.connected = true; state.connectedAt = this.now(); upstream.setTimeout(0);
         state.handshakeTimer = this.setTimer(() => this.#reset(state, 'provider handshake timed out'), 10000);
         state.handshakeTimer?.unref?.(); this.#arm(state);
       });
@@ -316,7 +330,7 @@ export class ProviderGuard {
           if (state.replyPending.length < length + 2) break;
           const complete = Buffer.from(state.replyPending.subarray(0, length + 2));
           if (local.writableLength + complete.length > 65536) { this.#reset(state, 'local reply queue overflow'); return; }
-          state.replyFrames++; this.stats.replyFramesReceived++; state.replyPending = state.replyPending.subarray(length + 2);
+          state.replyFrames++; state.lastReplyAt = this.now(); this.stats.replyFramesReceived++; state.replyPending = state.replyPending.subarray(length + 2);
           state.replyPendingAt = state.replyPending.length ? this.now() : null;
           // The pinned OSCam peer incorrectly assumes recv() returns the full
           // header/body. Do not deliberately forward WAN fragmentation to it.
