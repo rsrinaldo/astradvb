@@ -101,11 +101,13 @@ test('matched late positive replies cannot falsely reopen full-rate admission', 
   let running=true;
   const work=Promise.all(clients.map(async(c,i)=>{let n=0;while(running){const r=await c.requestECM({channelId:i+1,epoch:10000+n++,timeoutMs:12000});assert.equal(r.ok,false);assert.equal(r.closed,undefined);}}));
   work.catch(()=>{});t.after(async()=>{running=false;for(const c of clients)c.close();await work.catch(()=>{});});
-  await until(()=>lab.snapshot().guard.ecmHealth.mode===1&&lab.snapshot().guard.ecmHealth.late>0,35000);
+  // Retired wire IDs now discard terminal replies before caller/key delivery.
+  // Their evidence belongs to isolation.lateReplies, not matched-live health.
+  await until(()=>lab.snapshot().guard.ecmHealth.mode===1&&lab.snapshot().guard.ecmIsolation.lateReplies>0,35000);
   const s=lab.snapshot();assert.equal(s.guard.ecmHealth.good,0);assert.equal(s.guard.ecmHealth.recoveries,0);
   assert.equal(s.provider.connections,1);assert.equal(s.guard.connectionResets,0);
   running=false;await work;
-  console.log(JSON.stringify({case:'late-positive-not-recovery',health:lab.snapshot().guard.ecmHealth,providerConnections:1}));
+  console.log(JSON.stringify({case:'late-positive-not-recovery',health:lab.snapshot().guard.ecmHealth,isolation:lab.snapshot().guard.ecmIsolation,providerConnections:1}));
 });
 test('positive packets with invalid null keys cannot grant healthy admission', { skip: !enabled, timeout: 40000 }, async t => {
   const lab=await fixture(t,{policy:()=>({zeroCW:true})}),clients=[];
@@ -190,6 +192,44 @@ test('direct OSCam deduplicates identical channel requests and negatives do not 
   assert.equal(negatives.every(r=>!r.ok&&!r.timedOut&&!r.closed),true);
   assert.equal(lab.provider.snapshot().connections,1);
   assert.equal(lab.snapshot().guard.connectionResets,0);
+});
+test('one missing and one late reply cannot reset healthy channels or poison fresh keys', { skip: !enabled, timeout: 60000 }, async t => {
+  const lab=await fixture(t,{policy:({channelId,epoch})=>({drop:channelId===1&&epoch===20000,delayMs:channelId===3&&epoch===20000?11000:20})});
+  const lost=await lab.client(),late=await lab.client(),healthy=await lab.client();
+  const missing=lost.requestECM({channelId:1,epoch:20000}),delayed=late.requestECM({channelId:3,epoch:20000});
+  const end=Date.now()+37000;let correct=0;
+  while(Date.now()<end) {
+    const epoch=21000+correct,r=await healthy.requestECM({channelId:2,epoch});
+    assert.equal(r.ok,true);assert.deepEqual(r.controlWords,cwForEpoch(2,epoch,lab.transportMode));correct++;await delay(250);
+  }
+  assert.equal((await missing).ok,false);assert.equal((await delayed).ok,false);
+  for(const [client,id] of [[lost,1],[late,3]]) {const r=await client.requestECM({channelId:id,epoch:22000});assert.equal(r.ok,true);assert.deepEqual(r.controlWords,cwForEpoch(id,22000,lab.transportMode));}
+  const s=lab.snapshot();assert.equal(s.provider.connections,1);assert.equal(s.guard.connectionResets,0);
+  assert.ok(s.guard.ecmIsolation.retired>=2);assert.ok(s.guard.ecmIsolation.pendingIDs>=1);assert.ok(s.guard.ecmIsolation.lateReplies>=1);
+  console.log(JSON.stringify({case:'isolated-missing-late',correctHealthyReplies:correct,providerConnections:1,isolation:s.guard.ecmIsolation}));
+});
+test('four sparse successful keys recover a limited account without extra requests', { skip: !enabled, timeout: 75000 }, async t => {
+  const lab=await fixture(t,{initialHealthLimited:true,policy:()=>({delayMs:20})}),c=await lab.client();
+  await delay(15500);
+  for(let n=0;n<4;n++) {if(n)await delay(10010);const epoch=23000+n,r=await c.requestECM({channelId:1,epoch});assert.equal(r.ok,true);assert.deepEqual(r.controlWords,cwForEpoch(1,epoch,lab.transportMode));}
+  await until(()=>lab.snapshot().guard.ecmHealth.limited===0,7000);
+  const s=lab.snapshot();assert.equal(s.provider.requests,4);assert.equal(s.provider.connections,1);assert.equal(s.guard.ecmHealth.recoveries,1);
+  console.log(JSON.stringify({case:'sparse-account-recovery',correctKeys:4,providerRequests:4,providerConnections:1,health:s.guard.ecmHealth}));
+});
+test('one failing service has bounded retries and cannot block other services recovery', { skip: !enabled, timeout: 100000 }, async t => {
+  const lab=await fixture(t,{initialHealthLimited:true,policy:({channelId})=>({reject:channelId===1,delayMs:20})}),clients=[];
+  for(let n=0;n<10;n++)clients.push(await lab.client());
+  await delay(15500);let run=true,correct=0,negative=0,failure;
+  // Sparse probe admission intentionally expires stale queued work. A healthy
+  // service retries with a fresh identity; every delivered key must be exact.
+  const work=Promise.all(clients.map(async(c,n)=>{let epoch=24000;while(run){const current=epoch++,r=await c.requestECM({channelId:n+1,epoch:current});assert.equal(r.closed,undefined);if(!n){assert.equal(r.ok,false);negative++;}else if(r.ok){assert.deepEqual(r.controlWords,cwForEpoch(n+1,current,lab.transportMode));correct++;}await delay(n?1000:10);}}));
+  work.catch(error=>{failure=error;});t.after(async()=>{run=false;clients.forEach(c=>c.close());await work.catch(()=>{});});
+  // A persisted sparse account can spend a 15s probe interval plus a caller
+  // renewal cycle finding its first useful service, then needs 30s of proof.
+  await until(()=>{if(failure)throw failure;return lab.snapshot().guard.ecmHealth.recoveries===1;},65000);run=false;await work;
+  assert.ok(correct>=20,'Working services must deliver useful keys throughout recovery');
+  const s=lab.snapshot();assert.equal(s.provider.connections,1);assert.equal(s.guard.connectionResets,0);assert.ok(negative<20,'Failure retries must not use the whole account rate');assert.ok(s.provider.peakRequestsPerSecond<=20);
+  console.log(JSON.stringify({case:'mixed-service-recovery',correctKeys:correct,negativeReplies:negative,providerConnections:1,health:s.guard.ecmHealth,isolation:s.guard.ecmIsolation}));
 });
 test('direct native reconnects obey the durable three-attempt window under repeated real TCP resets', { skip: !enabled, timeout: 90000 }, async t => {
   const lab=await fixture(t); const began=Date.now();

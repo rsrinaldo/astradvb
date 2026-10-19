@@ -257,7 +257,7 @@ The shared OSCam reader uses 128 local storage slots, but allows at most 32 unan
 
 OSCam is an integral part of the native and Docker installations. The installer builds and installs it automatically alongside tsdecrypt; Astra starts and stops the proxy itself, including after reboot. No separate manual OSCam installation or service configuration is needed. One upstream Newcamd TCP connection per shared account carries individual channel ECM exchanges.
 
-Leave `ASTRA_CAS_INPUT_BUFFER_MS=0` in `/etc/astra-linux/environment`; restart the service after changing that environment file. The legacy 0–2000 ms unconditional input-delay override is diagnostic only and is **not** required to enable policy v6's adaptive hold. Validated media is released promptly, while uncertain encrypted packets can wait at most **two seconds**, within an **8 MiB per-decoder ciphertext-safety envelope** that includes bounded retention/key/probe bookkeeping. This is not a limit on whole-process RSS, native input/write rings, Node workers or HLS caches. Uncertifiable media is discarded on timeout/capacity/ambiguity rather than emitted using a guessed word. Unknown startup, gap or rekey prefixes are withheld unless a trustworthy observed boundary permits release; a later PES header does not automatically validate an unknown earlier prefix. Finite EOF drains owned input-delay tails without padding or inventing packets. Do not delay ECM reception externally. Decoder starts remain paced at one every 500 ms and no more than five per five seconds (about 87 seconds for 90 decoders).
+Leave `ASTRA_CAS_INPUT_BUFFER_MS=0` in `/etc/astra-linux/environment`; restart the service after changing that environment file. The legacy 0–2000 ms unconditional input-delay override is diagnostic only and is **not** required to enable policy v6's adaptive hold. Validated media is released promptly, while uncertain encrypted packets can wait at most **five seconds**, within an **8 MiB per-decoder ciphertext-safety envelope** that includes bounded retention/key/probe bookkeeping. This is not a limit on whole-process RSS, native input/write rings, Node workers or HLS caches. Uncertifiable media is discarded on timeout/capacity/ambiguity rather than emitted using a guessed word. Unknown startup, gap or rekey prefixes are withheld unless a trustworthy observed boundary permits release; a later PES header does not automatically validate an unknown earlier prefix. Finite EOF drains owned input-delay tails without padding or inventing packets. Do not delay ECM reception externally. Decoder starts remain paced at one every 500 ms and no more than five per five seconds (about 87 seconds for 90 decoders).
 
 The safety contract assumes correct provider CWs and stable CW contents within each observed same-PID/same-TSC run; ECM table IDs do not determine even/odd transport parity. A continuation cannot reveal an unannounced same-parity key change. PES syntax is not cryptographic authentication or a guarantee of correct picture decoding. Missing source data/ECM announcements, wrong provider keys, excessive latency or unsupported transport behavior can still interrupt playback; there is no 100% availability guarantee.
 
@@ -282,9 +282,25 @@ The credential is encrypted at rest with AES-256-GCM using the secret in `/etc/a
 
 ## 10. Back up and upgrade
 
-### Stable recovery and ECM tracing (0.8.57)
+### Channel-isolated recovery (0.8.58)
 
-The current installer requires verified direct native policy 3 and rebuilds
+The latest installer requires decoder policy 11, semantic policy 5 / direct native
+policy 4 and rebuilds older native binaries. Decoder policy 11 supersedes the
+historical policy-10/two-second descriptions above: the adaptive encrypted-media
+hold is now at most five seconds within the unchanged 8 MiB cap. Capacity can be
+reached sooner at high bitrates; healthy media has no fixed five-second delay.
+The ECM reply timeout remains eight seconds and HLS settings are unchanged.
+Its corresponding app/native pair isolates missing
+channel replies with bounded late-ID quarantine, supports sparse successful
+recovery and paces retries for individually failing services. It retains normal
+aggregate admission and the durable provider attempt/health state. One service
+restart activates the matching application and native binaries. Preserve the whole
+provider-budget directory on upgrade or rollback; never restore old credit.
+See [current verification](VERIFICATION-0.8.58.md) and the README for bounds.
+
+### Stable recovery and ECM tracing (0.8.57, superseded qualification)
+
+Version 0.8.57 required verified direct native policy 3 and rebuilt
 older policy 1/2 binaries. It preserves the existing decoder, secrets,
 authentication, stream/EPG settings, explicit pause and lower rate settings.
 One planned service restart activates the matching application/native pair.

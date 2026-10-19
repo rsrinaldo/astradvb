@@ -2,6 +2,16 @@ import { DecoderStartQueue, providerGuardOptions } from './provider-guard.mjs';
 
 const FIELDS = ['port', 'ready', 'connections', 'closes', 'frames', 'failures', 'retryMs', 'attempts', 'stableRecoveries'];
 const HEALTH_FIELDS = ['port', 'mode', 'limited', 'good', 'negative', 'late', 'entries', 'probes', 'recoveries', 'nextMs'];
+export function parseIsolationStatus(line) {
+  if (typeof line !== 'string' || line.length > 16384) return null;
+  const match = line.match(/astra isolation status: (\d+) (\d+) (\d+) (\d+) (\d+)$/);
+  if (!match) return null;
+  const values = match.slice(1).map(Number);
+  if (!values.every(Number.isSafeInteger)) return null;
+  const [port, retired, pendingIDs, lateReplies, backedOffServices] = values;
+  return port >= 1 && port <= 65535 && pendingIDs <= 65503 && pendingIDs <= retired && lateReplies <= retired && backedOffServices <= 256
+    ? { port, retired, pendingIDs, lateReplies, backedOffServices } : null;
+}
 const TRACE_FIELDS = ['port', 'requests', 'repeated', 'repeatedNOK', 'ageOver1s', 'ageOver2s', 'maxAgeMs', 'replies', 'good', 'negative', 'unusable', 'replyOver1s', 'replyOver4s', 'maxReplyMs', 'maxGoodReplyMs', 'maxNegativeReplyMs', 'recoveryExpired', 'maxRecoveryAgeMs', 'peakRecoverySent', 'inflightLimit'];
 export function parseTraceStatus(line) {
   if (typeof line !== 'string' || line.length > 16384) return null;
@@ -52,6 +62,7 @@ export class DirectCASController {
     this.offsets = { connections: 0, closes: 0, frames: 0, stableRecoveries: 0 };
     this.health = null;
     this.trace = null;
+    this.isolation = null;
     this.healthOffsets = Object.fromEntries(['good', 'negative', 'late', 'entries', 'probes', 'recoveries'].map(key => [key, 0]));
     this.negativeReplies = 0; this.lastConnectionAt = null; this.lastReaderReadyAt = null; this.lastResetAt = null;
     this.negativeECMReplies = 0;
@@ -71,6 +82,7 @@ export class DirectCASController {
     if (this.health) for (const field of Object.keys(this.healthOffsets)) this.healthOffsets[field] += this.health[field];
     this.health = null;
     this.trace = null;
+    this.isolation = null;
     this.status = null; this.readerReady = false;
   }
   update(value) {
@@ -95,6 +107,9 @@ export class DirectCASController {
   updateTrace({ port, ...value }) {
     if (!this.stopped && port === this.reportPort) this.trace = value;
   }
+  updateIsolation({ port, ...value }) {
+    if (!this.stopped && port === this.reportPort) this.isolation = value;
+  }
   snapshot() {
     const s = this.status;
     const counter = name => this.offsets[name] + (s?.[name] || 0);
@@ -109,6 +124,7 @@ export class DirectCASController {
       ecmHealth: { mode: this.health?.mode || 0, limited: this.health?.limited || 0, nextMs: this.health?.nextMs || 0,
         ...Object.fromEntries(Object.keys(this.healthOffsets).map(key => [key, this.healthOffsets[key] + (this.health?.[key] || 0)])) },
       ...(this.trace ? { ecmTrace: { ...this.trace } } : {}),
+      ...(this.isolation ? { ecmIsolation: { ...this.isolation } } : {}),
       accountBudget: { persistent: true, owner: 'oscam', attemptsLastWindow: s?.attempts || 0,
         maxAttempts: 3, windowMs: 61000, failureCount: s?.failures || 0, retryAfterMs: s?.retryMs || 0 },
     };

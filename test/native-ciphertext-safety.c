@@ -219,7 +219,7 @@ static void bounds_and_output_failure(void) {
     const size_t bytes = sizeof(struct astra_ciphertext) + 32 * sizeof(struct astra_ct_packet);
     assert(!astra_ciphertext_create(bytes - 1, 2000, decrypt, emit, &oracle));
     assert(!astra_ciphertext_create(ASTRA_CT_MAX_BYTES + 1, 2000, decrypt, emit, &oracle));
-    assert(!astra_ciphertext_create(bytes, 2001, decrypt, emit, &oracle));
+    assert(!astra_ciphertext_create(bytes, ASTRA_CT_MAX_WAIT_MS + 1, decrypt, emit, &oracle));
     struct astra_ciphertext *s = start(bytes, 2000);
     // Keep an owned, anchored missing-key head: retired headerless runs now
     // leave promptly and cannot legitimately be used to force capacity loss.
@@ -745,6 +745,40 @@ static void unreachable_headerless_runs_retire_without_a_timer(void) {
     exact_owned_references(s); safe_tail(s, 102, 2);
 }
 
+static void five_second_adaptive_hold(void) {
+    assert(ASTRA_CT_MAX_WAIT_MS == 5000);
+    assert(!astra_ciphertext_create(ASTRA_CT_MAX_BYTES, 5001, decrypt, emit, &oracle));
+    for (unsigned int arrival = 3000; arrival <= 4999; arrival += 1999) {
+        struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 5000);
+        oracle.strict_order = 1;
+        publish(s, 0, 1, 0); push(s, 256, 0, 1, 0, 1, 0, 1);
+        assert(oracle.emitted == 1 && "healthy media has no fixed five-second delay");
+        push(s, 256, 1, 0, 1, 2, 10, 2);
+        publish(s, 1, 3, 20); /* Wrong candidate cannot release any raw prefix. */
+        push(s, 256, 2, 1, 1, 2, 22, 3);
+        assert(astra_ciphertext_pump(s, arrival - 1, 0));
+        assert(oracle.emitted == 1 && s->count == 2 && !s->stats.packets_dropped);
+        publish(s, 1, 2, arrival); assert(astra_ciphertext_pump(s, arrival, 0));
+        exact(s, arrival + 1);
+    }
+    struct astra_ciphertext *s = start(ASTRA_CT_MAX_BYTES, 5000);
+    push(s, 256, 0, 1, 0, 2, 0, 1);
+    assert(astra_ciphertext_pump(s, 4999, 0));
+    assert(s->count == 1 && !oracle.emitted && !s->stats.timeout_drops);
+    assert(astra_ciphertext_pump(s, 5000, 0));
+    assert(!s->count && !oracle.emitted && s->stats.timeout_drops == 1);
+    publish(s, 0, 2, 5001); assert(astra_ciphertext_pump(s, 5001, 0));
+    assert(!oracle.emitted && "a late word cannot resurrect expired packets");
+    astra_ciphertext_destroy(s);
+
+    /* Capacity may retire uncertain media before the time limit; never grow. */
+    s = start(sizeof(struct astra_ciphertext) + 32 * sizeof(struct astra_ct_packet), 5000);
+    for (unsigned int i = 0; i < 96; i++) push(s, 256, i, i == 0, 0, 2, i, i);
+    assert(s->stats.capacity_drops && !s->stats.timeout_drops && !oracle.emitted);
+    assert(s->count <= s->capacity && s->stats.allocated_bytes <= ASTRA_CT_MAX_BYTES);
+    astra_ciphertext_destroy(s);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--short-clear-regression")) {
         short_clear_tail_preserves_pending_parity_prefix();
@@ -771,6 +805,7 @@ int main(int argc, char **argv) {
         puts("PASS: completed-anchor cache preserves fresh evidence and exact candidate ownership"); return 0;
     }
     assert(argc == 1);
+    five_second_adaptive_hold();
     healthy_parity_continuation(); late_word_does_not_retire_physical_parity_prefix(); asynchronous_pid_parity_preserves_certified_old_tail(); overlap_does_not_waive_own_invalidation(); delayed_and_missing_words(); prefetched_same_parity_change(); startup_ambiguous_prefix();
     pid_whole_cycle_gap(1); pid_whole_cycle_gap(0); unchanged_pairs_and_future_opposite_half(); marked_same_parity_changes(); ambiguity_context_and_eof(); bounds_and_output_failure();
     split_pes_prefix_and_cc_gap(); candidate_and_run_exhaustion(); deferred_batches_wrap_and_eof();

@@ -19,6 +19,7 @@ function safePoint(value) {
     ...(guard.semantic ? { semantic: numeric(guard.semantic, SEMANTIC) } : {}),
     ...(guard.ecmHealth ? { ecmHealth: numeric(guard.ecmHealth, HEALTH) } : {}),
     ...(guard.ecmTrace ? { ecmTrace: numeric(guard.ecmTrace, TRACE) } : {}),
+    ...(guard.ecmIsolation ? { ecmIsolation: numeric(guard.ecmIsolation, ['retired', 'pendingIDs', 'lateReplies', 'backedOffServices']) } : {}),
     ...(guard.ingress ? { ingress: numeric(guard.ingress, INGRESS) } : {}) })),
     ...numeric(value, ['localTimeouts', 'localRejected', 'mainLoopMaxMs']), truncatedProfiles: value.truncatedProfiles === true };
 }

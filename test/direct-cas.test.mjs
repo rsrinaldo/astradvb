@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { buildOscamConfiguration, CASProxyManager } from '../src/cas-proxy.mjs';
-import { DirectCASController, parseDirectStatus, parseHealthStatus, parseTraceStatus } from '../src/direct-cas-controller.mjs';
+import { DirectCASController, parseDirectStatus, parseHealthStatus, parseTraceStatus, parseIsolationStatus } from '../src/direct-cas-controller.mjs';
 import { encryptSecret } from '../src/secrets.mjs';
 import { openProviderBudgetStore } from '../src/provider-budget.mjs';
 import { RingLogger } from '../src/logger.mjs';
@@ -135,6 +135,13 @@ test('ECM trace retains only bounded numeric measurements, never correlation has
   assert.ok(parseTraceStatus(largest));
   const c=new DirectCASController({reportPort:23000});
   try {c.updateTrace(value);assert.equal(c.snapshot().ecmTrace.maxNegativeReplyMs,5000);assert.equal(JSON.stringify(c.snapshot()).includes('private'),false);c.beginGeneration();assert.equal(c.snapshot().ecmTrace,undefined);}finally{await c.stop();}
+});
+test('channel isolation diagnostics are numeric, bounded and generation-local', async () => {
+  const line='private astra isolation status: 23000 100 4 96 2';
+  const value=parseIsolationStatus(line);assert.equal(value.pendingIDs,4);
+  for(const bad of [line+' secret=x',line.replace(' 4 ',' 65504 '),line.replace(/ 2$/,' 257'),line.replace(' 100 ',' -1 ')]) assert.equal(parseIsolationStatus(bad),null);
+  const c=new DirectCASController({reportPort:23000});
+  try {c.updateIsolation(value);assert.equal(c.snapshot().ecmIsolation.lateReplies,96);c.beginGeneration();assert.equal(c.snapshot().ecmIsolation,undefined);}finally{await c.stop();}
 });
 test('direct mode preserves an explicit provider pause and lower configured rate', async () => {
   const previous={secret:process.env.ASTRA_SECRET_KEY,pause:process.env.ASTRA_CAS_PROVIDER_PAUSED,rate:process.env.ASTRA_CAS_REQUESTS_PER_SECOND};

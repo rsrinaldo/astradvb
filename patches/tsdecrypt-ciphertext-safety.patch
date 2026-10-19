@@ -650,7 +650,7 @@ index 0000000..e8fc54b
 --- /dev/null
 +++ b/astra-ciphertext-safety.h
 @@ -0,0 +1,539 @@
-+/* Normal native decoder safety (policy 10). READY-prefix SIMD cohorts preserve
++/* Normal native decoder safety (policy 11). READY-prefix SIMD cohorts preserve
 + * original TS order and adaptive retention bounds without fixed input delay.
 + * Copyright AstraDVB contributors, GPL-2.0-only.
 + *
@@ -672,7 +672,7 @@ index 0000000..e8fc54b
 +#define ASTRA_CT_PID_COUNT 8192
 +#define ASTRA_CT_NONE UINT16_MAX
 +#define ASTRA_CT_MAX_BYTES (8u * 1024u * 1024u)
-+#define ASTRA_CT_MAX_WAIT_MS 2000u
++#define ASTRA_CT_MAX_WAIT_MS 5000u
 +#define ASTRA_CT_BATCH_PACKETS 70u
 +#define ASTRA_CT_PRIVATE_ANCILLARY 0x86u /* internal marker; never an on-wire stream type */
 +

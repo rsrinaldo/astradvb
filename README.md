@@ -73,7 +73,41 @@ node src/server.mjs
 
 Open `http://server-address:8000/` and sign in as `admin`. Read the unique initial password from `data/initial-admin-password`, then change it in **Settings → Administrator account**. All example streams are disabled.
 
-## Stable recovery and ECM tracing (v0.8.57)
+## Channel-isolated recovery (v0.8.58)
+
+Current builds require semantic policy 5 and direct native policy 4. A request
+that receives no reply no longer closes a shared connection while other matched
+replies progress. After its response interval its work slot is retired; a fixed
+8-KiB wire-ID quarantine prevents late replies from being assigned to fresh work.
+A parsed late reply is discarded and releases that ID. A real socket failure,
+account-wide response silence, or actual finite ID-quarantine exhaustion still
+uses the durable paced reconnect path. No historical work is replayed.
+
+Recovery no longer requires sixteen useful replies per thirty-second window.
+Four useful replies for a service spanning at least thirty seconds, without a
+failure for that service or a gap over thirty seconds, establish recovery. No
+extra ECM requests are manufactured. Short all-service good bursts followed by
+failures cannot establish this proof. Failed services retain their own bounded
+retry delay (0.5, 1, 2, 4, then 5 seconds) after the account recovers; a useful
+reply clears that service's delay. This is not a permanent blacklist. Normal
+aggregate pacing, lower operator rates and the durable connection budget remain.
+Retry spacing is measured from dispatch, not added after a full reply timeout.
+During sparse probing only, a rejected service with other recent channel demand
+leaves one ordinary probe opportunity for a different service (at most two probe
+intervals before its own next eligibility). Single-service retries are unchanged;
+this fairness rule creates no extra provider requests or permanent blacklist.
+
+Service metadata is RAM-only, capped at 256 records; eviction loses proof, never
+creates it. ID and service storage are constant-size per account, with no added
+per-packet work or per-key disk writes. Numeric `ecmIsolation` diagnostics count
+retired work, quarantined IDs, discarded late replies and backed-off services;
+they contain no service identities, raw ECMs or keys. Decoder policy 11 raises
+only the adaptive encrypted-media hold from two to
+five seconds, within the unchanged 8 MiB cap; healthy output is not deliberately
+delayed. The eight-second ECM reply timeout and HLS settings are unchanged.
+See [verification](VERIFICATION-0.8.58.md).
+
+## Stable recovery and ECM tracing (v0.8.57, superseded qualification)
 
 Direct native policy 3 corrects v0.8.56's premature return to full rate: a short
 two-second good-key burst is no longer enough. Recovery progresses through
@@ -487,7 +521,7 @@ Version 0.8.46 requires native CAS bundle policy v6: a probe/batching optimizati
 
 The optimization targets native probe/setup work and confirmed-packet batching, without increasing buffers or changing OSCam policy 2/semantic policy 2, provider rates, durable account budgets, startup pacing or global CPU quotas. Release acceptance requires packet/order preservation and fault regressions **plus** bounded CPU, source-feed lateness, backpressure and A/V-delivery-gap measurements using comparable inputs, channel counts, key timing and resource quotas. Correctness tests alone do not demonstrate lightweight operation. Synthetic results do not establish a universal CPU budget, production capacity or comparative performance against another product.
 
-The decoder retains uncertain encrypted packets and immutable candidate control words instead of decrypting queued media with whichever pair arrived most recently. A per-PID observed transport-scrambling-control (TSC) run is checked against bounded PES-header evidence; ECM table IDs do not define CSA parity. Candidate checks use an isolated scalar libdvbcsa probe, while confirmed media retains FFdecsa batch output. Normal validated media is released promptly; uncertainty can hold ordered output for **at most two seconds**, subject to an **8 MiB per-decoder ciphertext-safety envelope** including its bounded retention/key/probe bookkeeping reservation. That is not a whole-process RSS limit and does not include existing native input/write rings, Node workers or HLS caches. Capacity, timeout, ambiguous-key or context failures discard uncertifiable media rather than publish a guessed decryption. Startup and gap/rekey prefixes without a trustworthy boundary are withheld; a later valid header does not automatically certify an unknown earlier prefix. Counter/queue observations are numeric only; no key or ECM contents are published.
+The decoder retains uncertain encrypted packets and immutable candidate control words instead of decrypting queued media with whichever pair arrived most recently. A per-PID observed transport-scrambling-control (TSC) run is checked against bounded PES-header evidence; ECM table IDs do not define CSA parity. Candidate checks use an isolated scalar libdvbcsa probe, while confirmed media retains FFdecsa batch output. Normal validated media is released promptly; uncertainty can hold ordered output for **at most five seconds**, subject to an **8 MiB per-decoder ciphertext-safety envelope** including its bounded retention/key/probe bookkeeping reservation. That is not a whole-process RSS limit and does not include existing native input/write rings, Node workers or HLS caches. Capacity, timeout, ambiguous-key or context failures discard uncertifiable media rather than publish a guessed decryption. Startup and gap/rekey prefixes without a trustworthy boundary are withheld; a later valid header does not automatically certify an unknown earlier prefix. Counter/queue observations are numeric only; no key or ECM contents are published.
 
 This contract assumes correct provider control words and a CW that stays stable within each observed same-PID/same-TSC run. Continuation packets alone cannot prove an unannounced same-parity key boundary. PES syntax is **not cryptographic authentication**, and neither a valid PES header nor clear TS flags prove that every video frame is correct. Source loss, wholly missing ECM announcements, wrong provider keys, unsupported transport behavior or keys arriving beyond the safety bounds can still interrupt output. No 100% reliability or availability guarantee is made.
 

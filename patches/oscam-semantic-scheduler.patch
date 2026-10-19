@@ -1,24 +1,25 @@
 diff --git a/astra-semantic-scheduler.h b/astra-semantic-scheduler.h
 new file mode 100644
-index 0000000..ab1486a
+index 00000000..14538972
 --- /dev/null
 +++ b/astra-semantic-scheduler.h
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,267 @@
 +#ifndef ASTRA_SEMANTIC_SCHEDULER_H
 +#define ASTRA_SEMANTIC_SCHEDULER_H
 +
 +/* Opt-in guarded-reader policy. No ECM, key or parent pointers live here.
 + * Caller owns the existing ecmtask[] storage and serializes these operations.
-+ * Expired SENT slots retain their IDs until reply/transport closure. Only a
++ * Retired SENT IDs are quarantined until reply/transport closure. Only a
 + * deadline plus absence of matched complete ECM reply progress permits reset. */
 +#include <stdint.h>
 +#include <stddef.h>
-+#define ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 4
++#define ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 5
++#define ASTRA_SEMANTIC_MAX_RETIRED (65535u - 32u)
 +
 +enum astra_semantic_state { ASTRA_EMPTY, ASTRA_QUEUED, ASTRA_SENT, ASTRA_ALIAS };
 +struct astra_semantic_slot
 +{
-+	uint64_t deadline_ms, order, service, sent_at_ms;
++	uint64_t deadline_ms, order, service, sent_at_ms, not_before_ms;
 +	uint16_t id;
 +	uint8_t state;
 +};
@@ -34,6 +35,9 @@ index 0000000..ab1486a
 +	uint64_t last_reply_ms, matched, generation, resets, abandoned, closes;
 +	uint64_t soft_defer_until_ms;
 +	uint8_t last_reset_reason;
++	uint64_t retired_ids[1024]; /* fixed 8 KiB; no ECMs, CWs or growing map */
++	uint32_t retired_count;
++	uint64_t retired, retired_replies;
 +};
 +
 +static inline void astra_semantic_init(struct astra_semantic_core *q, struct astra_semantic_slot *slots, size_t capacity)
@@ -81,7 +85,7 @@ index 0000000..ab1486a
 +	for(size_t i = 0; i < q->capacity; ++i)
 +	{
 +		struct astra_semantic_slot *s = &q->slots[i];
-+		if(s->state != ASTRA_QUEUED || s->deadline_ms <= now) { continue; }
++		if(s->state != ASTRA_QUEUED || s->deadline_ms <= now || s->not_before_ms > now) { continue; }
 +		int head = 1;
 +		for(size_t j = 0; j < q->capacity; ++j)
 +			{ if(q->slots[j].state == ASTRA_QUEUED && q->slots[j].service == s->service && q->slots[j].order < s->order) { head = 0; break; } }
@@ -106,7 +110,7 @@ index 0000000..ab1486a
 +		int used = 0;
 +		for(size_t i = 0; i < q->capacity; ++i)
 +			{ if(q->slots[i].state == ASTRA_SENT && q->slots[i].id == candidate) { used = 1; break; } }
-+		if(!used) { return candidate; }
++		if(!used && !(q->retired_ids[candidate / 64] & (UINT64_C(1) << (candidate % 64)))) { return candidate; }
 +	}
 +	return 0;
 +}
@@ -138,6 +142,40 @@ index 0000000..ab1486a
 +	return 1;
 +}
 +
++/* A parsed late ECM reply is discarded, never delivered to a newer caller.
++ * Its quarantined ID can only become reusable after this terminal reply. */
++static inline int astra_semantic_retired_reply(struct astra_semantic_core *q, uint16_t id, uint64_t now)
++{
++	uint64_t bit = UINT64_C(1) << (id % 64);
++	if(!id || !(q->retired_ids[id / 64] & bit)) { return 0; }
++	q->retired_ids[id / 64] &= ~bit; --q->retired_count; ++q->retired_replies;
++	q->reply_progress = 1; q->last_reply_ms = now; q->soft_defer_until_ms = 0;
++	return 1;
++}
++
++/* Free a missing request's work slot only while other matched replies prove
++ * current transport progress. Retain its ID separately, without a shared close.
++ * A silent account still follows the no-progress recovery path below. */
++static inline int astra_semantic_retire_due(struct astra_semantic_core *q, uint64_t now, uint64_t interval_ms)
++{
++	if(q->retired_count >= ASTRA_SEMANTIC_MAX_RETIRED) { return -1; }
++	if(!q->reply_progress || now < q->last_reply_ms || now - q->last_reply_ms >= interval_ms) { return -1; }
++	for(size_t i = 0; i < q->capacity; ++i)
++	{
++		struct astra_semantic_slot *s = &q->slots[i];
++		if(s->state == ASTRA_SENT && now >= s->sent_at_ms && now - s->sent_at_ms >= interval_ms) { return (int)i; }
++	}
++	return -1;
++}
++static inline void astra_semantic_retire(struct astra_semantic_core *q, size_t i)
++{
++	uint16_t id = q->slots[i].id;
++	if(q->slots[i].state != ASTRA_SENT || !id) { return; }
++	uint64_t bit = UINT64_C(1) << (id % 64);
++	if(!(q->retired_ids[id / 64] & bit)) { q->retired_ids[id / 64] |= bit; ++q->retired_count; }
++	++q->retired; astra_semantic_release(q, i);
++}
++
 +static inline uint64_t astra_semantic_no_progress_due(struct astra_semantic_core *q, uint64_t interval_ms)
 +{
 +	uint64_t oldest = UINT64_MAX;
@@ -160,37 +198,19 @@ index 0000000..ab1486a
 +	return oldest;
 +}
 +
-+/* Queue protection thresholds, NOT provider capacity/entitlement promises.
-+ * Retire a whole generation, never reuse a live ID or replay individual work. */
++/* Only global lack of matched progress, not an isolated orphan's age, is a
++ * transport-silence deadline. Retired-ID exhaustion is separately bounded. */
 +static inline uint64_t astra_semantic_recovery_due(struct astra_semantic_core *q, uint64_t interval_ms)
 +{
-+	uint64_t due = astra_semantic_no_progress_due(q, interval_ms);
-+	uint64_t lifetime = interval_ms > UINT64_MAX / 4 ? UINT64_MAX : interval_ms * 4;
-+	for(size_t i = 0; i < q->capacity; ++i)
-+	{
-+		struct astra_semantic_slot *s = &q->slots[i];
-+		if(s->state != ASTRA_SENT) { continue; }
-+		uint64_t hard = s->sent_at_ms > UINT64_MAX - lifetime ? UINT64_MAX : s->sent_at_ms + lifetime;
-+		if(hard < due) { due = hard; }
-+	}
-+	return due;
++	return q->retired_count >= ASTRA_SEMANTIC_MAX_RETIRED ? 0 : astra_semantic_no_progress_due(q, interval_ms);
 +}
 +
-+/* 1=no matched progress, 3=absolute orphan lifetime. Reason 2 (expired
-+ * majority) is retired: client timeouts/backlog do not prove a dead transport.
-+ * Continuing matched replies preserve the connection, but cannot retain
-+ * orphan IDs forever. Soft silence gives readable replies <=250ms to parse;
-+ * continuous junk cannot defeat this grace or the absolute lifetime. */
++/* 1=account-wide silence, 3=actual finite ID-quarantine exhaustion. A single
++ * missing reply never forces a shared reset while other replies progress.
++ * Readable data gets a bounded 250-ms parsing grace, not an indefinite hold. */
 +static inline int astra_semantic_recovery_decision(struct astra_semantic_core *q, uint64_t now, uint64_t interval_ms, int readable)
 +{
-+	int reason = 0;
-+	uint64_t lifetime = interval_ms > UINT64_MAX / 4 ? UINT64_MAX : interval_ms * 4;
-+	for(size_t i = 0; i < q->capacity; ++i)
-+	{
-+		struct astra_semantic_slot *s = &q->slots[i];
-+		if(s->state != ASTRA_SENT) { continue; }
-+		if(now >= s->sent_at_ms && now - s->sent_at_ms >= lifetime) { reason = 3; }
-+	}
++	int reason = q->retired_count >= ASTRA_SEMANTIC_MAX_RETIRED ? 3 : 0;
 +	if(reason != 3)
 +	{
 +		uint64_t silence = astra_semantic_no_progress_due(q, interval_ms);
@@ -212,6 +232,8 @@ index 0000000..ab1486a
 +	q->reply_progress = 0;
 +	q->last_reply_ms = 0;
 +	q->soft_defer_until_ms = 0;
++	for(size_t i = 0; i < 1024; ++i) { q->retired_ids[i] = 0; }
++	q->retired_count = 0;
 +	q->generation++;
 +	q->closes++;
 +	/* Preserve sender sequence and frame deadline: closure gives no burst credit. */
@@ -223,15 +245,7 @@ index 0000000..ab1486a
 +	if(due == UINT64_MAX) { return normal_ms; }
 +	if(q->soft_defer_until_ms > now)
 +	{
-+		uint64_t lifetime = interval_ms > UINT64_MAX / 4 ? UINT64_MAX : interval_ms * 4;
-+		uint64_t hard_due = UINT64_MAX;
-+		for(size_t i = 0; i < q->capacity; ++i)
-+		{
-+			if(q->slots[i].state != ASTRA_SENT) { continue; }
-+			uint64_t hard = q->slots[i].sent_at_ms > UINT64_MAX - lifetime ? UINT64_MAX : q->slots[i].sent_at_ms + lifetime;
-+			if(hard < hard_due) { hard_due = hard; }
-+		}
-+		if(due <= now) { due = q->soft_defer_until_ms < hard_due ? q->soft_defer_until_ms : hard_due; }
++		if(due <= now && q->retired_count < ASTRA_SEMANTIC_MAX_RETIRED) { due = q->soft_defer_until_ms; }
 +	}
 +	uint64_t wait = due > now ? due - now : 0;
 +	return wait < (uint64_t)normal_ms ? (int)wait : normal_ms;
@@ -249,6 +263,8 @@ index 0000000..ab1486a
 +		if(s->state == ASTRA_QUEUED && ready && q->sent < 32)
 +		{
 +			uint64_t due = q->next_send_ms > now ? q->next_send_ms - now : 0;
++			uint64_t service_due = s->not_before_ms > now ? s->not_before_ms - now : 0;
++			if(service_due > due) { due = service_due; }
 +			if(due < wait) { wait = due; }
 +		}
 +	}
@@ -256,7 +272,7 @@ index 0000000..ab1486a
 +}
 +#endif
 diff --git a/globals.h b/globals.h
-index eefb5fd..e8bbcaf 100644
+index eefb5fda..e8bbcafd 100644
 --- a/globals.h
 +++ b/globals.h
 @@ -1343,6 +1343,7 @@ struct s_client
@@ -276,7 +292,7 @@ index eefb5fd..e8bbcaf 100644
  	uint8_t			changes_since_shareupdate;
  	int32_t			resetcycle;						// ECM until reset
 diff --git a/oscam-client.c b/oscam-client.c
-index a264f2f..3c50710 100644
+index a264f2fd..a76d47c8 100644
 --- a/oscam-client.c
 +++ b/oscam-client.c
 @@ -758,7 +758,12 @@ void client_check_status(struct s_client *cl)
@@ -293,7 +309,7 @@ index a264f2f..3c50710 100644
  				{
  					add_job(rdr->client, ACTION_READER_IDLE, NULL, 0);
  					rdr->last_check = now;
-@@ -890,6 +890,7 @@ void free_client(struct s_client *cl)
+@@ -890,6 +895,7 @@ void free_client(struct s_client *cl)
  
  	if(cl->ecmtask)
  	{
@@ -302,7 +318,7 @@ index a264f2f..3c50710 100644
  		cl->ecmtask = NULL;
  	}
 diff --git a/oscam-config-reader.c b/oscam-config-reader.c
-index 02880e1..402137a 100644
+index 02880e13..402137a8 100644
 --- a/oscam-config-reader.c
 +++ b/oscam-config-reader.c
 @@ -1156,6 +1156,7 @@ static const struct config_list reader_opts[] =
@@ -314,7 +330,7 @@ index 02880e1..402137a 100644
  	DEF_OPT_FUNC("device"                         , 0,                                    device_fn),
  	DEF_OPT_UINT8("ipv4force"                     , OFS(ipv4force),                       0),
 diff --git a/oscam-ecm.c b/oscam-ecm.c
-index 6b9c6c5..65309ca 100644
+index 6b9c6c52..65309ca9 100644
 --- a/oscam-ecm.c
 +++ b/oscam-ecm.c
 @@ -1165,6 +1165,10 @@ static void remove_ecm_from_reader(ECM_REQUEST *ecm)
@@ -329,7 +345,7 @@ index 6b9c6c5..65309ca 100644
  		{
  			// we found a outstanding reader, clean it:
 diff --git a/oscam-reader.c b/oscam-reader.c
-index ee10064..0164e21 100644
+index ee100648..51275138 100644
 --- a/oscam-reader.c
 +++ b/oscam-reader.c
 @@ -1,6 +1,7 @@
@@ -340,7 +356,7 @@ index ee10064..0164e21 100644
  #include "module-cccam.h"
  #include "module-led.h"
  #include "module-stat.h"
-@@ -18,6 +19,273 @@
+@@ -18,6 +19,291 @@
  #include "oscam-work.h"
  #include "reader-common.h"
  #include "oscam-config.h"
@@ -401,6 +417,16 @@ index ee10064..0164e21 100644
 +	pthread_mutex_lock(&s->lock);
 +	astra_semantic_note_reply(&s->core, (size_t)slot, id, astra_semantic_now());
 +	pthread_mutex_unlock(&s->lock);
++}
++
++int astra_semantic_discard_retired(struct s_reader *reader, uint16_t id)
++{
++	if(!reader || !reader->client || !reader->client->astra_scheduler) { return 0; }
++	struct astra_semantic_scheduler *s = reader->client->astra_scheduler;
++	pthread_mutex_lock(&s->lock);
++	int discarded = astra_semantic_retired_reply(&s->core, id, astra_semantic_now());
++	pthread_mutex_unlock(&s->lock);
++	return discarded;
 +}
 +
 +void astra_semantic_destroy(struct s_client *cl)
@@ -546,6 +572,14 @@ index ee10064..0164e21 100644
 +		}
 +		if(!leader) { s->core.slots[i].state = ASTRA_QUEUED; }
 +	}
++	while((n = astra_semantic_retire_due(&s->core, now, (uint64_t)cfg.ctimeout)) >= 0)
++	{
++		ECM_REQUEST *ecm = &cl->ecmtask[n];
++		if(ecm->parent) { write_ecm_answer(reader, ecm, E_TIMEOUT, 0, NULL, NULL, 0, NULL); }
++		ecm->idx = 0; ecm->rc = E_FOUND; ecm->parent = NULL;
++		astra_semantic_retire(&s->core, (size_t)n);
++	}
++	cl->pending = (int)s->core.sent;
 +	/* Ready replies have priority over soft retirement as well as dispatch. */
 +	struct pollfd fd = { .fd = cl->pfd, .events = POLLIN | POLLPRI };
 +	int readable = cl->pfd > 0 && poll(&fd, 1, 0) > 0;
@@ -614,7 +648,7 @@ index ee10064..0164e21 100644
  
  extern CS_MUTEX_LOCK system_lock;
  extern CS_MUTEX_LOCK ecmcache_lock;
-@@ -707,6 +975,8 @@ void cs_clear_entitlement(struct s_reader *rdr)
+@@ -707,6 +993,8 @@ void cs_clear_entitlement(struct s_reader *rdr)
  
  void casc_check_dcw(struct s_reader *reader, int32_t idx, int32_t rc, uint8_t *cw)
  {
@@ -623,7 +657,7 @@ index ee10064..0164e21 100644
  	int32_t i, pending = 0;
  	time_t t = time(NULL);
  	ECM_REQUEST *ecm;
-@@ -1028,10 +1298,21 @@ void network_tcp_connection_close(struct s_reader *reader, char *reason)
+@@ -1028,10 +1316,21 @@ void network_tcp_connection_close(struct s_reader *reader, char *reason)
  
  	if(cl->ecmtask)
  	{
@@ -645,7 +679,7 @@ index ee10064..0164e21 100644
  		}
  	}
  	// newcamd message ids are stored as a reference in ecmtask[].idx
-@@ -1042,6 +1323,8 @@ void network_tcp_connection_close(struct s_reader *reader, char *reason)
+@@ -1042,6 +1341,8 @@ void network_tcp_connection_close(struct s_reader *reader, char *reason)
  
  int32_t casc_process_ecm(struct s_reader *reader, ECM_REQUEST *er)
  {
@@ -654,7 +688,7 @@ index ee10064..0164e21 100644
  	int32_t rc, n, i, sflag, pending = 0;
  	time_t t;//, tls;
  	struct s_client *cl = reader->client;
-@@ -1247,6 +1530,7 @@ void reader_do_idle(struct s_reader *reader)
+@@ -1247,6 +1548,7 @@ void reader_do_idle(struct s_reader *reader)
  int32_t reader_init(struct s_reader *reader)
  {
  	struct s_client *client = reader->client;
@@ -662,7 +696,7 @@ index ee10064..0164e21 100644
  
  	if(is_cascading_reader(reader))
  	{
-@@ -1268,6 +1552,7 @@ int32_t reader_init(struct s_reader *reader)
+@@ -1268,6 +1570,7 @@ int32_t reader_init(struct s_reader *reader)
  
  		if(client->ecmtask)
  		{
@@ -670,7 +704,7 @@ index ee10064..0164e21 100644
  			add_garbage(client->ecmtask);
  			client->ecmtask = NULL;
  		}
-@@ -1275,6 +1560,18 @@ int32_t reader_init(struct s_reader *reader)
+@@ -1275,6 +1578,18 @@ int32_t reader_init(struct s_reader *reader)
  		if(!cs_malloc(&client->ecmtask, cfg.max_pending * sizeof(ECM_REQUEST)))
  			{ return 0; }
  
@@ -690,15 +724,16 @@ index ee10064..0164e21 100644
  	}
  	else
 diff --git a/oscam-reader.h b/oscam-reader.h
-index f798bb1..5fc4fc6 100644
+index f798bb13..299e211a 100644
 --- a/oscam-reader.h
 +++ b/oscam-reader.h
-@@ -20,6 +20,12 @@ int32_t is_connect_blocked(struct s_reader *rdr);
+@@ -20,6 +20,13 @@ int32_t is_connect_blocked(struct s_reader *rdr);
  
  void reader_do_idle(struct s_reader *reader);
  void casc_check_dcw(struct s_reader *reader, int32_t idx, int32_t rc, uint8_t *cw);
 +void astra_semantic_tick(struct s_reader *reader);
 +void astra_semantic_reply_progress(struct s_reader *reader, int slot, uint16_t id);
++int astra_semantic_discard_retired(struct s_reader *reader, uint16_t id);
 +int astra_semantic_poll_ms(struct s_reader *reader, int normal_ms);
 +int astra_semantic_remote_priority(struct s_reader *reader);
 +int astra_semantic_detach_parent(struct s_client *cl, ECM_REQUEST *parent);
@@ -707,7 +742,7 @@ index f798bb1..5fc4fc6 100644
  int32_t reader_slots_available(struct s_reader *reader, ECM_REQUEST *er);
  
 diff --git a/oscam-work.c b/oscam-work.c
-index 9af35d4..ae8a3b3 100644
+index 9af35d40..4a1da096 100644
 --- a/oscam-work.c
 +++ b/oscam-work.c
 @@ -156,6 +156,22 @@ void *work_thread(void *ptr)
@@ -751,10 +786,11 @@ index 9af35d4..ae8a3b3 100644
  
  			if(!reader && data->action < ACTION_CLIENT_FIRST)
  			{
-@@ -277,12 +293,16 @@ void *work_thread(void *ptr)
+@@ -277,12 +293,17 @@ void *work_thread(void *ptr)
  					cl->last = time(NULL); // *********************************** TO BE REPLACE BY CS_FTIME() LATER ****************
  					idx = cl->reader->ph.c_recv_chk(cl, dcw, &rc, mbuf, rc);
  					if(idx < 0) { break; }  // no dcw received
++					if(idx > 0 && astra_semantic_discard_retired(reader, (uint16_t)idx)) { break; }
 +					/* Newcamd has explicit nonzero request IDs. Do not apply the
 +					 * generic protocol-without-IDs fallback to this scheduler. */
 +					if(!idx && cl->astra_scheduler) { break; }
@@ -768,7 +804,7 @@ index 9af35d4..ae8a3b3 100644
  							cl->pending--;
  							casc_check_dcw(reader, i, rc, dcw);
  							n++;
-@@ -520,6 +540,7 @@ void *work_thread(void *ptr)
+@@ -520,6 +541,7 @@ void *work_thread(void *ptr)
  				} // case ACTION_CLIENT_HIDECARDS
  
  			} // switch

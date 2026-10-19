@@ -309,7 +309,7 @@ test('actual pinned OSCam/guard/native CAS fault simulation laboratory', { skip:
     cleanup(t, lab, 'semantic-recovery-partial');
     t.diagnostic(JSON.stringify(await runSemanticPartialRecovery(lab))); safety(lab);
   });
-  if (selected('semantic-recovery-orphan-age')) await t.test('one orphan retains its ID during progress but is retired by the absolute32-second generation lifetime', { timeout: 55000 }, async t => {
+  if (selected('semantic-recovery-orphan-age')) await t.test('one orphan is isolated beyond the former32-second shared reset boundary', { timeout: 55000 }, async t => {
     progress('semantic-recovery-orphan-age');
     const lab = await createCASLab({ pendingSlots: 128, semanticScheduler: true,
       policy: request => ({ drop: request.connectionId === 1 && request.epoch === 5700 }) });

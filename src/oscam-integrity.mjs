@@ -16,8 +16,8 @@ export function protectedOscamBuild(binary = process.env.ASTRA_OSCAM || '/usr/lo
     if (verified.get(key)?.identity === identity) return verified.get(key).valid;
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
     const releaseAllowed = manifest.experimental === undefined || manifest.experimental === false || (manifest.experimental === true && allowExperimental === true);
-    const directAllowed = !direct || (manifest.directTransportPolicyVersion === 3 && /^[a-f0-9]{64}$/.test(manifest.directTransportSha256 || '') && /^[a-f0-9]{64}$/.test(manifest.providerBudgetSha256 || ''));
-    const valid = releaseAllowed && directAllowed && manifest.policyVersion === OSCAM_POLICY_VERSION && manifest.semanticPolicyVersion === 4 && /^[a-f0-9]{64}$/.test(manifest.semanticSchedulerSha256 || '') && manifest.sourceRevision === OSCAM_SOURCE_REVISION && /^[a-f0-9]{64}$/.test(manifest.binarySha256 || '') && createHash('sha256').update(readFileSync(binary)).digest('hex') === manifest.binarySha256;
+    const directAllowed = !direct || (manifest.directTransportPolicyVersion === 4 && /^[a-f0-9]{64}$/.test(manifest.directTransportSha256 || '') && /^[a-f0-9]{64}$/.test(manifest.providerBudgetSha256 || ''));
+    const valid = releaseAllowed && directAllowed && manifest.policyVersion === OSCAM_POLICY_VERSION && manifest.semanticPolicyVersion === 5 && /^[a-f0-9]{64}$/.test(manifest.semanticSchedulerSha256 || '') && manifest.sourceRevision === OSCAM_SOURCE_REVISION && /^[a-f0-9]{64}$/.test(manifest.binarySha256 || '') && createHash('sha256').update(readFileSync(binary)).digest('hex') === manifest.binarySha256;
     if (verified.size >= 16) verified.clear();
     verified.set(key, { identity, valid }); return valid;
   } catch { return false; }

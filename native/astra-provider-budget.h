@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define ASTRA_DIRECT_TRANSPORT_POLICY_VERSION 3
+#define ASTRA_DIRECT_TRANSPORT_POLICY_VERSION 4
 #define ASTRA_PROVIDER_WINDOW 60000ULL
 /* Bounded RAM-only correlation. Hashes never leave the worker or reach disk,
  * logs, diagnostics or the provider; they never suppress/replay a request. */
@@ -63,6 +63,13 @@ static inline void astra_trace_reply(struct astra_ecm_trace *t, uint64_t service
         }
     }
 }
+/* Bounded per-service metadata only: no blacklist and no ECM/key storage.
+ * A failed service keeps getting paced retries, without holding other services
+ * in account-wide recovery. Eviction loses proof/backoff, never grants proof. */
+struct astra_service_health {
+    uint64_t service, seen, next, proof_since, proof_last, sent_at;
+    unsigned used, failures, proof_good, probe_used;
+};
 struct astra_provider_budget {
     int dirfd, ownerfd, accountfd, dirty, ready, attempted;
     char id[65], boot[37];
@@ -79,7 +86,63 @@ struct astra_provider_budget {
     uint64_t health_good, health_negative, health_late, health_entries;
     uint64_t health_probe_sent, health_recoveries;
     uint64_t health_window_since, health_window_good, health_window_bad;
+    struct astra_service_health services[256];
 };
+static inline struct astra_service_health *astra_service_get(struct astra_provider_budget *b, uint64_t service, uint64_t now) {
+    struct astra_service_health *oldest = &b->services[0];
+    for(unsigned i = 0; i < 256; ++i) {
+        struct astra_service_health *s = &b->services[i];
+        if(s->used && s->service == service) { s->seen = now; return s; }
+        if(!s->used || (oldest->used && s->seen < oldest->seen)) { oldest = s; }
+    }
+    *oldest = (struct astra_service_health){ .used = 1, .service = service, .seen = now };
+    return oldest;
+}
+static inline uint64_t astra_service_interval(const struct astra_service_health *s) {
+    return !s->failures ? 0 : s->failures < 5 ? 500ULL << (s->failures - 1) : 5000;
+}
+static inline uint64_t astra_service_delay(struct astra_provider_budget *b, uint64_t service, uint64_t now) {
+    struct astra_service_health *s = astra_service_get(b, service, now);
+    uint64_t due = s->next;
+    /* A promptly rejected service must not monopolize sparse probe credits
+     * while other active services renew their deliberately short-lived work.
+     * Leave one probe opportunity for fresh different-service demand. This
+     * never creates credit, sends a probe or permanently excludes a service. */
+    if(b->health_mode == 1 && s->failures && s->probe_used && s->sent_at) {
+        for(unsigned i = 0; i < 256; ++i) {
+            const struct astra_service_health *other = &b->services[i];
+            if(!other->used || other->service == service || now < other->seen || now - other->seen > 30000) { continue; }
+            uint64_t interval = b->health_probes < 5 ? 2000 : b->health_probes < 10 ? 5000 : 15000;
+            uint64_t fair = s->sent_at + 2 * interval;
+            if(fair > due) { due = fair; }
+            break;
+        }
+    }
+    return due > now ? due - now : 0;
+}
+static inline void astra_service_sent(struct astra_provider_budget *b, uint64_t service, uint64_t now) {
+    struct astra_service_health *s = astra_service_get(b, service, now);
+    s->next = now + astra_service_interval(s);
+    s->sent_at = now; s->probe_used = b->health_mode == 1;
+}
+static inline struct astra_service_health *astra_service_result(struct astra_provider_budget *b, uint64_t service, uint64_t now, int good) {
+    struct astra_service_health *s = astra_service_get(b, service, now);
+    if(!good) {
+        s->proof_since = s->proof_last = s->proof_good = 0;
+        if(s->failures < 5) { ++s->failures; }
+        /* Retry spacing starts at dispatch, not at a late failure reply.
+         * Do not stack a five-second retry hold after an eight-second wait. */
+        uint64_t due = (s->sent_at ? s->sent_at : now) + astra_service_interval(s);
+        s->next = due > now ? due : now;
+    } else {
+        s->failures = s->probe_used = 0; s->next = s->sent_at = 0;
+        if(s->proof_last && now >= s->proof_last && now - s->proof_last > 30000) { s->proof_since = s->proof_good = 0; }
+        if(!s->proof_good) { s->proof_since = now; }
+        if(s->proof_good < 65535) { ++s->proof_good; }
+        s->proof_last = now;
+    }
+    return s;
+}
 static inline int astra_provider_literal(const char **p, const char *literal) {
     size_t n = strlen(literal);
     if(strncmp(*p, literal, n)) { return 0; }
@@ -304,6 +367,9 @@ static inline void astra_health_tick(struct astra_provider_budget *b, uint64_t n
         b->health_mode = 1; b->health_probes = 0; b->health_next = now + 2000;
         b->health_ramp_good = b->health_ramp_since = 0; ++b->health_entries;
         b->health_window_since = b->health_window_good = b->health_window_bad = 0;
+        for(unsigned i = 0; i < 256; ++i) {
+            b->services[i].proof_since = b->services[i].proof_last = b->services[i].proof_good = 0;
+        }
         b->health_limited = b->health_dirty = 1;
     }
     if(b->health_dirty && now >= b->health_retry) { (void)astra_health_save(b, now); }
@@ -324,7 +390,8 @@ static inline void astra_health_sent(struct astra_provider_budget *b, uint64_t n
 }
 /* Exactly once per matched upstream reply, not per alias/cache result. 'good'
  * requires a nonzero valid CW AND a live caller within its original deadline. */
-static inline void astra_health_result(struct astra_provider_budget *b, uint64_t now, int good, int positive) {
+static inline void astra_health_result(struct astra_provider_budget *b, uint64_t now, int good, int positive, uint64_t service) {
+    struct astra_service_health *s = astra_service_result(b, service, now, good);
     if(!good) {
         if(positive) { ++b->health_late; } else { ++b->health_negative; }
         if(b->health_limited) { ++b->health_window_bad; }
@@ -350,15 +417,13 @@ static inline void astra_health_result(struct astra_provider_budget *b, uint64_t
         if(b->health_mode == 3 && b->health_ramp_good >= 8 && now - b->health_ramp_since >= 2000) {
             b->health_mode = 4; /* 12/s, NOT full rate after a brief good burst */
         }
-        /* One mostly-good thirty-second window establishes recovery. Sparse
-         * unsupported-service NOKs (<=5% of useful keys) need not hold an
-         * otherwise working account forever. Failed windows never jump to 20/s. */
-        if(b->health_mode == 4 && now - b->health_window_since >= 30000) {
-            if(b->health_window_good >= 16 && b->health_window_bad <= b->health_window_good / 20) {
-                b->health_mode = b->health_limited = 0; ++b->health_recoveries;
-                b->health_dirty = 1; (void)astra_health_save(b, now);
-            }
-            b->health_window_since = now; b->health_window_good = b->health_window_bad = 0;
+        /* Four useful replies for one service spanning >=30s, with no failure
+         * for that service and no >30s idle gap, establish sustained progress.
+         * Short all-service good bursts still cannot reopen full rate. An
+         * isolated failed service keeps its own backoff after account recovery. */
+        if(s->proof_good >= 4 && now >= s->proof_since && now - s->proof_since >= 30000) {
+            b->health_mode = b->health_limited = 0; ++b->health_recoveries;
+            b->health_dirty = 1; (void)astra_health_save(b, now);
         }
     }
 }

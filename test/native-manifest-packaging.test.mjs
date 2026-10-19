@@ -18,14 +18,14 @@ const expectedPatches = { ecm: digests[1], streamIO: digests[2], controlWords: d
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
 function verify(value, sourceDirectory) {
-  assert.equal(value.policyVersion, 10, 'Production packaging must require the optimized policy 10 decoder');
+  assert.equal(value.policyVersion, 11, 'Production packaging must require the optimized policy 11 decoder');
   assert.equal(value.sourceRevision, sourceRevision); assert.equal(value.binarySha256, hash(binary));
   assert.equal(value.patchSetSha256, hash(digests.join('\n') + '\n'), 'Patch-set digest must include all seven normal patches in application order');
   assert.deepEqual(value.patches, expectedPatches); assert.equal(value.buildTarget, 'ffdecsa');
   assert.equal(value.sourceDirectory, sourceDirectory); assert.notEqual(value.experimental, true);
 }
 
-test('actual Docker native manifest generator records policy 10 and the exact normal patch set', () => {
+test('actual Docker native manifest generator records policy 11 and the exact normal patch set', () => {
   const docker = readFileSync(new URL('Dockerfile', root), 'utf8');
   const programs = [...docker.matchAll(/node -e '([^']*astra-native-cas\.json[^']*)'/g)];
   assert.equal(programs.length, 1, 'Extract exactly the native CAS manifest generator, never a Docker RUN instruction');
@@ -48,7 +48,7 @@ test('actual Docker native manifest generator records policy 10 and the exact no
   verify(captured, '/usr/local/src/tsdecrypt');
 });
 
-test('actual native installer printf writes the same policy 10 manifest with normal safety provenance', () => {
+test('actual native installer printf writes the same policy 11 manifest with normal safety provenance', () => {
   const installer = readFileSync(new URL('install-cas.sh', root), 'utf8');
   const marker = 'manifest_stage="$tsdecrypt_license_stage/astra-native-cas.json"';
   const start = installer.indexOf("printf '", installer.indexOf(marker));

@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
-export const NATIVE_CAS_POLICY_VERSION = 10;
+export const NATIVE_CAS_POLICY_VERSION = 11;
 export const NATIVE_CAS_SOURCE_REVISION = 'f4876e84cf1866645f84b93f830af67193c85f69';
 const nativeVerification = new Map();
 
@@ -91,7 +91,7 @@ export class SoftcamBridge {
   start() {
     if (this.child || this.cancelStart || this.retryTimer) return;
     if (!this.connection) throw new Error(`Shared CAS connection for profile ${this.stream.cam.profile} is unavailable`);
-    if (!this.protectedBuild()) throw new Error('Install the verified native CAS policy v8 build with install-cas.sh before enabling CAS');
+    if (!this.protectedBuild()) throw new Error('Install the verified native CAS policy v11 build with install-cas.sh before enabling CAS');
     this.stopped = false; this.queueStart();
   }
 

@@ -41,5 +41,19 @@ int main(void) {
         assert(astra_ciphertext_finish(s,101)); assert(f.emitted==f.fed && s->stats.packets_dropped==0);
         astra_ciphertext_destroy(s); astra_ciphertext_probe_free(&f.probe); dvbcsa_key_free(f.encryptor);
     }
-    puts("PASS: real CSA late-key prefix recovery is byte-exact and wrong candidates remain withheld"); return 0;
+    for (unsigned int arrival=3000; arrival<=4999; arrival+=1999) {
+        struct fixture f={0}; f.probe=astra_ciphertext_probe_alloc(); f.encryptor=dvbcsa_key_alloc(); assert(f.probe && f.encryptor);
+        struct astra_ciphertext *s=astra_ciphertext_create(ASTRA_CT_MAX_BYTES,5000,decrypt,emit,&f); assert(s);
+        astra_ciphertext_context(s,1); astra_ciphertext_pid(s,256,0x1b);
+        assert(astra_ciphertext_word(s,1,0,words[0],0)); push(s,&f,0,1,0,0,0);
+        assert(f.emitted==1);
+        push(s,&f,1,0,1,1,10);
+        assert(astra_ciphertext_word(s,1,1,words[2],20));
+        push(s,&f,2,1,1,1,22); assert(astra_ciphertext_pump(s,arrival-1,0));
+        assert(f.emitted==1 && !s->stats.packets_dropped);
+        assert(astra_ciphertext_word(s,1,1,words[1],arrival)); assert(astra_ciphertext_pump(s,arrival,0));
+        assert(astra_ciphertext_finish(s,arrival+1)); assert(f.emitted==f.fed && !s->stats.packets_dropped);
+        astra_ciphertext_destroy(s); astra_ciphertext_probe_free(&f.probe); dvbcsa_key_free(f.encryptor);
+    }
+    puts("PASS: real CSA late-key prefix recovery is byte-exact through 4999 ms and wrong candidates remain withheld"); return 0;
 }

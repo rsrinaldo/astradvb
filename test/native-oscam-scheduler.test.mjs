@@ -38,8 +38,8 @@ test('normal installers include verified semantic policy while the reader remain
     assert.equal(content.includes('native-oscam-scheduler.c'), true);
     assert.equal(content.includes('semanticSchedulerSha256'), true);
   }
-  assert.match(readFileSync(join(root, 'install-cas.sh'), 'utf8'), /"policyVersion":4,"semanticPolicyVersion":4/);
-  assert.match(readFileSync(join(root, 'Dockerfile'), 'utf8'), /policyVersion:4,semanticPolicyVersion:4/);
+  assert.match(readFileSync(join(root, 'install-cas.sh'), 'utf8'), /"policyVersion":4,"semanticPolicyVersion":5/);
+  assert.match(readFileSync(join(root, 'Dockerfile'), 'utf8'), /policyVersion:4,semanticPolicyVersion:5/);
   assert.match(patch, /DEF_OPT_INT8\("astra_ecm_scheduler".*OFS\(astra_ecm_scheduler\),\s*0\)/);
   assert.match(patch, /reader->astra_ecm_scheduler == 1 && \(reader->typ != R_NEWCAMD \|\| cfg.max_pending > 256\)/);
   assert.match(patch, /if\(reader->client && reader->client->astra_scheduler\)/);
@@ -48,7 +48,7 @@ test('normal installers include verified semantic policy while the reader remain
   assert.match(patch, /Retained SENT slots can outlive REQUEST_ANSWERED/);
   assert.match(patch, /if\(ea->reader && ea->reader->client &&\n\+\s*astra_semantic_detach_parent/);
   assert.match(patch, /cl->ecmtask\[i\]\.parent = NULL/);
-  assert.match(patch, /ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 4/);
+  assert.match(patch, /ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 5/);
   assert.match(patch, /rdr->tcp_ito == -1 && rdr->tcp_connected == 0 && !cl->thread_active && time_diff >= 1/);
   assert.match(patch, /if\(guarded_reconnect \|\| time_diff > 60/);
   assert.match(patch, /if\(cl->ecmtask\[i\]\.idx == idx\)/);
@@ -59,8 +59,10 @@ test('normal installers include verified semantic policy while the reader remain
   assert.match(patch, /network_tcp_connection_close\(reader, "semantic ECM response deadline"\)/);
   assert.match(patch, /if\(!cl->kill\) \{ add_job\(cl, ACTION_READER_IDLE, NULL, 0\); \}/);
   assert.match(patch, /s->next_report_ms = now \+ 5000/);
-  assert.match(patch, /Reason 2 \(expired/);
-  assert.match(patch, /interval_ms \* 4/);
+  assert.match(patch, /ASTRA_SEMANTIC_MAX_RETIRED/);
+  assert.match(patch, /astra_semantic_retire_due/);
+  assert.match(patch, /astra_semantic_discard_retired/);
+  assert.doesNotMatch(patch, /interval_ms \* 4/);
   assert.match(patch, /now \+ 250/);
   assert.match(patch, /if\(!data && astra_semantic_remote_priority\(reader\)/);
   assert.match(patch, /\} \/\/ switch\n\+\s*astra_semantic_tick\(reader\)/);

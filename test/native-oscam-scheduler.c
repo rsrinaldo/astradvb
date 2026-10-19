@@ -340,7 +340,7 @@ static void partial_drop_pressure_retirement(void)
 	assert(astra_semantic_recovery_decision(&q, 15990, 8000, 0) == 1);
 }
 
-static void absolute_orphan_age_and_ready_reply_boundary(void)
+static void isolated_orphan_and_ready_reply_boundary(void)
 {
 	struct astra_semantic_slot slots[8];
 	struct astra_semantic_core q;
@@ -355,12 +355,26 @@ static void absolute_orphan_age_and_ready_reply_boundary(void)
 		astra_semantic_dispatch(&q, (size_t)n, now, id);
 		assert(astra_semantic_note_reply(&q, (size_t)n, id, now + 100));
 		astra_semantic_release(&q, (size_t)n);
+		int retire;
+		while((retire = astra_semantic_retire_due(&q, now + 101, 8000)) >= 0) { astra_semantic_retire(&q, (size_t)retire); }
 		assert(astra_semantic_recovery_decision(&q, now + 101, 8000, 0) == 0);
 	}
-	assert(q.sent == 1 && q.matched == 31);
-	assert(astra_semantic_recovery_due(&q, 8000) == 32000);
-	assert(astra_semantic_recovery_wait(&q, 31999, 8000, 3000) == 1);
-	assert(astra_semantic_recovery_decision(&q, 32000, 8000, 1) == 3);
+	assert(q.sent == 0 && q.matched == 31 && q.retired_count == 1 && q.retired == 1);
+	assert(astra_semantic_recovery_due(&q, 8000) == UINT64_MAX);
+	assert(astra_semantic_recovery_decision(&q, 32000, 8000, 1) == 0);
+	q.last_id = 2; assert(astra_semantic_next_id(&q, 0) == 4);
+	assert(!astra_semantic_retired_reply(&q, 0, 32001));
+	assert(astra_semantic_retired_reply(&q, 3, 32001));
+	assert(q.retired_count == 0 && q.retired_replies == 1);
+	assert(!astra_semantic_retired_reply(&q, 3, 32002));
+	assert(astra_semantic_next_id(&q, 0) == 3);
+	int wrap = astra_semantic_enqueue(&q, 32003, 40003, 1, 0);
+	astra_semantic_dispatch(&q, (size_t)wrap, 32003, 1);
+	astra_semantic_retire(&q, (size_t)wrap);
+	q.last_id = 65535;
+	assert(astra_semantic_next_id(&q, 0) == 2);
+	assert(astra_semantic_retired_reply(&q, 1, 32004));
+	assert(astra_semantic_next_id(&q, 0) == 1);
 	/* A valid ready reply at a soft boundary gets a bounded parsing turn. */
 	astra_semantic_init(&q, slots, 8);
 	missing = astra_semantic_enqueue(&q, 0, 8000, 1, 0);
@@ -373,7 +387,7 @@ static void absolute_orphan_age_and_ready_reply_boundary(void)
 	astra_semantic_release(&q, (size_t)missing);
 	assert(astra_semantic_recovery_decision(&q, 8002, 8000, 1) == 0);
 	/* Continuous readable junk/ID0 is not reply progress and cannot extend
-	 * soft grace repeatedly, nor postpone the absolute orphan-age boundary. */
+	 * soft grace repeatedly. */
 	astra_semantic_init(&q, slots, 8);
 	missing = astra_semantic_enqueue(&q, 0, 8000, 1, 0);
 	astra_semantic_dispatch(&q, (size_t)missing, 0, 3);
@@ -381,10 +395,27 @@ static void absolute_orphan_age_and_ready_reply_boundary(void)
 	assert(!astra_semantic_note_reply(&q, (size_t)missing, 0, 8100));
 	assert(astra_semantic_recovery_decision(&q, 8249, 8000, 1) == 0);
 	assert(astra_semantic_recovery_decision(&q, 8250, 8000, 1) == 1);
-	q.soft_defer_until_ms = 0;
-	assert(astra_semantic_recovery_decision(&q, 31999, 8000, 1) == 0);
-	assert(astra_semantic_recovery_wait(&q, 31999, 8000, 3000) == 1);
-	assert(astra_semantic_recovery_decision(&q, 32000, 8000, 1) == 3);
+	assert(astra_semantic_retire_due(&q, 9000, 8000) == -1);
+	/* Fixed storage can represent every wire ID. Only real exhaustion is a
+	 * reason-3 close; no timed individual orphan threshold remains. */
+	astra_semantic_init(&q, slots, 8);
+	for(unsigned retired_id = 1; retired_id <= ASTRA_SEMANTIC_MAX_RETIRED; ++retired_id) {
+		int n = astra_semantic_enqueue(&q, 1, 9000, 1, 0);
+		astra_semantic_dispatch(&q, (size_t)n, 1, (uint16_t)retired_id);
+		astra_semantic_retire(&q, (size_t)n);
+	}
+	assert(q.retired_count == ASTRA_SEMANTIC_MAX_RETIRED);
+	assert(astra_semantic_retire_due(&q, 10000, 8000) == -1);
+	assert(astra_semantic_recovery_decision(&q, 2, 8000, 1) == 3);
+	astra_semantic_transport_closed(&q);
+	assert(q.retired_count == 0);
+	for(unsigned i = 0; i < 1024; ++i) { assert(!q.retired_ids[i]); }
+	/* Per-service pacing must not create a zero-delay polling loop. */
+	int delayed = astra_semantic_enqueue(&q, 1000, 9000, 1, 0);
+	q.slots[delayed].not_before_ms = 6000;
+	q.next_send_ms = 0;
+	assert(astra_semantic_pick(&q, 1000, 1) == -1);
+	assert(astra_semantic_wait(&q, 1000, 1, 10000) == 5000);
 }
 
 static void long_running_request_ids(void)
@@ -428,7 +459,7 @@ int main(int argc, char **argv)
 	continuing_replies_preserve_healthy_transport();
 	original_deadline_and_progress_boundaries();
 	partial_drop_pressure_retirement();
-	absolute_orphan_age_and_ready_reply_boundary();
+	isolated_orphan_and_ready_reply_boundary();
 	long_running_request_ids();
 	puts("PASS: semantic pacing, bounded silence/orphan recovery, progress-safe backlog, dispatch response interval, ready-reply boundary and IDs");
 	return 0;

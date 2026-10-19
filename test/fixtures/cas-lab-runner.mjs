@@ -15,7 +15,7 @@ import { buildOscamConfiguration, parseSemanticStatus } from '../../src/cas-prox
 import { MPEGTSAnalyzer, TransportStreamFramer } from '../../src/mpegts.mjs';
 import { protectedOscamBuild } from '../../src/oscam-integrity.mjs';
 import { ProviderGuard } from '../../src/provider-guard.mjs';
-import { DirectCASController, parseDirectStatus, parseHealthStatus, parseTraceStatus } from '../../src/direct-cas-controller.mjs';
+import { DirectCASController, parseDirectStatus, parseHealthStatus, parseTraceStatus, parseIsolationStatus } from '../../src/direct-cas-controller.mjs';
 import { CASIngress } from '../../src/cas-ingress.mjs';
 import { openProviderBudgetStore } from '../../src/provider-budget.mjs';
 import { encryptSecret } from '../../src/secrets.mjs';
@@ -97,7 +97,7 @@ export function parseLabSemanticStatus(line) {
   return value;
 }
 
-export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fragmentDelayMs = 0, transportMode, pendingSlots = 128, guardQueueMs = 1500, semanticScheduler = true, directTransport = false, localIngress = directTransport } = {}) {
+export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fragmentDelayMs = 0, transportMode, pendingSlots = 128, guardQueueMs = 1500, semanticScheduler = true, directTransport = false, localIngress = directTransport, initialHealthLimited = false } = {}) {
   assert.equal(typeof semanticScheduler, 'boolean', 'Isolated semanticScheduler must be boolean');
   const parameters = labCapacityOptions({ pendingSlots, guardQueueMs });
   const binaries = labRequirements();
@@ -106,7 +106,7 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
     assert.ok(process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, 'Semantic dispatch requires its explicit lab manifest');
     const manifest = JSON.parse(await readFile(process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, 'utf8'));
     assert.equal(manifest.policyVersion, 4, 'Semantic dispatch requires the policy4 reader');
-    assert.equal(manifest.semanticPolicyVersion, 4);
+    assert.equal(manifest.semanticPolicyVersion, 5);
     assert.notEqual(manifest.experimental, true, 'Release tests must use the normal protected reader');
     assert.match(manifest.semanticSchedulerSha256 || '', /^[a-f0-9]{64}$/, 'Semantic dispatch requires its normal patch digest');
   }
@@ -126,7 +126,10 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
     const c = provider.credentials;
     const profile = { id: 'fixture', name: 'Synthetic only', caid: c.caid, lineEncrypted: encryptSecret(`${c.host} ${c.port} ${c.username} ${c.password} ${c.desKey}`) };
     const mode = directTransport ? { directAccounts: new Map([['fixture', 'a'.repeat(64)]]), budgetDirectory: join(directory, 'budgets') } : { guardedPorts: new Map([['fixture', guardPort]]) };
-    if (directTransport) await mkdir(join(directory, 'budgets'), { mode: 0o700 });
+    if (directTransport) {
+      await mkdir(join(directory, 'budgets'), { mode: 0o700 });
+      if (initialHealthLimited) await writeFile(join(directory,'budgets','a'.repeat(64)+'.health.json'),'{"version":1,"limited":1}\n',{mode:0o600});
+    }
     configuration = labReaderConfiguration(buildOscamConfiguration([profile], { firstPort, ...mode }), semanticScheduler);
   } finally {
     if (previousSecret === undefined) delete process.env.ASTRA_SECRET_KEY; else process.env.ASTRA_SECRET_KEY = previousSecret;
@@ -152,6 +155,7 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
         if (directTransport) { const status = parseDirectStatus(line); if (status) guard.update(status); }
         if (directTransport) { const status = parseHealthStatus(line); if (status) guard.updateHealth(status); }
         if (directTransport) { const status = parseTraceStatus(line); if (status) guard.updateTrace(status); }
+        if (directTransport) { const status = parseIsolationStatus(line); if (status) guard.updateIsolation(status); }
         const status = parseLabSemanticStatus(line);
         if (status) {
           const previous = semanticStatus.latest;
@@ -498,15 +502,15 @@ export async function runSemanticPartialRecovery(lab) {
       });
       request.catch(() => {}); requests.push(request);
     }
-    await waitFor(() => { const value = lab.snapshot(); return value.guard.connections >= 2 && value.guard.readerReady; }, 35000);
+    await Promise.all(requests);
     const retiredElapsedMs = performance.now() - began;
     const initial = await Promise.all(requests);
     assert.ok(initial.slice(0, 31).every(reply => !reply.ok), 'Permanently missing words cannot become fabricated successful replies');
     const freshClient = await lab.client(); clients.push(freshClient);
     correctSyntheticReply(await freshClient.requestECM({ channelId: 90, epoch: 5690 }), 90, 5690, lab.transportMode);
-    const after = semanticEvidence(lab, { allowResets: true });
-    assert.equal(after.guard.connections, 2); assert.equal(after.guard.connectionResets, 1);
-    assert.ok(after.semanticScheduler.latest.resets >= 1 && after.semanticScheduler.latest.abandoned >= 31);
+    const after = semanticEvidence(lab);
+    assert.equal(after.guard.connections, 1); assert.equal(after.guard.connectionResets, 0);
+    assert.equal(after.semanticScheduler.latest.resets, 0);
     assert.ok(after.provider.semantic.peakInFlight <= 32);
     assert.equal(after.provider.dropped, 31);
     assert.ok(initial.slice(31).filter(reply => reply.ok).length >= 5, 'Other valid replies must actually keep progressing before partial-generation retirement');
@@ -535,18 +539,18 @@ export async function runSemanticOrphanAge(lab) {
       request.catch(() => {}); pending.push(request);
     };
     submit(); timer = setInterval(submit, 1000);
-    await waitFor(() => { const value = lab.snapshot(); return value.guard.connections >= 2 && value.guard.readerReady; }, 35000);
+    await sleep(35000);
     clearInterval(timer); timer = null;
     const retiredElapsedMs = performance.now() - began;
-    assert.ok(retiredElapsedMs >= 30000 && retiredElapsedMs <= 35000, 'An isolated orphan with healthy progress must retain its ID until the bounded32-second absolute generation lifetime, not reset at8seconds');
+    assert.ok(retiredElapsedMs >= 35000, 'Exercise the former 32-second shared-close boundary');
     assert.equal((await original).ok, false); await Promise.all(pending);
     const freshClient = await lab.client();
     try { correctSyntheticReply(await freshClient.requestECM({ channelId: 1, epoch: 5790 }), 1, 5790, lab.transportMode); }
     finally { freshClient.close(); }
-    const after = semanticEvidence(lab, { allowResets: true });
-    assert.equal(after.guard.connections, 2); assert.equal(after.guard.connectionResets, 1);
+    const after = semanticEvidence(lab);
+    assert.equal(after.guard.connections, 1); assert.equal(after.guard.connectionResets, 0);
     assert.ok(correct >= 25, 'Real healthy progress must continue long enough to exercise the absolute orphan-age boundary');
-    assert.ok(after.semanticScheduler.latest.resets >= 1 && after.semanticScheduler.latest.abandoned >= 1);
+    assert.equal(after.semanticScheduler.latest.resets, 0);
     return { scenario: 'semantic-absolute-orphan-age', missingRequests: 1, healthyCorrectProgressReplies: correct,
       retiredElapsedMs: Math.round(retiredElapsedMs), freshCorrectReplies: 1, automaticClientRetries: 0, ...after };
   } finally { clearInterval(timer); missing.close(); progress.close(); }

@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
     for(unsigned i=0;i<2000;i++) {
         now+=100;
         assert(astra_health_allowed(&b,now)); astra_health_sent(&b,now);
-        astra_health_result(&b,now,i%10==0,i%10==0);
+        astra_health_result(&b,now,i%10==0,i%10==0,1);
     }
     assert(b.health_mode==0 && b.health_entries==0);
     /* Idle time creates no failures and no stored catch-up send credit. */
@@ -133,7 +133,7 @@ int main(int argc, char **argv) {
     uint64_t began=now;
     for(unsigned i=0;i<32;i++) {
         now+=100; assert(astra_health_allowed(&b,now)); astra_health_sent(&b,now);
-        astra_health_result(&b,now,0,0);
+        astra_health_result(&b,now,0,0,1);
     }
     astra_health_tick(&b,began+14999); assert(b.health_mode==0);
     now=began+15200; astra_health_tick(&b,now);
@@ -147,7 +147,7 @@ int main(int argc, char **argv) {
         if(!astra_health_allowed(&b,t)) { continue; }
         if(last) { assert(t-last>=2000); }
         last=t; ++probes; astra_health_sent(&b,t);
-        astra_health_result(&b,t,0,probes%2);
+        astra_health_result(&b,t,0,probes%2,1);
     }
     assert(probes<5780 && b.health_mode==1 && b.health_recoveries==0);
     assert(b.writes==1); /* no per-key disk writes */
@@ -157,19 +157,19 @@ int main(int argc, char **argv) {
     astra_health_open(&b,now);
     assert(b.health_mode==1 && !astra_health_allowed(&b,now+14999));
     assert(astra_health_allowed(&b,now+15000));
-    now+=15000; astra_health_sent(&b,now); astra_health_result(&b,now,1,1);
+    now+=15000; astra_health_sent(&b,now); astra_health_result(&b,now,1,1,1);
     assert(b.health_mode==2 && !astra_health_allowed(&b,now+250));
     /* Restart in tentative recovery must remain limited. */
     astra_provider_close(&b);
     assert(astra_provider_open(&b,health_directory,id,boot,now,wall+now-100000));
     astra_health_open(&b,now); assert(b.health_mode==1);
     now+=15000; assert(astra_health_allowed(&b,now));
-    astra_health_sent(&b,now); astra_health_result(&b,now,1,1);
+    astra_health_sent(&b,now); astra_health_result(&b,now,1,1,1);
     uint64_t recovery=now;
     for(unsigned i=1;i<=130;i++) {
         now=recovery+i*251;
         assert(astra_health_allowed(&b,now)); astra_health_sent(&b,now);
-        astra_health_result(&b,now,1,1);
+        astra_health_result(&b,now,1,1,1);
         if(now-recovery<30000) { assert(b.health_mode!=0); }
     }
     assert(b.health_mode==0 && b.health_limited==0 && b.health_recoveries==1 && b.writes==1);
@@ -188,26 +188,63 @@ int main(int argc, char **argv) {
     astra_health_open(&b,now); assert(b.health_mode==1);
     astra_provider_close(&b); remove_files(health_directory);
 
-    /* Brief good bursts, like the live incident, must never restore full rate.
-     * A <=5% unsupported-service tail may still complete a healthy window. */
+    /* Brief same-service good bursts cannot restore full rate. A different
+     * repeatedly failing service must not hold healthy service recovery down. */
     char mixed_directory[]="/tmp/astra-native-mixed-health-XXXXXX";
     assert(mkdtemp(mixed_directory)); assert(chmod(mixed_directory,0700)==0);
     now=100000;assert(astra_provider_open(&b,mixed_directory,id,boot,now,wall));
     astra_health_open(&b,now);b.health_mode=b.health_limited=1;
-    astra_health_result(&b,now,1,1);
+    astra_health_result(&b,now,1,1,1);
     for(unsigned i=1;i<=130;i++) {
         now+=251;assert(astra_health_allowed(&b,now));astra_health_sent(&b,now);
-        astra_health_result(&b,now,1,1);
-        if(i%3==0)astra_health_result(&b,now,0,0);
+        astra_health_result(&b,now,1,1,1);
+        if(i%3==0)astra_health_result(&b,now,0,0,1);
     }
     assert(b.health_mode==4 && b.health_limited && !b.health_recoveries);
     for(unsigned i=1;i<=140;i++) {
         now+=251;assert(astra_health_allowed(&b,now));astra_health_sent(&b,now);
-        astra_health_result(&b,now,1,1);
-        if(i%40==0)astra_health_result(&b,now,0,0);
+        astra_health_result(&b,now,1,1,1);
+        if(i%3==0)astra_health_result(&b,now,0,0,2);
     }
     assert(b.health_mode==0 && !b.health_limited && b.health_recoveries==1);
+    assert(astra_service_delay(&b,2,now)>0);
+    assert(astra_service_delay(&b,1,now)==0);
     astra_provider_close(&b);remove_files(mixed_directory);
+    char sparse_directory[]="/tmp/astra-native-sparse-health-XXXXXX";
+    assert(mkdtemp(sparse_directory));assert(chmod(sparse_directory,0700)==0);
+    now=100000;assert(astra_provider_open(&b,sparse_directory,id,boot,now,wall));
+    b.health_mode=b.health_limited=1;
+    for(unsigned i=0;i<4;i++) { astra_health_result(&b,now+i*10000,1,1,1); }
+    assert(!b.health_limited && b.health_recoveries==1);
+    /* One good reply followed by a long idle gap does not establish proof. */
+    b.health_mode=b.health_limited=1;memset(b.services,0,sizeof b.services);
+    for(unsigned i=0;i<20;i++) { astra_health_result(&b,now+i*31000,1,1,1); }
+    assert(b.health_limited && b.health_recoveries==1);
+    /* Failure backoff is bounded, never permanent, and a useful key clears it. */
+    now+=1000000;
+    for(unsigned i=0;i<10;i++) { astra_service_result(&b,2,now,0); }
+    assert(astra_service_delay(&b,2,now)==5000);
+    assert(astra_service_delay(&b,2,now+5000)==0);
+    astra_service_sent(&b,2,now+5000);
+    assert(astra_service_delay(&b,2,now+5000)==5000);
+    astra_service_result(&b,2,now+5100,1);
+    assert(astra_service_delay(&b,2,now+5100)==0);
+    for(unsigned i=0;i<10000;i++) { astra_service_result(&b,i,now+i,0); }
+    assert(sizeof b.services <= 16384);
+    memset(b.services,0,sizeof b.services);b.health_mode=b.health_limited=1;b.health_probes=10;
+    astra_service_sent(&b,1,now);astra_service_result(&b,1,now+20,0);
+    assert(astra_service_delay(&b,1,now+15000)==0 && "single-service demand must retain ordinary probes");
+    (void)astra_service_get(&b,2,now+15000);
+    assert(astra_service_delay(&b,1,now+15000)==15000);
+    assert(astra_service_delay(&b,2,now+15000)==0 && "fresh different-service work gets the open probe opportunity");
+    assert(astra_service_delay(&b,1,now+30000)==0 && "failed services are never permanently excluded");
+    astra_service_result(&b,1,now+30001,1);
+    assert(astra_service_delay(&b,1,now+30001)==0);
+    memset(b.services,0,sizeof b.services);b.health_mode=b.health_limited=0;
+    astra_service_sent(&b,1,now);
+    astra_service_result(&b,1,now+8000,0);
+    assert(astra_service_delay(&b,1,now+8000)==0 && "retry delay must not stack after a full key timeout");
+    astra_provider_close(&b);remove_files(sparse_directory);
     struct astra_ecm_trace trace={0};unsigned char hash[16]={1}, other[16]={2};
     astra_trace_send(&trace,1000,1,hash,1500);astra_trace_reply(&trace,1,hash,5000,0,0);
     astra_trace_send(&trace,2000,1,hash,0);astra_trace_reply(&trace,1,hash,250,1,1);
