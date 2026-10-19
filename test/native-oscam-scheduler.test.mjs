@@ -38,8 +38,8 @@ test('normal installers include verified semantic policy while the reader remain
     assert.equal(content.includes('native-oscam-scheduler.c'), true);
     assert.equal(content.includes('semanticSchedulerSha256'), true);
   }
-  assert.match(readFileSync(join(root, 'install-cas.sh'), 'utf8'), /"policyVersion":4,"semanticPolicyVersion":5/);
-  assert.match(readFileSync(join(root, 'Dockerfile'), 'utf8'), /policyVersion:4,semanticPolicyVersion:5/);
+  assert.match(readFileSync(join(root, 'install-cas.sh'), 'utf8'), /"policyVersion":4,"semanticPolicyVersion":6/);
+  assert.match(readFileSync(join(root, 'Dockerfile'), 'utf8'), /policyVersion:4,semanticPolicyVersion:6/);
   assert.match(patch, /DEF_OPT_INT8\("astra_ecm_scheduler".*OFS\(astra_ecm_scheduler\),\s*0\)/);
   assert.match(patch, /reader->astra_ecm_scheduler == 1 && \(reader->typ != R_NEWCAMD \|\| cfg.max_pending > 256\)/);
   assert.match(patch, /if\(reader->client && reader->client->astra_scheduler\)/);
@@ -48,7 +48,12 @@ test('normal installers include verified semantic policy while the reader remain
   assert.match(patch, /Retained SENT slots can outlive REQUEST_ANSWERED/);
   assert.match(patch, /if\(ea->reader && ea->reader->client &&\n\+\s*astra_semantic_detach_parent/);
   assert.match(patch, /cl->ecmtask\[i\]\.parent = NULL/);
-  assert.match(patch, /ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 5/);
+  assert.match(patch, /ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 6/);
+  assert.match(patch, /#define ASTRA_SEMANTIC_RESPONSE_WINDOW_MS UINT64_C\(8000\)/);
+  for (const operation of ['retire_due', 'recovery_decision', 'recovery_wait', 'recovery_due']) {
+    assert.match(patch, new RegExp(`astra_semantic_${operation}\\(&s->core, [^\\n]*ASTRA_SEMANTIC_RESPONSE_WINDOW_MS`));
+    assert.doesNotMatch(patch, new RegExp(`astra_semantic_${operation}\\(&s->core, [^\\n]*cfg\\.ctimeout`));
+  }
   assert.match(patch, /rdr->tcp_ito == -1 && rdr->tcp_connected == 0 && !cl->thread_active && time_diff >= 1/);
   assert.match(patch, /if\(guarded_reconnect \|\| time_diff > 60/);
   assert.match(patch, /if\(cl->ecmtask\[i\]\.idx == idx\)/);

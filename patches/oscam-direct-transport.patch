@@ -138,7 +138,7 @@ index 402137a8..92f4c8ad 100644
  	DEF_OPT_FUNC("device"                         , 0,                                    device_fn),
  	DEF_OPT_UINT8("ipv4force"                     , OFS(ipv4force),                       0),
 diff --git a/oscam-reader.c b/oscam-reader.c
-index 51275138..e2a33689 100644
+index c055878f..3c94927a 100644
 --- a/oscam-reader.c
 +++ b/oscam-reader.c
 @@ -20,6 +20,7 @@
@@ -355,7 +355,7 @@ index 51275138..e2a33689 100644
  	int n;
 @@ -233,6 +367,7 @@ void astra_semantic_tick(struct s_reader *reader)
  	}
- 	while((n = astra_semantic_retire_due(&s->core, now, (uint64_t)cfg.ctimeout)) >= 0)
+ 	while((n = astra_semantic_retire_due(&s->core, now, ASTRA_SEMANTIC_RESPONSE_WINDOW_MS)) >= 0)
  	{
 +		if(reader->astra_direct == 1) { astra_service_result(&s->provider, s->core.slots[n].service, astra_direct_uptime(), 0); }
  		ECM_REQUEST *ecm = &cl->ecmtask[n];
@@ -434,7 +434,7 @@ index 51275138..e2a33689 100644
 +		if(due > uptime && now + due - uptime > polling.next_send_ms) { polling.next_send_ms = now + due - uptime; }
 +	}
 +	int wait = astra_semantic_wait(&polling, now, reader->tcp_connected == 2, normal_ms);
- 	if(reader->tcp_connected == 2) { wait = astra_semantic_recovery_wait(&s->core, now, (uint64_t)cfg.ctimeout, wait); }
+ 	if(reader->tcp_connected == 2) { wait = astra_semantic_recovery_wait(&s->core, now, ASTRA_SEMANTIC_RESPONSE_WINDOW_MS, wait); }
  	pthread_mutex_unlock(&s->lock);
  	return wait;
 @@ -1297,6 +1483,7 @@ void network_tcp_connection_close(struct s_reader *reader, char *reason)

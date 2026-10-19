@@ -1,9 +1,9 @@
 diff --git a/astra-semantic-scheduler.h b/astra-semantic-scheduler.h
 new file mode 100644
-index 00000000..14538972
+index 00000000..de71c087
 --- /dev/null
 +++ b/astra-semantic-scheduler.h
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,271 @@
 +#ifndef ASTRA_SEMANTIC_SCHEDULER_H
 +#define ASTRA_SEMANTIC_SCHEDULER_H
 +
@@ -13,7 +13,11 @@ index 00000000..14538972
 + * deadline plus absence of matched complete ECM reply progress permits reset. */
 +#include <stdint.h>
 +#include <stddef.h>
-+#define ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 5
++#define ASTRA_OSCAM_SEMANTIC_POLICY_VERSION 6
++/* Transport progress is independent of an individual caller's deadline.
++ * Retain unanswered IDs and the full response/silence budget after a shorter
++ * client expires; never turn a request timeout into a shared five-second reset. */
++#define ASTRA_SEMANTIC_RESPONSE_WINDOW_MS UINT64_C(8000)
 +#define ASTRA_SEMANTIC_MAX_RETIRED (65535u - 32u)
 +
 +enum astra_semantic_state { ASTRA_EMPTY, ASTRA_QUEUED, ASTRA_SENT, ASTRA_ALIAS };
@@ -345,7 +349,7 @@ index 6b9c6c52..65309ca9 100644
  		{
  			// we found a outstanding reader, clean it:
 diff --git a/oscam-reader.c b/oscam-reader.c
-index ee100648..51275138 100644
+index ee100648..c055878f 100644
 --- a/oscam-reader.c
 +++ b/oscam-reader.c
 @@ -1,6 +1,7 @@
@@ -572,7 +576,7 @@ index ee100648..51275138 100644
 +		}
 +		if(!leader) { s->core.slots[i].state = ASTRA_QUEUED; }
 +	}
-+	while((n = astra_semantic_retire_due(&s->core, now, (uint64_t)cfg.ctimeout)) >= 0)
++	while((n = astra_semantic_retire_due(&s->core, now, ASTRA_SEMANTIC_RESPONSE_WINDOW_MS)) >= 0)
 +	{
 +		ECM_REQUEST *ecm = &cl->ecmtask[n];
 +		if(ecm->parent) { write_ecm_answer(reader, ecm, E_TIMEOUT, 0, NULL, NULL, 0, NULL); }
@@ -583,7 +587,7 @@ index ee100648..51275138 100644
 +	/* Ready replies have priority over soft retirement as well as dispatch. */
 +	struct pollfd fd = { .fd = cl->pfd, .events = POLLIN | POLLPRI };
 +	int readable = cl->pfd > 0 && poll(&fd, 1, 0) > 0;
-+	int reset_reason = reader->tcp_connected == 2 ? astra_semantic_recovery_decision(&s->core, now, (uint64_t)cfg.ctimeout, readable) : 0;
++	int reset_reason = reader->tcp_connected == 2 ? astra_semantic_recovery_decision(&s->core, now, ASTRA_SEMANTIC_RESPONSE_WINDOW_MS, readable) : 0;
 +	if(reset_reason)
 +	{
 +		s->core.resets++;
@@ -630,7 +634,7 @@ index ee100648..51275138 100644
 +	pthread_mutex_lock(&s->lock);
 +	uint64_t now = astra_semantic_now();
 +	int wait = astra_semantic_wait(&s->core, now, reader->tcp_connected == 2, normal_ms);
-+	if(reader->tcp_connected == 2) { wait = astra_semantic_recovery_wait(&s->core, now, (uint64_t)cfg.ctimeout, wait); }
++	if(reader->tcp_connected == 2) { wait = astra_semantic_recovery_wait(&s->core, now, ASTRA_SEMANTIC_RESPONSE_WINDOW_MS, wait); }
 +	pthread_mutex_unlock(&s->lock);
 +	return wait;
 +}
@@ -640,7 +644,7 @@ index ee100648..51275138 100644
 +	if(!reader || !reader->client || !reader->client->astra_scheduler || reader->tcp_connected != 2) { return 0; }
 +	struct astra_semantic_scheduler *s = reader->client->astra_scheduler;
 +	pthread_mutex_lock(&s->lock);
-+	uint64_t due = astra_semantic_recovery_due(&s->core, (uint64_t)cfg.ctimeout);
++	uint64_t due = astra_semantic_recovery_due(&s->core, ASTRA_SEMANTIC_RESPONSE_WINDOW_MS);
 +	int priority = due != UINT64_MAX && due <= astra_semantic_now();
 +	pthread_mutex_unlock(&s->lock);
 +	return priority;

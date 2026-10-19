@@ -437,6 +437,32 @@ static void long_running_request_ids(void)
 	assert(q.dispatched == 140000 && q.matched == 140000 && q.sent == 0);
 }
 
+static void five_second_callers_keep_eight_second_transport(void)
+{
+	struct astra_semantic_slot slots[8];
+	struct astra_semantic_core q;
+	const uint64_t transport = ASTRA_SEMANTIC_RESPONSE_WINDOW_MS;
+	assert(transport == 8000);
+	astra_semantic_init(&q, slots, 8);
+	assert(astra_semantic_enqueue(&q, 0, 5000, 10, 0) == 0);
+	astra_semantic_dispatch(&q, 0, 0, 3);
+	assert(astra_semantic_enqueue(&q, 0, 5000, 20, 0) == 1);
+	expire(&q, 5000);
+	assert(q.sent == 1 && slots[0].state == ASTRA_SENT && slots[1].state == ASTRA_EMPTY);
+	assert(astra_semantic_recovery_due(&q, transport) == 8000);
+	assert(astra_semantic_wait(&q, 5000, 1, 3000) == 3000 && "expired SENT callers cannot create a zero-delay poll loop");
+	assert(astra_semantic_recovery_wait(&q, 5000, transport, 3000) == 3000);
+	assert(astra_semantic_recovery_decision(&q, 5000, transport, 0) == 0);
+	assert(astra_semantic_recovery_decision(&q, 7999, transport, 0) == 0);
+	assert(astra_semantic_recovery_decision(&q, 8000, transport, 0) == 1);
+	assert(astra_semantic_next_id(&q, 2) == 4 && "expired callers must not release an unanswered wire ID");
+	/* A framed reply at 6s is transport progress, not a new caller deadline. */
+	assert(astra_semantic_note_reply(&q, 0, 3, 6000));
+	assert(slots[0].deadline_ms == 5000);
+	astra_semantic_release(&q, 0);
+	assert(q.sent == 0 && astra_semantic_recovery_due(&q, transport) == UINT64_MAX);
+}
+
 int main(int argc, char **argv)
 {
 	if(argc == 2 && !strcmp(argv[1], "--dispatch-deadline"))
@@ -452,6 +478,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	pacing_and_latency();
+	five_second_callers_keep_eight_second_transport();
 	all_dropped_backpressure();
 	fairness_aliases_deadlines();
 	no_catchup_wrap_and_transport_close();

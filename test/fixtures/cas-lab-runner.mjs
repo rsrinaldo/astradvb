@@ -85,10 +85,12 @@ export function labNativeArgs(stream, profile, connection, nativeBufferMs = 0) {
   return tsdecryptArgs(stream, profile, connection, nativeBufferMs);
 }
 
-export function labReaderConfiguration(configuration, semanticScheduler = true) {
+export function labReaderConfiguration(configuration, semanticScheduler = true, callerTimeoutMs = 8000) {
   assert.equal(typeof semanticScheduler, 'boolean', 'Isolated semanticScheduler must be boolean');
+  assert.ok(callerTimeoutMs === 5000 || callerTimeoutMs === 8000, 'Isolated caller timeout must be 5000 or 8000');
+  const conf = configuration.conf.replace(/^clienttimeout\s*=.*$/m, `clienttimeout = ${callerTimeoutMs}`);
   const server = configuration.server.replace(/^astra_ecm_scheduler\s*=.*\n?/gm, '');
-  return { ...configuration, server: server + `\nastra_ecm_scheduler = ${semanticScheduler ? 1 : 0}\n` };
+  return { ...configuration, conf, server: server + `\nastra_ecm_scheduler = ${semanticScheduler ? 1 : 0}\n` };
 }
 
 export function parseLabSemanticStatus(line) {
@@ -97,8 +99,9 @@ export function parseLabSemanticStatus(line) {
   return value;
 }
 
-export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fragmentDelayMs = 0, transportMode, pendingSlots = 128, guardQueueMs = 1500, semanticScheduler = true, directTransport = false, localIngress = directTransport, initialHealthLimited = false } = {}) {
+export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fragmentDelayMs = 0, transportMode, pendingSlots = 128, guardQueueMs = 1500, semanticScheduler = true, directTransport = false, localIngress = directTransport, initialHealthLimited = false, callerTimeoutMs = 8000 } = {}) {
   assert.equal(typeof semanticScheduler, 'boolean', 'Isolated semanticScheduler must be boolean');
+  assert.ok(callerTimeoutMs === 5000 || callerTimeoutMs === 8000, 'Isolated caller timeout must be 5000 or 8000');
   const parameters = labCapacityOptions({ pendingSlots, guardQueueMs });
   const binaries = labRequirements();
   if (directTransport) assert.ok(protectedOscamBuild(binaries.oscam, process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, { direct: true }), 'Direct lab requires its verified native policy');
@@ -106,7 +109,7 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
     assert.ok(process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, 'Semantic dispatch requires its explicit lab manifest');
     const manifest = JSON.parse(await readFile(process.env.ASTRA_CAS_LAB_OSCAM_MANIFEST, 'utf8'));
     assert.equal(manifest.policyVersion, 4, 'Semantic dispatch requires the policy4 reader');
-    assert.equal(manifest.semanticPolicyVersion, 5);
+    assert.equal(manifest.semanticPolicyVersion, 6);
     assert.notEqual(manifest.experimental, true, 'Release tests must use the normal protected reader');
     assert.match(manifest.semanticSchedulerSha256 || '', /^[a-f0-9]{64}$/, 'Semantic dispatch requires its normal patch digest');
   }
@@ -130,7 +133,7 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
       await mkdir(join(directory, 'budgets'), { mode: 0o700 });
       if (initialHealthLimited) await writeFile(join(directory,'budgets','a'.repeat(64)+'.health.json'),'{"version":1,"limited":1}\n',{mode:0o600});
     }
-    configuration = labReaderConfiguration(buildOscamConfiguration([profile], { firstPort, ...mode }), semanticScheduler);
+    configuration = labReaderConfiguration(buildOscamConfiguration([profile], { firstPort, ...mode }), semanticScheduler, callerTimeoutMs);
   } finally {
     if (previousSecret === undefined) delete process.env.ASTRA_SECRET_KEY; else process.env.ASTRA_SECRET_KEY = previousSecret;
   }

@@ -50,15 +50,55 @@ test('local decoder churn and a negative-reply retry flood cannot reset the nati
   assert.equal(lab.provider.snapshot().connections,1);assert.equal(lab.snapshot().guard.connectionResets,0);
   console.log(JSON.stringify({case:'local-retry-churn',localRequests:counts.reduce((a,b)=>a+b,0),providerConnections:1,localPeak:lab.ingress.snapshot().peakFramesPerSecond,providerPeak:lab.provider.snapshot().peakRequestsPerSecond,recoveredFreshKey:true}));
 });
-test('many delayed replies retain one provider session without a local queue-pressure reset', { skip: !enabled, timeout: 25000 }, async t => {
+test('production eight-second deadlines complete forty delayed replies on one shared connection', { skip: !enabled, timeout: 25000 }, async t => {
   const lab=await fixture(t,{policy:()=>({delayMs:4000})}),clients=[];
   for(let i=0;i<40;i++)clients.push(await lab.client());
-  const replies=await Promise.all(clients.map((c,i)=>c.requestECM({channelId:i+1,epoch:7300,timeoutMs:10000})));
-  assert.ok(replies.every(r=>r.ok),JSON.stringify(replies.map(r=>({ok:r.ok,timedOut:r.timedOut,closed:r.closed}))));
-  for(let i=0;i<40;i++)assert.deepEqual(replies[i].controlWords,cwForEpoch(i+1,7300,lab.transportMode));
+  const replies=await Promise.all(clients.map((c,i)=>c.requestECM({channelId:i+1,epoch:7299,timeoutMs:12000})));
+  for(let i=0;i<40;i++){assert.equal(replies[i].ok,true);assert.deepEqual(replies[i].controlWords,cwForEpoch(i+1,7299,lab.transportMode));}
   const s=lab.snapshot();assert.equal(s.provider.connections,1);assert.equal(s.guard.connectionResets,0);
   assert.equal(s.ingress.expiredCloses+s.ingress.capacityCloses+s.ingress.transportCloses,0);
-  console.log(JSON.stringify({case:'local-delayed-40',correctKeys:40,providerConnections:1,providerPeak:s.provider.peakRequestsPerSecond,localPeak:s.ingress.peakFramesPerSecond}));
+  console.log(JSON.stringify({case:'production-delayed-40-eight-second',correctKeys:40,providerConnections:1,providerPeak:s.provider.peakRequestsPerSecond}));
+});
+test('five-second deadlines bound delayed bursts without resetting or misassigning late keys', { skip: !enabled, timeout: 25000 }, async t => {
+  let delayed=true;
+  const lab=await fixture(t,{callerTimeoutMs:5000,policy:()=>({delayMs:delayed?4000:20})}),clients=[];
+  for(let i=0;i<40;i++)clients.push(await lab.client());
+  const replies=await Promise.all(clients.map((c,i)=>c.requestECM({channelId:i+1,epoch:7300,timeoutMs:10000})));
+  const correct=replies.filter(r=>r.ok).length;
+  assert.ok(correct>=30&&correct<40,JSON.stringify({correct,expired:40-correct}));
+  for(let i=0;i<40;i++){assert.equal(replies[i].closed,undefined);if(replies[i].ok)assert.deepEqual(replies[i].controlWords,cwForEpoch(i+1,7300,lab.transportMode));}
+  delayed=false;
+  const fresh=await Promise.all(clients.map((c,i)=>c.requestECM({channelId:i+1,epoch:7301,timeoutMs:10000})));
+  for(let i=0;i<40;i++){assert.equal(fresh[i].ok,true);assert.deepEqual(fresh[i].controlWords,cwForEpoch(i+1,7301,lab.transportMode));}
+  const s=lab.snapshot();assert.equal(s.provider.connections,1);assert.equal(s.guard.connectionResets,0);
+  assert.equal(s.ingress.expiredCloses+s.ingress.capacityCloses+s.ingress.transportCloses,0);
+  console.log(JSON.stringify({case:'local-delayed-40',correctKeys:correct,expiredRequests:40-correct,freshCorrectKeys:40,providerConnections:1,providerPeak:s.provider.peakRequestsPerSecond,localPeak:s.ingress.peakFramesPerSecond}));
+});
+
+test('five-second caller expiry retains the shared socket and cannot deliver a six-second reply to fresh work', { skip: !enabled, timeout: 25000 }, async t => {
+  const lab=await fixture(t,{callerTimeoutMs:5000,policy:({epoch})=>({delayMs:epoch===61000?6000:epoch===61001?1500:20})});
+  const c=await lab.client({timeoutMs:12000}),other=await lab.client({timeoutMs:12000});
+  const old=await c.requestECM({channelId:1,epoch:61000});
+  assert.equal(old.ok,false);assert.equal(old.closed,undefined);assert.ok(old.elapsedMs>=4500&&old.elapsedMs<6500,JSON.stringify({elapsedMs:old.elapsedMs}));
+  const fresh=c.requestECM({channelId:1,epoch:61001});
+  const good=await other.requestECM({channelId:2,epoch:61002});assert.equal(good.ok,true);assert.deepEqual(good.controlWords,cwForEpoch(2,61002,lab.transportMode));
+  const current=await fresh;assert.equal(current.ok,true);assert.ok(current.elapsedMs>=1400);assert.deepEqual(current.controlWords,cwForEpoch(1,61001,lab.transportMode));
+  await until(()=>lab.snapshot().guard.ecmHealth.late>=1,7000);
+  const s=lab.snapshot();assert.equal(s.provider.connections,1);assert.equal(s.guard.connectionResets,0);assert.equal(s.guard.ecmHealth.good,2);
+  console.log(JSON.stringify({case:'caller-five-socket-eight',expiredAfterMs:old.elapsedMs,correctFreshKeys:2,providerConnections:1,health:s.guard.ecmHealth}));
+});
+
+test('five-second expired callers do not advance actual eight-second shared-silence recovery', { skip: !enabled, timeout: 30000 }, async t => {
+  const lab=await fixture(t,{callerTimeoutMs:5000,policy:({epoch})=>({drop:epoch===62000,delayMs:20})}),c=await lab.client({timeoutMs:12000});
+  const began=performance.now(),old=await c.requestECM({channelId:1,epoch:62000});
+  assert.equal(old.ok,false);assert.equal(old.closed,undefined);assert.ok(old.elapsedMs>=4500&&old.elapsedMs<6500);
+  await delay(Math.max(0,7500-(performance.now()-began)));
+  assert.equal(lab.provider.snapshot().connections,1);assert.equal(lab.snapshot().guard.connectionResets,0);
+  await until(()=>lab.provider.snapshot().connections===2&&lab.snapshot().guard.readerReady,10000);
+  assert.ok(performance.now()-began>=7900);
+  const fresh=await lab.client(),reply=await fresh.requestECM({channelId:1,epoch:62001});assert.equal(reply.ok,true);assert.deepEqual(reply.controlWords,cwForEpoch(1,62001,lab.transportMode));
+  assert.ok(lab.snapshot().guard.attemptsLastWindow<=3);
+  console.log(JSON.stringify({case:'caller-expiry-no-early-reset',expiredAfterMs:old.elapsedMs,providerConnections:2,correctFreshKey:true}));
 });
 test('prolonged account-wide key failure reduces fresh upstream work and recovers without TCP reset', { skip: !enabled, timeout: 160000 }, async t => {
   let reject=false, running=true;

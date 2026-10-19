@@ -37,6 +37,8 @@ test('builds one upstream reader and one shared local Newcamd endpoint per profi
   }], { firstPort: 24000, random: (size) => Buffer.alloc(size, 0xaa) });
   assert.match(generated.conf, /port = 24000\{a{28}\}@0B00:000000/);
   assert.match(generated.conf, /^lb_mode = 0$/m);
+  assert.match(generated.conf, /^clienttimeout = 8000$/m);
+  assert.match(generated.conf, /^fallbacktimeout = 4000$/m);
   assert.match(generated.server, /device = cas\.example\.test,15000/);
   assert.match(generated.server, /connectoninit = 1/);
   assert.doesNotMatch(generated.user, /max_connections/);

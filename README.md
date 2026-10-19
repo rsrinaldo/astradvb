@@ -73,6 +73,25 @@ node src/server.mjs
 
 Open `http://server-address:8000/` and sign in as `admin`. Read the unique initial password from `data/initial-admin-password`, then change it in **Settings → Administrator account**. All example streams are disabled.
 
+## Independent ECM and connection deadlines (v0.8.59)
+
+The managed OSCam caller timeout remains eight seconds. The shared provider
+response/silence window remains eight seconds from dispatch/progress, independent
+of that caller deadline. Semantic policy 6 makes the transport window explicit
+instead of deriving it from the caller configuration. Five-second caller expiry
+was tested but not activated because it rejected useful slow replies.
+
+An expired caller does not release an unanswered wire ID or close a shared
+socket. Late replies cannot satisfy a different request or count as useful
+recovery without an actually live matching caller. Existing alias coalescing,
+retired-ID quarantine, request/frame/inflight limits and durable reconnect pacing
+remain. Request expiry can reject otherwise valid slow or queue-delayed replies;
+it does not reduce healthy playback latency or imply an automatic retry burst.
+
+The adaptive encrypted-video hold remains at most five seconds within its
+unchanged 8 MiB cap. It is a separate clock, not a fixed playback delay or a
+five-second end-to-end delivery guarantee. See [verification](VERIFICATION-0.8.59.md).
+
 ## Channel-isolated recovery (v0.8.58)
 
 Current builds require semantic policy 5 and direct native policy 4. A request

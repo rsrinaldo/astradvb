@@ -31,7 +31,11 @@ const safety = lab => {
 };
 
 test('release semantic reader dispatch is the default and comparisons require a boolean override', async () => {
-  const configuration = { conf: 'fixture', server: '[reader]\nlabel=fixture\n', connections: new Map() };
+  const configuration = { conf: '[global]\nclienttimeout = 8000\n', server: '[reader]\nlabel=fixture\n', connections: new Map() };
+  assert.match(labReaderConfiguration(configuration).conf, /^clienttimeout = 8000$/m);
+  assert.match(labReaderConfiguration(configuration, true, 5000).conf, /^clienttimeout = 5000$/m);
+  assert.throws(() => labReaderConfiguration(configuration, true, 6000), /caller timeout/);
+  await assert.rejects(createCASLab({ callerTimeoutMs: 6000 }), /caller timeout/);
   assert.match(labReaderConfiguration(configuration).server, /astra_ecm_scheduler = 1/);
   assert.match(labReaderConfiguration(configuration, false).server, /astra_ecm_scheduler = 0/);
   assert.match(labReaderConfiguration(configuration, true).server, /astra_ecm_scheduler = 1/);

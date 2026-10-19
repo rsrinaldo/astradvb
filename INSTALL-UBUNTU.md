@@ -282,6 +282,19 @@ The credential is encrypted at rest with AES-256-GCM using the secret in `/etc/a
 
 ## 10. Back up and upgrade
 
+### Independent deadlines (0.8.59)
+
+The latest installer requires verified OSCam semantic policy 6 and rebuilds older
+readers before activating the matching application. The managed caller timeout
+remains eight seconds; shared provider response/silence recovery independently
+remains eight seconds.
+Request expiry alone cannot close the shared socket or release an unanswered ID.
+Five-second caller expiry was tested but not activated. Provider pacing,
+inflight caps, durable budgets and explicit pause are unchanged. The decoder
+remains policy 11 with its existing adaptive five-second/8-MiB envelope.
+Use the normal latest-version installation/upgrade steps above; no manual OSCam
+configuration edit is needed. See [verification](VERIFICATION-0.8.59.md).
+
 ### Channel-isolated recovery (0.8.58)
 
 The latest installer requires decoder policy 11, semantic policy 5 / direct native
