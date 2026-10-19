@@ -11,8 +11,58 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define ASTRA_DIRECT_TRANSPORT_POLICY_VERSION 2
+#define ASTRA_DIRECT_TRANSPORT_POLICY_VERSION 3
 #define ASTRA_PROVIDER_WINDOW 60000ULL
+/* Bounded RAM-only correlation. Hashes never leave the worker or reach disk,
+ * logs, diagnostics or the provider; they never suppress/replay a request. */
+struct astra_ecm_recent {
+    uint64_t service, at;
+    unsigned char hash[16];
+    unsigned used, result;
+};
+struct astra_ecm_trace {
+    struct astra_ecm_recent recent[128];
+    unsigned cursor;
+    uint64_t requests, repeated, repeated_nok, age_over_1s, age_over_2s, max_age;
+    uint64_t replies, good, negative, unusable, reply_over_1s, reply_over_4s;
+    uint64_t max_reply, max_good_reply, max_negative_reply, recovery_expired;
+    uint64_t max_recovery_age, peak_recovery_sent;
+};
+static inline void astra_trace_send(struct astra_ecm_trace *t, uint64_t now, uint64_t service, const unsigned char *hash, uint64_t age) {
+    struct astra_ecm_recent *slot = NULL;
+    ++t->requests;
+    if(age >= 1000) { ++t->age_over_1s; }
+    if(age >= 2000) { ++t->age_over_2s; }
+    if(age > t->max_age) { t->max_age = age; }
+    for(unsigned i = 0; i < 128; ++i) {
+        struct astra_ecm_recent *r = &t->recent[i];
+        if(r->used && r->service == service && !memcmp(r->hash, hash, 16)) {
+            slot = r;
+            if(now >= r->at && now - r->at <= 30000) {
+                ++t->repeated; if(r->result == 2) { ++t->repeated_nok; }
+            }
+            break;
+        }
+    }
+    if(!slot) { slot = &t->recent[t->cursor++ % 128]; }
+    *slot = (struct astra_ecm_recent){ .used = 1, .at = now, .service = service };
+    memcpy(slot->hash, hash, 16);
+}
+static inline void astra_trace_reply(struct astra_ecm_trace *t, uint64_t service, const unsigned char *hash, uint64_t elapsed, int useful, int positive) {
+    ++t->replies;
+    if(useful) { ++t->good; if(elapsed > t->max_good_reply) { t->max_good_reply = elapsed; } }
+    else if(!positive) { ++t->negative; if(elapsed > t->max_negative_reply) { t->max_negative_reply = elapsed; } }
+    else { ++t->unusable; }
+    if(elapsed >= 1000) { ++t->reply_over_1s; }
+    if(elapsed >= 4000) { ++t->reply_over_4s; }
+    if(elapsed > t->max_reply) { t->max_reply = elapsed; }
+    for(unsigned i = 0; i < 128; ++i) {
+        struct astra_ecm_recent *r = &t->recent[i];
+        if(r->used && r->service == service && !memcmp(r->hash, hash, 16)) {
+            r->result = useful ? 1 : !positive ? 2 : 3; break;
+        }
+    }
+}
 struct astra_provider_budget {
     int dirfd, ownerfd, accountfd, dirty, ready, attempted;
     char id[65], boot[37];
@@ -28,6 +78,7 @@ struct astra_provider_budget {
     uint64_t health_since_good, health_ramp_since, health_ramp_good, health_probes;
     uint64_t health_good, health_negative, health_late, health_entries;
     uint64_t health_probe_sent, health_recoveries;
+    uint64_t health_window_since, health_window_good, health_window_bad;
 };
 static inline int astra_provider_literal(const char **p, const char *literal) {
     size_t n = strlen(literal);
@@ -246,10 +297,13 @@ static inline void astra_health_tick(struct astra_provider_budget *b, uint64_t n
     /* Require both enough real upstream work AND a sustained absence of useful
      * keys. Idle periods or one unsupported channel cannot trip an active,
      * otherwise working account. No service blacklist is maintained. */
-    if(b->health_mode != 1 && b->health_since_good >= 32 && b->health_anchor &&
-       now >= b->health_anchor && now - b->health_anchor >= 15000) {
+    uint64_t minimum_work = b->health_limited ? 16 : 32;
+    uint64_t minimum_silence = b->health_limited ? 5000 : 15000;
+    if(b->health_mode != 1 && b->health_since_good >= minimum_work && b->health_anchor &&
+       now >= b->health_anchor && now - b->health_anchor >= minimum_silence) {
         b->health_mode = 1; b->health_probes = 0; b->health_next = now + 2000;
         b->health_ramp_good = b->health_ramp_since = 0; ++b->health_entries;
+        b->health_window_since = b->health_window_good = b->health_window_bad = 0;
         b->health_limited = b->health_dirty = 1;
     }
     if(b->health_dirty && now >= b->health_retry) { (void)astra_health_save(b, now); }
@@ -266,31 +320,45 @@ static inline void astra_health_sent(struct astra_provider_budget *b, uint64_t n
     if(b->health_mode == 1) {
         ++b->health_probe_sent; ++b->health_probes;
         b->health_next = now + (b->health_probes < 5 ? 2000 : b->health_probes < 10 ? 5000 : 15000);
-    } else if(b->health_mode >= 2) { b->health_next = now + (b->health_mode == 2 ? 251 : 126); }
+    } else if(b->health_mode >= 2) { b->health_next = now + (b->health_mode == 2 ? 251 : b->health_mode == 3 ? 126 : 84); }
 }
 /* Exactly once per matched upstream reply, not per alias/cache result. 'good'
  * requires a nonzero valid CW AND a live caller within its original deadline. */
 static inline void astra_health_result(struct astra_provider_budget *b, uint64_t now, int good, int positive) {
-    if(!good) { if(positive) { ++b->health_late; } else { ++b->health_negative; } return; }
+    if(!good) {
+        if(positive) { ++b->health_late; } else { ++b->health_negative; }
+        if(b->health_limited) { ++b->health_window_bad; }
+        return;
+    }
     ++b->health_good; b->health_since_good = 0; b->health_anchor = 0;
-    if(b->health_last_good && now - b->health_last_good > 15000) { b->health_ramp_since = b->health_ramp_good = 0; }
+    if(b->health_last_good && now - b->health_last_good > 15000) {
+        b->health_ramp_since = b->health_ramp_good = 0;
+        b->health_window_since = b->health_window_good = b->health_window_bad = 0;
+    }
     b->health_last_good = now;
     if(b->health_mode == 1) {
         b->health_mode = 2; b->health_ramp_since = now; b->health_ramp_good = 0;
+        b->health_window_since = now; b->health_window_good = b->health_window_bad = 0;
         b->health_next = now + 251;
     }
     if(b->health_limited) {
         if(!b->health_ramp_since) { b->health_ramp_since = now; }
+        if(!b->health_window_since) { b->health_window_since = now; }
         ++b->health_ramp_good;
+        ++b->health_window_good;
         if(b->health_mode == 2 && b->health_ramp_good >= 3) { b->health_mode = 3; }
         if(b->health_mode == 3 && b->health_ramp_good >= 8 && now - b->health_ramp_since >= 2000) {
-            b->health_mode = 0; ++b->health_recoveries;
+            b->health_mode = 4; /* 12/s, NOT full rate after a brief good burst */
         }
-        /* Keep the durable latch through the initial ramp. A process crash
-         * during tentative recovery must not grant a new full-rate startup. */
-        if(b->health_mode == 0 && now - b->health_ramp_since >= 30000) {
-            b->health_limited = 0; b->health_dirty = 1;
-            (void)astra_health_save(b, now);
+        /* One mostly-good thirty-second window establishes recovery. Sparse
+         * unsupported-service NOKs (<=5% of useful keys) need not hold an
+         * otherwise working account forever. Failed windows never jump to 20/s. */
+        if(b->health_mode == 4 && now - b->health_window_since >= 30000) {
+            if(b->health_window_good >= 16 && b->health_window_bad <= b->health_window_good / 20) {
+                b->health_mode = b->health_limited = 0; ++b->health_recoveries;
+                b->health_dirty = 1; (void)astra_health_save(b, now);
+            }
+            b->health_window_since = now; b->health_window_good = b->health_window_bad = 0;
         }
     }
 }

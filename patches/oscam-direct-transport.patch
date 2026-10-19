@@ -138,7 +138,7 @@ index 402137a8..92f4c8ad 100644
  	DEF_OPT_FUNC("device"                         , 0,                                    device_fn),
  	DEF_OPT_UINT8("ipv4force"                     , OFS(ipv4force),                       0),
 diff --git a/oscam-reader.c b/oscam-reader.c
-index 0164e218..7165e556 100644
+index 0164e218..4cce2b9d 100644
 --- a/oscam-reader.c
 +++ b/oscam-reader.c
 @@ -20,6 +20,7 @@
@@ -149,17 +149,18 @@ index 0164e218..7165e556 100644
  
  /* Guarded Newcamd policy, disabled unless this reader explicitly opts in.
   * The reader worker owns metadata; GC may only detach a parent under lock.
-@@ -29,6 +30,9 @@ struct astra_semantic_scheduler
+@@ -29,6 +30,10 @@ struct astra_semantic_scheduler
  	pthread_mutex_t lock;
  	struct astra_semantic_core core;
  	uint64_t next_report_ms, reported_revision;
 +	struct astra_provider_budget provider;
++	struct astra_ecm_trace trace;
 +	uint64_t next_direct_report_ms, direct_open_retry_ms;
 +	int health_reply_index;
  	struct astra_semantic_slot slots[];
  };
  /* GC may race reader cleanup. Publish/acquire/destroy the optional context
-@@ -42,6 +46,99 @@ static uint64_t astra_semantic_now(void)
+@@ -42,6 +47,105 @@ static uint64_t astra_semantic_now(void)
  	return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
  }
  
@@ -188,13 +189,19 @@ index 0164e218..7165e556 100644
 +	if(!force && now < s->next_direct_report_ms) { return; }
 +	s->next_direct_report_ms = now + 5000;
 +	struct astra_provider_budget *b = &s->provider;
-+	rdr_log(reader, "astra direct status: port=%u ready=%u connections=%"PRIu64" closes=%"PRIu64" frames=%"PRIu64" failures=%"PRIu64" retryMs=%"PRIu64" attempts=%"PRIu64" stableRecoveries=%"PRIu64,
++	cs_log("astra direct status: port=%u ready=%u connections=%"PRIu64" closes=%"PRIu64" frames=%"PRIu64" failures=%"PRIu64" retryMs=%"PRIu64" attempts=%"PRIu64" stableRecoveries=%"PRIu64,
 +		(unsigned)reader->astra_report_port, (unsigned)b->ready, b->connections, b->closes, b->frames,
 +		b->failures, astra_provider_delay(b, now), b->count, b->stable_recoveries);
-+	rdr_log(reader, "astra health status: port=%u mode=%u limited=%u good=%"PRIu64" negative=%"PRIu64" late=%"PRIu64" entries=%"PRIu64" probes=%"PRIu64" recoveries=%"PRIu64" nextMs=%"PRIu64,
++	cs_log("astra health status: port=%u mode=%u limited=%u good=%"PRIu64" negative=%"PRIu64" late=%"PRIu64" entries=%"PRIu64" probes=%"PRIu64" recoveries=%"PRIu64" nextMs=%"PRIu64,
 +		(unsigned)reader->astra_report_port, b->health_mode, b->health_limited,
 +		b->health_good, b->health_negative, b->health_late, b->health_entries,
 +		b->health_probe_sent, b->health_recoveries, b->health_next > now ? b->health_next - now : 0);
++	struct astra_ecm_trace *t = &s->trace;
++	cs_log("astra trace status: %u %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %u",
++		(unsigned)reader->astra_report_port, t->requests, t->repeated, t->repeated_nok,
++		t->age_over_1s, t->age_over_2s, t->max_age, t->replies, t->good, t->negative,
++		t->unusable, t->reply_over_1s, t->reply_over_4s, t->max_reply, t->max_good_reply,
++		t->max_negative_reply, t->recovery_expired, t->max_recovery_age, t->peak_recovery_sent, b->health_limited ? 16u : 32u);
 +}
 +int astra_direct_admit(struct s_reader *reader)
 +{
@@ -259,16 +266,18 @@ index 0164e218..7165e556 100644
  /* Numeric private diagnostics only: no account names, ECM hashes, IDs or CWs.
   * Status is bounded to once per five seconds plus explicit reset transitions. */
  static void astra_semantic_report(struct s_reader *reader, int reset)
-@@ -64,7 +161,7 @@ static void astra_semantic_report(struct s_reader *reader, int reset)
+@@ -64,8 +168,8 @@ static void astra_semantic_report(struct s_reader *reader, int reset)
  	s->next_report_ms = now + 5000;
  	s->reported_revision = revision;
  	pthread_mutex_unlock(&s->lock);
 -	uint32_t port = (!strcmp(reader->device, "127.0.0.1") || !strcmp(reader->device, "::1")) ? (uint32_t)reader->r_port : 0;
+-	rdr_log(reader, "astra semantic %s: port=%u generation=%"PRIu64" queued=%u aliases=%u sent=%u peak=%u dispatched=%"PRIu64" matched=%"PRIu64" coalesced=%"PRIu64" expired=%"PRIu64" rejected=%"PRIu64" resets=%"PRIu64" abandoned=%"PRIu64" closes=%"PRIu64" oldestMs=%"PRIu64" resetReason=%u",
 +	uint32_t port = reader->astra_direct == 1 ? reader->astra_report_port : (!strcmp(reader->device, "127.0.0.1") || !strcmp(reader->device, "::1")) ? (uint32_t)reader->r_port : 0;
- 	rdr_log(reader, "astra semantic %s: port=%u generation=%"PRIu64" queued=%u aliases=%u sent=%u peak=%u dispatched=%"PRIu64" matched=%"PRIu64" coalesced=%"PRIu64" expired=%"PRIu64" rejected=%"PRIu64" resets=%"PRIu64" abandoned=%"PRIu64" closes=%"PRIu64" oldestMs=%"PRIu64" resetReason=%u",
++	cs_log("astra semantic %s: port=%u generation=%"PRIu64" queued=%u aliases=%u sent=%u peak=%u dispatched=%"PRIu64" matched=%"PRIu64" coalesced=%"PRIu64" expired=%"PRIu64" rejected=%"PRIu64" resets=%"PRIu64" abandoned=%"PRIu64" closes=%"PRIu64" oldestMs=%"PRIu64" resetReason=%u",
  		reset ? "reset" : "status", port, q.generation, queued, aliases, q.sent, q.peak_sent, q.dispatched, q.matched, q.coalesced, q.expired, q.rejected, q.resets, q.abandoned, q.closes, oldest, (unsigned)q.last_reset_reason);
  }
-@@ -74,7 +171,7 @@ void astra_semantic_reply_progress(struct s_reader *reader, int slot, uint16_t i
+ 
+@@ -74,7 +178,7 @@ void astra_semantic_reply_progress(struct s_reader *reader, int slot, uint16_t i
  	if(!reader || !reader->client || !reader->client->astra_scheduler || slot < 0) { return; }
  	struct astra_semantic_scheduler *s = reader->client->astra_scheduler;
  	pthread_mutex_lock(&s->lock);
@@ -277,7 +286,7 @@ index 0164e218..7165e556 100644
  	pthread_mutex_unlock(&s->lock);
  }
  
-@@ -87,6 +184,7 @@ void astra_semantic_destroy(struct s_client *cl)
+@@ -87,6 +191,7 @@ void astra_semantic_destroy(struct s_client *cl)
  	pthread_mutex_lock(&s->lock);
  	pthread_mutex_unlock(&s->lock);
  	pthread_mutex_destroy(&s->lock);
@@ -285,16 +294,18 @@ index 0164e218..7165e556 100644
  	add_garbage(s);
  	pthread_mutex_unlock(&astra_scheduler_lifetime_lock);
  }
-@@ -160,6 +258,8 @@ static void astra_semantic_complete(struct s_reader *reader, int idx, int rc, ui
+@@ -160,6 +265,10 @@ static void astra_semantic_complete(struct s_reader *reader, int idx, int rc, ui
  	struct astra_semantic_scheduler *s = cl->astra_scheduler;
  	uint64_t now = astra_semantic_now();
  	pthread_mutex_lock(&s->lock);
 +	int matched = s->health_reply_index == idx + 1, useful = 0;
 +	s->health_reply_index = 0;
++	uint64_t service = s->core.slots[idx].service;
++	uint64_t elapsed = now >= s->core.slots[idx].sent_at_ms ? now - s->core.slots[idx].sent_at_ms : 0;
  	uint16_t caid = cl->ecmtask[idx].caid;
  	uint8_t hash[CS_ECMSTORESIZE];
  	memcpy(hash, cl->ecmtask[idx].ecmd5, sizeof(hash));
-@@ -170,7 +270,20 @@ static void astra_semantic_complete(struct s_reader *reader, int idx, int rc, ui
+@@ -170,7 +279,20 @@ static void astra_semantic_complete(struct s_reader *reader, int idx, int rc, ui
  		if(ecm->parent)
  		{
  			int answer = s->core.slots[i].deadline_ms <= now ? E_TIMEOUT : rc == 2 ? E_INVALID : rc ? E_FOUND : E_NOTFOUND;
@@ -316,20 +327,21 @@ index 0164e218..7165e556 100644
  		}
  		ecm->idx = 0;
  		ecm->rc = E_FOUND;
-@@ -179,6 +292,12 @@ static void astra_semantic_complete(struct s_reader *reader, int idx, int rc, ui
+@@ -179,6 +301,13 @@ static void astra_semantic_complete(struct s_reader *reader, int idx, int rc, ui
  	}
  	cl->pending = (int)s->core.sent;
  	pthread_mutex_unlock(&s->lock);
 +	if(reader->astra_direct == 1 && matched)
 +	{
 +		uint64_t uptime = astra_direct_uptime();
++		astra_trace_reply(&s->trace, service, hash, elapsed, useful, rc == 1);
 +		astra_health_result(&s->provider, uptime, useful, rc == 1);
 +		if(useful) { astra_provider_positive(&s->provider, uptime, astra_direct_wall()); }
 +	}
  }
  
  void astra_semantic_tick(struct s_reader *reader)
-@@ -186,6 +305,7 @@ void astra_semantic_tick(struct s_reader *reader)
+@@ -186,6 +315,7 @@ void astra_semantic_tick(struct s_reader *reader)
  	if(!reader || !reader->client || reader->client->kill || !reader->client->astra_scheduler) { return; }
  	struct s_client *cl = reader->client;
  	struct astra_semantic_scheduler *s = cl->astra_scheduler;
@@ -337,7 +349,7 @@ index 0164e218..7165e556 100644
  	uint64_t now = astra_semantic_now();
  	pthread_mutex_lock(&s->lock);
  	int n;
-@@ -239,7 +359,28 @@ void astra_semantic_tick(struct s_reader *reader)
+@@ -239,7 +369,31 @@ void astra_semantic_tick(struct s_reader *reader)
  		if(!cl->kill) { add_job(cl, ACTION_READER_IDLE, NULL, 0); }
  		return;
  	}
@@ -347,19 +359,22 @@ index 0164e218..7165e556 100644
 +	if(reader->astra_direct == 1)
 +	{
 +		admitted = admitted && astra_health_allowed(&s->provider, uptime);
++		if(s->provider.health_limited && s->core.sent >= 16) { admitted = 0; }
 +		/* Sparse probes must be fresh enough to receive a useful reply, not
 +		 * stale near-deadline work selected from the recovery backlog. */
-+		if(s->provider.health_mode == 1)
++		if(s->provider.health_limited)
 +		{
 +			for(size_t i = 0; i < s->core.capacity; ++i)
 +			{
 +				struct astra_semantic_slot *slot = &s->core.slots[i];
-+				uint64_t minimum = cfg.ctimeout > 2000 ? (uint64_t)cfg.ctimeout - 1000 : 1000;
++				uint64_t freshness = s->provider.health_mode == 1 ? 1000 : 2000;
++				uint64_t minimum = (uint64_t)cfg.ctimeout > freshness ? (uint64_t)cfg.ctimeout - freshness : 1;
 +				if(slot->state != ASTRA_QUEUED || slot->deadline_ms > now + minimum) { continue; }
 +				ECM_REQUEST *ecm = &cl->ecmtask[i];
 +				if(ecm->parent) { write_ecm_answer(reader, ecm, E_TIMEOUT, 0, NULL, NULL, 0, NULL); }
 +				ecm->idx = 0; ecm->rc = E_FOUND; ecm->parent = NULL;
 +				astra_semantic_release(&s->core, i); s->core.expired++;
++				++s->trace.recovery_expired;
 +			}
 +		}
 +	}
@@ -367,15 +382,26 @@ index 0164e218..7165e556 100644
  	if(n >= 0)
  	{
  		uint16_t id = astra_semantic_next_id(&s->core, cl->ncd_msgid);
-@@ -250,6 +391,7 @@ void astra_semantic_tick(struct s_reader *reader)
+@@ -250,6 +404,18 @@ void astra_semantic_tick(struct s_reader *reader)
  			cl->ncd_msgid = (uint16_t)(id - 1);
  			cl->ecmtask[n].idx = id;
  			astra_semantic_dispatch(&s->core, (size_t)n, now, id);
-+			if(reader->astra_direct == 1) { astra_health_sent(&s->provider, uptime); }
++			if(reader->astra_direct == 1)
++			{
++				uint64_t remaining = s->core.slots[n].deadline_ms - now;
++				uint64_t age = (uint64_t)cfg.ctimeout > remaining ? (uint64_t)cfg.ctimeout - remaining : 0;
++				astra_trace_send(&s->trace, now, s->core.slots[n].service, cl->ecmtask[n].ecmd5, age);
++				if(s->provider.health_limited)
++				{
++					if(age > s->trace.max_recovery_age) { s->trace.max_recovery_age = age; }
++					if(s->core.sent > s->trace.peak_recovery_sent) { s->trace.peak_recovery_sent = s->core.sent; }
++				}
++				astra_health_sent(&s->provider, uptime);
++			}
  			cl->pending = (int)s->core.sent;
  		}
  	}
-@@ -270,7 +412,15 @@ int astra_semantic_poll_ms(struct s_reader *reader, int normal_ms)
+@@ -270,7 +436,16 @@ int astra_semantic_poll_ms(struct s_reader *reader, int normal_ms)
  	struct astra_semantic_scheduler *s = reader->client->astra_scheduler;
  	pthread_mutex_lock(&s->lock);
  	uint64_t now = astra_semantic_now();
@@ -386,13 +412,14 @@ index 0164e218..7165e556 100644
 +		uint64_t uptime = astra_direct_uptime();
 +		astra_health_tick(&s->provider, uptime);
 +		uint64_t due = s->provider.health_dirty ? s->provider.health_retry : s->provider.health_next;
++		if(s->provider.health_limited && s->core.sent >= 16) { polling.sent = 32; } /* no zero-delay spin at the recovery cap */
 +		if(due > uptime && now + due - uptime > polling.next_send_ms) { polling.next_send_ms = now + due - uptime; }
 +	}
 +	int wait = astra_semantic_wait(&polling, now, reader->tcp_connected == 2, normal_ms);
  	if(reader->tcp_connected == 2) { wait = astra_semantic_recovery_wait(&s->core, now, (uint64_t)cfg.ctimeout, wait); }
  	pthread_mutex_unlock(&s->lock);
  	return wait;
-@@ -1279,6 +1429,7 @@ void network_tcp_connection_close(struct s_reader *reader, char *reason)
+@@ -1279,6 +1454,7 @@ void network_tcp_connection_close(struct s_reader *reader, char *reason)
  
  	struct s_client *cl = reader->client;
  	if(!cl) { return; }
@@ -400,7 +427,7 @@ index 0164e218..7165e556 100644
  	int32_t fd = cl->udp_fd;
  
  	int32_t i;
-@@ -1531,6 +1682,8 @@ int32_t reader_init(struct s_reader *reader)
+@@ -1531,6 +1707,8 @@ int32_t reader_init(struct s_reader *reader)
  {
  	struct s_client *client = reader->client;
  	if(reader->astra_ecm_scheduler == 1 && (reader->typ != R_NEWCAMD || cfg.max_pending > 256)) { return 0; }
@@ -409,7 +436,7 @@ index 0164e218..7165e556 100644
  
  	if(is_cascading_reader(reader))
  	{
-@@ -1567,6 +1720,7 @@ int32_t reader_init(struct s_reader *reader)
+@@ -1567,6 +1745,7 @@ int32_t reader_init(struct s_reader *reader)
  			if(!cs_malloc(&s, sizeof(*s) + (size_t)cfg.max_pending * sizeof(*s->slots))) { return 0; }
  			if(pthread_mutex_init(&s->lock, NULL) != 0) { free(s); return 0; }
  			astra_semantic_init(&s->core, s->slots, (size_t)cfg.max_pending);

@@ -73,7 +73,37 @@ node src/server.mjs
 
 Open `http://server-address:8000/` and sign in as `admin`. Read the unique initial password from `data/initial-admin-password`, then change it in **Settings → Administrator account**. All example streams are disabled.
 
-## Failure-aware provider admission (v0.8.56)
+## Stable recovery and ECM tracing (v0.8.57)
+
+Direct native policy 3 corrects v0.8.56's premature return to full rate: a short
+two-second good-key burst is no longer enough. Recovery progresses through
+approximately 4/s, 8/s and 12/s. New recovery dispatches stop at 16 unanswered
+requests; any older in-flight work drains without cancellation. Full admission requires a thirty-second window with at least
+16 useful fresh replies and no more bad replies than 5% of the useful replies.
+Failed windows stay limited; a renewed complete failure returns to sparse probes
+after five seconds and 16 dispatches without a useful key. Normal operation still
+has the existing maximum 20/s, 32-unanswered bounds; lower configured rates win.
+
+Queued recovery work older than two seconds inside OSCam is retired locally;
+probe work has a one-second bound. Original caller deadlines are never extended,
+SENT IDs are not reused/replayed, and replies are not delayed by the recovery cap.
+This adds no video buffering or decoder replacement. The durable health latch,
+account attempt budget and responsive provider socket are preserved.
+
+Private numeric tracing now reports request age at native dispatch, repeated
+identities/retries after NOK, reply latency, stale recovery retirements and peak
+recovery concurrency. Its 128-entry correlation table is RAM-only and constant
+size; hashes/ECM bytes/CWs never appear in diagnostics, logs or persisted history.
+Request age starts at OSCam reception, **not** the original broadcast time, so
+these measurements alone cannot prove that an ECM was fresh at the headend.
+Trace counters describe native dispatch attempts, not provider receipts. History
+is byte-bounded, and instrumentation adds no per-packet work or per-key disk I/O.
+
+Use the latest installer to rebuild older native policy 1/2 binaries. Keep the
+entire provider-budget directory; neither upgrade nor rollback may reset it.
+See [v0.8.57 verification](VERIFICATION-0.8.57.md) for evidence and limits.
+
+## Failure-aware provider admission (v0.8.56, superseded recovery ramp)
 
 The direct native reader now reduces ECM work when **at least 32 real dispatches
 and 15 seconds pass without a useful fresh key**. A matched NOK proves TCP
@@ -98,6 +128,7 @@ the decoder and media buffers are unchanged. Preserve the entire budget
 directory including `*.health.json`; never restore an old budget snapshot.
 Explicit operator pause and lower rate settings remain unchanged.
 
+The v0.8.57 section above supersedes this release's short recovery ramp.
 These are conservative safety thresholds, not a claim about provider capacity
 or proof of the initial provider failure. See [verification](VERIFICATION-0.8.56.md).
 

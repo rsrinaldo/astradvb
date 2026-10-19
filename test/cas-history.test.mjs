@@ -25,10 +25,12 @@ test('private history distinguishes local admission counters from native upstrea
   d.casProxy.providerGuards[0].ingress = { forwardedFrames: 200, peakFramesPerSecond: 20, minimumFrameIntervalMs: 51.01,
     sessions: 77, queuedBytes: 640, transportCloses: 2, address: 'DO-NOT-RETAIN', credentials: 'DO-NOT-RETAIN' };
   d.casProxy.providerGuards[0].ecmHealth = { mode: 1, limited: 1, good: 12, negative: 19, late: 2, probes: 3, nextMs: 2000, cw: 'DO-NOT-RETAIN' };
+  d.casProxy.providerGuards[0].ecmTrace = { requests: 30, repeatedNOK: 9, maxAgeMs: 1200, maxNegativeReplyMs: 5000, hash: 'DO-NOT-RETAIN' };
   h.record(d); const g = h.snapshot().samples[0].guards[0];
   assert.equal(g.ingress.forwardedFrames, 200); assert.equal(g.ingress.sessions, 77);
   assert.equal(g.ingress.minimumFrameIntervalMs, 51.01);
   assert.deepEqual(g.ecmHealth, { mode: 1, limited: 1, nextMs: 2000, good: 12, negative: 19, late: 2, probes: 3 });
+  assert.deepEqual(g.ecmTrace, { requests: 30, repeatedNOK: 9, maxAgeMs: 1200, maxNegativeReplyMs: 5000 });
   assert.deepEqual(h.snapshot().incidents[0].reasons, ['key_probe']);
   assert.equal(JSON.stringify(g).includes('DO-NOT-RETAIN'), false);
 });

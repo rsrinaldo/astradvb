@@ -114,7 +114,7 @@ install -o root -g root -m 0644 "$oscam_scheduler_patch" "$oscam_license_stage/o
 install -o root -g root -m 0644 "$oscam_direct_patch" "$oscam_license_stage/oscam-direct-transport.patch"
 install -o root -g root -m 0644 "$oscam_provider_header" "$oscam_license_stage/astra-provider-budget.h"
 oscam_binary_digest="$(sha256sum "$oscam_stage" | cut -d ' ' -f 1)"
-printf '{"policyVersion":4,"semanticPolicyVersion":4,"sourceRevision":"%s","binarySha256":"%s","patchSha256":"%s","semanticSchedulerSha256":"%s","sourceDirectory":"%s","directTransportPolicyVersion":2,"directTransportSha256":"%s","providerBudgetSha256":"%s"}\n' \
+printf '{"policyVersion":4,"semanticPolicyVersion":4,"sourceRevision":"%s","binarySha256":"%s","patchSha256":"%s","semanticSchedulerSha256":"%s","sourceDirectory":"%s","directTransportPolicyVersion":3,"directTransportSha256":"%s","providerBudgetSha256":"%s"}\n' \
   "$oscam_revision" "$oscam_binary_digest" "$oscam_patch_digest" "$oscam_scheduler_digest" "$oscam_source_dir" "$oscam_direct_digest" "$oscam_provider_digest" > "$oscam_license_stage/astra-native-oscam.json"
 chmod 0644 "$oscam_license_stage/astra-native-oscam.json"
 

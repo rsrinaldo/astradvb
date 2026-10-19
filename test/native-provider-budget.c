@@ -170,6 +170,7 @@ int main(int argc, char **argv) {
         now=recovery+i*251;
         assert(astra_health_allowed(&b,now)); astra_health_sent(&b,now);
         astra_health_result(&b,now,1,1);
+        if(now-recovery<30000) { assert(b.health_mode!=0); }
     }
     assert(b.health_mode==0 && b.health_limited==0 && b.health_recoveries==1 && b.writes==1);
     astra_provider_close(&b);
@@ -186,6 +187,37 @@ int main(int argc, char **argv) {
     assert(astra_provider_open(&b,health_directory,id,boot,now,wall+now-100000));
     astra_health_open(&b,now); assert(b.health_mode==1);
     astra_provider_close(&b); remove_files(health_directory);
+
+    /* Brief good bursts, like the live incident, must never restore full rate.
+     * A <=5% unsupported-service tail may still complete a healthy window. */
+    char mixed_directory[]="/tmp/astra-native-mixed-health-XXXXXX";
+    assert(mkdtemp(mixed_directory)); assert(chmod(mixed_directory,0700)==0);
+    now=100000;assert(astra_provider_open(&b,mixed_directory,id,boot,now,wall));
+    astra_health_open(&b,now);b.health_mode=b.health_limited=1;
+    astra_health_result(&b,now,1,1);
+    for(unsigned i=1;i<=130;i++) {
+        now+=251;assert(astra_health_allowed(&b,now));astra_health_sent(&b,now);
+        astra_health_result(&b,now,1,1);
+        if(i%3==0)astra_health_result(&b,now,0,0);
+    }
+    assert(b.health_mode==4 && b.health_limited && !b.health_recoveries);
+    for(unsigned i=1;i<=140;i++) {
+        now+=251;assert(astra_health_allowed(&b,now));astra_health_sent(&b,now);
+        astra_health_result(&b,now,1,1);
+        if(i%40==0)astra_health_result(&b,now,0,0);
+    }
+    assert(b.health_mode==0 && !b.health_limited && b.health_recoveries==1);
+    astra_provider_close(&b);remove_files(mixed_directory);
+    struct astra_ecm_trace trace={0};unsigned char hash[16]={1}, other[16]={2};
+    astra_trace_send(&trace,1000,1,hash,1500);astra_trace_reply(&trace,1,hash,5000,0,0);
+    astra_trace_send(&trace,2000,1,hash,0);astra_trace_reply(&trace,1,hash,250,1,1);
+    astra_trace_send(&trace,3000,1,hash,0);astra_trace_send(&trace,4000,2,hash,0);
+    astra_trace_send(&trace,5000,1,other,0);astra_trace_send(&trace,40000,1,hash,2500);
+    assert(trace.requests==6 && trace.repeated==2 && trace.repeated_nok==1);
+    assert(trace.max_age==2500 && trace.age_over_1s==2 && trace.age_over_2s==1);
+    assert(trace.negative==1 && trace.good==1 && trace.max_negative_reply==5000 && trace.max_good_reply==250);
+    for(unsigned i=0;i<10000;i++){astra_trace_send(&trace,50000+i,i,hash,0);}
+    assert(sizeof trace<8192); /* constant memory, no growing identity map */
     puts("PASS: durable native attempt budget, mutual exclusion, pacing, health, corruption hold and ownership checks");
     return 0;
 }

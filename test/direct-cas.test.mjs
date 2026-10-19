@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { buildOscamConfiguration, CASProxyManager } from '../src/cas-proxy.mjs';
-import { DirectCASController, parseDirectStatus, parseHealthStatus } from '../src/direct-cas-controller.mjs';
+import { DirectCASController, parseDirectStatus, parseHealthStatus, parseTraceStatus } from '../src/direct-cas-controller.mjs';
 import { encryptSecret } from '../src/secrets.mjs';
 import { openProviderBudgetStore } from '../src/provider-budget.mjs';
 import { RingLogger } from '../src/logger.mjs';
@@ -116,7 +116,8 @@ test('numeric native status is strict and cannot retain provider text or extra f
 test('account health diagnostics retain only strict numeric evidence, not payloads or names', async () => {
   const line='private astra health status: port=23000 mode=1 limited=1 good=20 negative=40 late=2 entries=1 probes=8 recoveries=0 nextMs=15000';
   const value=parseHealthStatus(line);assert.equal(value.good,20);
-  for(const invalid of [line+' key=secret',line.replace('mode=1','mode=4'),line.replace('nextMs=15000','nextMs=15001'),line.replace('good=20','good=-1')]) assert.equal(parseHealthStatus(invalid),null);
+  for(const invalid of [line+' key=secret',line.replace('mode=1','mode=5'),line.replace('nextMs=15000','nextMs=15001'),line.replace('good=20','good=-1')]) assert.equal(parseHealthStatus(invalid),null);
+  assert.equal(parseHealthStatus(line.replace('mode=1','mode=4')).mode,4);
   const c=new DirectCASController({reportPort:23000});
   try {
     c.updateHealth(value);assert.equal(c.snapshot().ecmHealth.mode,1);
@@ -124,6 +125,16 @@ test('account health diagnostics retain only strict numeric evidence, not payloa
     c.updateHealth({...value,good:1});assert.equal(c.snapshot().ecmHealth.good,21);
     assert.equal(c.snapshot().connectionResets,0);
   } finally {await c.stop();}
+});
+test('ECM trace retains only bounded numeric measurements, never correlation hashes', async () => {
+  const line='private astra trace status: 23000 20 3 2 2 0 1500 19 15 3 1 2 1 5000 500 5000 2 1200 16 16';
+  const value=parseTraceStatus(line);assert.equal(value.repeatedNOK,2);
+  for(const invalid of [line+' hash=secret',line.replace(/ 16$/,' 64'),line.replace('23000 20','23000 -1')]) assert.equal(parseTraceStatus(invalid),null);
+  const largest='astra trace status: '+[23000,...Array(18).fill(Number.MAX_SAFE_INTEGER),16].join(' ');
+  assert.ok(largest.length<440,'Positional numeric status must fit the 512-byte global logger, including its prefix');
+  assert.ok(parseTraceStatus(largest));
+  const c=new DirectCASController({reportPort:23000});
+  try {c.updateTrace(value);assert.equal(c.snapshot().ecmTrace.maxNegativeReplyMs,5000);assert.equal(JSON.stringify(c.snapshot()).includes('private'),false);c.beginGeneration();assert.equal(c.snapshot().ecmTrace,undefined);}finally{await c.stop();}
 });
 test('direct mode preserves an explicit provider pause and lower configured rate', async () => {
   const previous={secret:process.env.ASTRA_SECRET_KEY,pause:process.env.ASTRA_CAS_PROVIDER_PAUSED,rate:process.env.ASTRA_CAS_REQUESTS_PER_SECOND};

@@ -18,7 +18,7 @@ test('OSCam trust requires matching installed hash, source and receive policy', 
     writeFileSync(manifest, JSON.stringify(data));
     assert.equal(protectedOscamBuild(binary, manifest), true);
     assert.equal(protectedOscamBuild(binary, manifest, { direct: true }), false, 'Legacy verified readers cannot silently enable direct transport');
-    const direct = { ...data, directTransportPolicyVersion: 2, directTransportSha256: 'b'.repeat(64), providerBudgetSha256: 'c'.repeat(64) };
+    const direct = { ...data, directTransportPolicyVersion: 3, directTransportSha256: 'b'.repeat(64), providerBudgetSha256: 'c'.repeat(64) };
     writeFileSync(manifest, JSON.stringify(direct));
     assert.equal(protectedOscamBuild(binary, manifest, { direct: true }), true);
     writeFileSync(manifest, JSON.stringify({ ...direct, directTransportPolicyVersion: 1 }));

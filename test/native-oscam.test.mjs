@@ -36,7 +36,7 @@ test('native installer verifies OSCam stream I/O and stages its manifest/license
   assert.match(installer, /^set -Eeuo pipefail/m);
   assert.match(installer, /git -C "\$oscam_source_dir" apply --check "\$oscam_patch"/);
   assert.match(installer, /test\/native-oscam-io\.c/);
-  assert.match(installer, /"policyVersion":4,"semanticPolicyVersion":4,"sourceRevision":"%s","binarySha256":"%s","patchSha256":"%s","semanticSchedulerSha256":"%s","sourceDirectory":"%s","directTransportPolicyVersion":2,"directTransportSha256":"%s","providerBudgetSha256":"%s"/);
+  assert.match(installer, /"policyVersion":4,"semanticPolicyVersion":4,"sourceRevision":"%s","binarySha256":"%s","patchSha256":"%s","semanticSchedulerSha256":"%s","sourceDirectory":"%s","directTransportPolicyVersion":3,"directTransportSha256":"%s","providerBudgetSha256":"%s"/);
   assert.ok(installer.indexOf('"$oscam_source_dir/native-oscam-io-test"') < installer.indexOf('tsdecrypt_published=1'));
   assert.ok(installer.indexOf('"$oscam_license_stage/astra-native-oscam.json"') < installer.indexOf('tsdecrypt_published=1'));
   assert.ok(installer.indexOf("trap 'rollback_native_install $?' ERR") < installer.indexOf('tsdecrypt_published=1'));

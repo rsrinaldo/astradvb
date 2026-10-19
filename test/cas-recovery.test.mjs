@@ -63,6 +63,15 @@ test('provider negative replies and key delays do not cause decoder restart stor
   s.children[0].stderr.write('No valid code word\nCard was not able to decode\n');
   assert.equal(s.bridge.retryTimer, null); assert.equal(s.children.length, 1); assert.equal(s.bridge.diagnostics.cwFailures, 2);
 });
+test('native ECM PID switching is counted without retaining raw identifiers or restarting the decoder', t => {
+  const s=decoderSetup(t);s.bridge.start();s.admit();
+  s.children[0].stderr.write('ECM | Switching ECM ');
+  s.children[0].stderr.write('pid to 0x1234 (4660) idx:1 DO-NOT-RETAIN\n');
+  assert.equal(s.bridge.diagnostics.ecmPIDSwitches,1);
+  assert.equal(s.bridge.diagnostics.protocolErrors,0);assert.equal(s.bridge.retryTimer,null);
+  assert.equal(JSON.stringify(s.bridge.diagnostics).includes('0x1234'),false);
+  assert.equal(JSON.stringify(s.bridge.diagnostics).includes('DO-NOT-RETAIN'),false);
+});
 
 test('a newly created decoder waits if the shared proxy is already unavailable', t => {
   const s = decoderSetup(t); s.bridge.backendAvailable = false; s.bridge.start();

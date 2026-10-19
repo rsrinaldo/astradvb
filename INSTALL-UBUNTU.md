@@ -282,6 +282,22 @@ The credential is encrypted at rest with AES-256-GCM using the secret in `/etc/a
 
 ## 10. Back up and upgrade
 
+### Stable recovery and ECM tracing (0.8.57)
+
+The current installer requires verified direct native policy 3 and rebuilds
+older policy 1/2 binaries. It preserves the existing decoder, secrets,
+authentication, stream/EPG settings, explicit pause and lower rate settings.
+One planned service restart activates the matching application/native pair.
+Preserve the whole provider-budget directory, including `*.health.json`, on
+upgrade or rollback; never restore historical attempt/health credit.
+
+Recovery now stays below full rate until thirty seconds of mostly useful keys,
+limits recovery concurrency to 16, and rejects old queued recovery work. It does
+not blacklist channels or reset a responsive provider socket. Numeric-only
+request-age/duplicate/latency counters help investigate remaining failures;
+raw ECMs, correlation hashes and control words are not logged or persisted.
+See README for exact conditions and [verification](VERIFICATION-0.8.57.md).
+
 ### Failure-aware provider admission (0.8.56)
 
 Use the latest installer below: it checks the installed binary and requires the

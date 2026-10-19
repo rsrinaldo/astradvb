@@ -5,6 +5,7 @@ const SEMANTIC = ['generation', 'queued', 'aliases', 'sent', 'peak', 'dispatched
 const GUARD = ['framesSent', 'replyFramesReceived', 'connectionResets', 'expiredConnections', 'queuedFrames', 'oldestQueuedAgeMs', 'negativeECMReplies'];
 const INGRESS = ['accepted', 'connected', 'forwardedFrames', 'peakFramesPerSecond', 'minimumFrameIntervalMs', 'sessions', 'queuedFrames', 'queuedBytes', 'capacityCloses', 'expiredCloses', 'protocolCloses', 'transportCloses', 'peerCloses', 'maxQueueAgeMs'];
 const HEALTH = ['mode', 'limited', 'nextMs', 'good', 'negative', 'late', 'entries', 'probes', 'recoveries'];
+const TRACE = ['requests', 'repeated', 'repeatedNOK', 'ageOver1s', 'ageOver2s', 'maxAgeMs', 'replies', 'good', 'negative', 'unusable', 'replyOver1s', 'replyOver4s', 'maxReplyMs', 'maxGoodReplyMs', 'maxNegativeReplyMs', 'recoveryExpired', 'maxRecoveryAgeMs', 'peakRecoverySent', 'inflightLimit'];
 const STATES = new Set(['paused', 'idle', 'connecting', 'connected', 'reconnecting']);
 const REASONS = new Set(['reply_wait', 'semantic_reset', 'transport_reset', 'local_failures', 'key_probe']);
 const MAX_FILE = 1024 * 1024, RING_BYTES = 256 * 1024, INCIDENT_BYTES = 128 * 1024;
@@ -17,6 +18,7 @@ function safePoint(value) {
     state: STATES.has(guard.state) ? guard.state : 'idle', ...numeric(guard, GUARD),
     ...(guard.semantic ? { semantic: numeric(guard.semantic, SEMANTIC) } : {}),
     ...(guard.ecmHealth ? { ecmHealth: numeric(guard.ecmHealth, HEALTH) } : {}),
+    ...(guard.ecmTrace ? { ecmTrace: numeric(guard.ecmTrace, TRACE) } : {}),
     ...(guard.ingress ? { ingress: numeric(guard.ingress, INGRESS) } : {}) })),
     ...numeric(value, ['localTimeouts', 'localRejected', 'mainLoopMaxMs']), truncatedProfiles: value.truncatedProfiles === true };
 }

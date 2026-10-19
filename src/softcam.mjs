@@ -80,7 +80,7 @@ export function formatTsdecryptCaid(value) {
 export class SoftcamBridge {
   constructor(stream, profile, connection, onData, logger, options = {}) {
     this.stream = stream; this.profile = profile; this.connection = connection; this.onData = onData; this.logger = logger; this.child = null; this.status = 'stopped'; this.lastOutputAt = 0; this.watchdog = null;
-    this.diagnostics = { outputPauses: 0, outputResumes: 0, cwFailures: 0, protocolErrors: 0, protocolReasons: {}, nativeInputOverflows: 0, inputQueueOverflows: 0, startupDroppedBytes: 0, inputBytes: 0, outputBytes: 0, inputHighWaterBytes: 0, maxOutputGapMs: 0, ciphertext: null, lastEvent: null }; this.stderrBuffer = '';
+    this.diagnostics = { outputPauses: 0, outputResumes: 0, cwFailures: 0, ecmPIDSwitches: 0, protocolErrors: 0, protocolReasons: {}, nativeInputOverflows: 0, inputQueueOverflows: 0, startupDroppedBytes: 0, inputBytes: 0, outputBytes: 0, inputHighWaterBytes: 0, maxOutputGapMs: 0, ciphertext: null, lastEvent: null }; this.stderrBuffer = '';
     this.spawnChild = options.spawnChild || spawn; this.protectedBuild = options.protectedBuild || protectedNativeBuild;
     this.setTimer = options.setTimer || setTimeout; this.clearTimer = options.clearTimer || clearTimeout;
     this.onDiscontinuity = options.onDiscontinuity || (() => {}); this.now = options.now || Date.now;
@@ -126,6 +126,7 @@ export class SoftcamBridge {
       for (const line of lines) {
         const ciphertext = parseCiphertextStatus(line, this.now());
         if (ciphertext) { this.diagnostics.ciphertext = ciphertext; continue; }
+        if (/\bECM \| Switching ECM pid to 0x[0-9a-f]+/i.test(line)) { this.diagnostics.ecmPIDSwitches++; continue; }
         let event;
         if (/stopping output/.test(line)) { this.diagnostics.outputPauses++; event = 'native payload validation paused'; }
         else if (/Got decrypted data/.test(line)) { this.diagnostics.outputResumes++; event = 'decrypted payload resumed'; }
