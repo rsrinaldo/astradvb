@@ -9,7 +9,7 @@ import { parseNewcamdLine } from './softcam.mjs';
 import { ProviderGuard, providerGuardOptions } from './provider-guard.mjs';
 import { protectedOscamBuild } from './oscam-integrity.mjs';
 import { openProviderBudgetStore } from './provider-budget.mjs';
-import { DirectCASController, parseDirectStatus } from './direct-cas-controller.mjs';
+import { DirectCASController, parseDirectStatus, parseHealthStatus } from './direct-cas-controller.mjs';
 import { CASIngress } from './cas-ingress.mjs';
 
 const LOCAL_HOST = '127.0.0.1';
@@ -305,6 +305,8 @@ export class CASProxyManager extends EventEmitter {
       for (const line of lines) {
         const direct = parseDirectStatus(line);
         if (direct) for (const [id, port] of this.directPorts || []) if (direct.port === port) this.guards.get(id)?.update(direct);
+        const health = parseHealthStatus(line);
+        if (health) for (const [id, port] of this.directPorts || []) if (health.port === port) this.guards.get(id)?.updateHealth(health);
         const semantic = parseSemanticStatus(line);
         if (semantic) {
           const { port, ...values } = semantic;

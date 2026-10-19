@@ -9,6 +9,7 @@ static const char *id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 static const char *boot = "12345678-1234-1234-1234-123456789abc";
 static void remove_files(const char *path) {
     char p[1024];
+    snprintf(p,sizeof p,"%s/%s.health.json",path,id); unlink(p);
     for(unsigned i=0;i<3;i++) {
         snprintf(p,sizeof p,"%s/%s%s",path,i==2?"owner":id,i==0?".json":".lock"); unlink(p);
     }
@@ -114,6 +115,77 @@ int main(int argc, char **argv) {
         snprintf(path,sizeof path,"%s/.direct-%s-%ld-%u.tmp",storage_directory,id,(long)getpid(),i); assert(unlink(path)==0);
     }
     astra_provider_close(&b); remove_files(storage_directory);
+
+    char health_directory[]="/tmp/astra-native-health-XXXXXX";
+    assert(mkdtemp(health_directory)); assert(chmod(health_directory,0700)==0);
+    now=100000; wall=1000000000;
+    assert(astra_provider_open(&b,health_directory,id,boot,now,wall));
+    astra_health_open(&b,now);
+    /* Slow/delayed startup and isolated NOKs cannot trip a healthy account. */
+    for(unsigned i=0;i<2000;i++) {
+        now+=100;
+        assert(astra_health_allowed(&b,now)); astra_health_sent(&b,now);
+        astra_health_result(&b,now,i%10==0,i%10==0);
+    }
+    assert(b.health_mode==0 && b.health_entries==0);
+    /* Idle time creates no failures and no stored catch-up send credit. */
+    now+=3600000; astra_health_tick(&b,now); assert(b.health_mode==0);
+    uint64_t began=now;
+    for(unsigned i=0;i<32;i++) {
+        now+=100; assert(astra_health_allowed(&b,now)); astra_health_sent(&b,now);
+        astra_health_result(&b,now,0,0);
+    }
+    astra_health_tick(&b,began+14999); assert(b.health_mode==0);
+    now=began+15200; astra_health_tick(&b,now);
+    assert(b.health_mode==1 && b.health_limited==1 && b.health_entries==1 && !b.health_dirty);
+    assert(!astra_health_allowed(&b,now));
+    /* One day of failed fresh probes is bounded, fair selection lives in the
+     * scheduler. Neither failures nor late positives grant full-rate credit. */
+    uint64_t probes=0, last=0;
+    for(uint64_t elapsed=0;elapsed<86400000;elapsed+=250) {
+        uint64_t t=now+elapsed;
+        if(!astra_health_allowed(&b,t)) { continue; }
+        if(last) { assert(t-last>=2000); }
+        last=t; ++probes; astra_health_sent(&b,t);
+        astra_health_result(&b,t,0,probes%2);
+    }
+    assert(probes<5780 && b.health_mode==1 && b.health_recoveries==0);
+    assert(b.writes==1); /* no per-key disk writes */
+    now+=86400000;
+    astra_provider_close(&b);
+    assert(astra_provider_open(&b,health_directory,id,boot,now,wall+now-100000));
+    astra_health_open(&b,now);
+    assert(b.health_mode==1 && !astra_health_allowed(&b,now+14999));
+    assert(astra_health_allowed(&b,now+15000));
+    now+=15000; astra_health_sent(&b,now); astra_health_result(&b,now,1,1);
+    assert(b.health_mode==2 && !astra_health_allowed(&b,now+250));
+    /* Restart in tentative recovery must remain limited. */
+    astra_provider_close(&b);
+    assert(astra_provider_open(&b,health_directory,id,boot,now,wall+now-100000));
+    astra_health_open(&b,now); assert(b.health_mode==1);
+    now+=15000; assert(astra_health_allowed(&b,now));
+    astra_health_sent(&b,now); astra_health_result(&b,now,1,1);
+    uint64_t recovery=now;
+    for(unsigned i=1;i<=130;i++) {
+        now=recovery+i*251;
+        assert(astra_health_allowed(&b,now)); astra_health_sent(&b,now);
+        astra_health_result(&b,now,1,1);
+    }
+    assert(b.health_mode==0 && b.health_limited==0 && b.health_recoveries==1 && b.writes==1);
+    astra_provider_close(&b);
+    assert(astra_provider_open(&b,health_directory,id,boot,now,wall+now-100000));
+    astra_health_open(&b,now); assert(b.health_mode==0);
+    astra_provider_close(&b);
+    /* Corruption and symlinks never restore full-rate traffic. */
+    snprintf(path,sizeof path,"%s/%s.health.json",health_directory,id);
+    fd=open(path,O_WRONLY|O_TRUNC); assert(fd>=0); assert(write(fd,"{}",2)==2); close(fd);
+    assert(astra_provider_open(&b,health_directory,id,boot,now,wall+now-100000));
+    astra_health_open(&b,now); assert(b.health_mode==1 && !b.health_dirty);
+    astra_provider_close(&b);
+    assert(unlink(path)==0); assert(symlink("/nonexistent/astra-health",path)==0);
+    assert(astra_provider_open(&b,health_directory,id,boot,now,wall+now-100000));
+    astra_health_open(&b,now); assert(b.health_mode==1);
+    astra_provider_close(&b); remove_files(health_directory);
     puts("PASS: durable native attempt budget, mutual exclusion, pacing, health, corruption hold and ownership checks");
     return 0;
 }

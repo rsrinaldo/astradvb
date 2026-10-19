@@ -282,6 +282,22 @@ The credential is encrypted at rest with AES-256-GCM using the secret in `/etc/a
 
 ## 10. Back up and upgrade
 
+### Failure-aware provider admission (0.8.56)
+
+Use the latest installer below: it checks the installed binary and requires the
+verified direct-policy-2 OSCam build, rebuilding older native installations.
+The media decoder is unchanged. One service restart activates the matching pair.
+Existing secrets, authentication, streams, explicit CAS pause and lower rate
+settings are preserved. Do not delete or roll back the provider-budget directory
+or its new `*.health.json` files. Reboot/restart cannot clear a limited account.
+
+After sustained account-wide failure, the native scheduler automatically switches
+to sparse fresh probes (2/5/15 seconds) and ramps back up after useful valid keys.
+It does not blacklist channels, need manual unblocking or close a responsive
+provider connection just because replies are negative. Health safety does not
+guarantee uninterrupted playback while keys are unavailable. See README and
+[v0.8.56 verification](VERIFICATION-0.8.56.md) for conditions and test limitations.
+
 ### Local admission guard (0.8.55)
 
 With `ASTRA_CAS_TRANSPORT=direct`, decoders now connect through one Node local
@@ -294,9 +310,9 @@ wait under load, and a local session exceeding the five-second safety limit is
 closed instead of forwarding stale queued data. Local and provider metrics are
 separate in private diagnostics/history. See README for exact bounds.
 
-Run the latest installer below. The verified v0.8.54 native OSCam/decoder pair is
-unchanged; an older/unverified native installation is still rebuilt by the normal
-installer. Existing direct/guarded mode and explicit pause settings are preserved.
+In that release the verified v0.8.54 native pair was unchanged; the current
+installer instead requires the v0.8.56 native policy described above.
+Existing direct/guarded mode and explicit pause settings are preserved.
 Do not clear provider budgets. Activating the application needs one service
 restart; Node's new local guard does not eliminate that interruption or genuine
 provider transport failures.

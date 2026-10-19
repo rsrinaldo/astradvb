@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define ASTRA_DIRECT_TRANSPORT_POLICY_VERSION 1
+#define ASTRA_DIRECT_TRANSPORT_POLICY_VERSION 2
 #define ASTRA_PROVIDER_WINDOW 60000ULL
 struct astra_provider_budget {
     int dirfd, ownerfd, accountfd, dirty, ready, attempted;
@@ -21,6 +21,13 @@ struct astra_provider_budget {
     uint64_t connections, frames, closes, stable_recoveries;
     uint64_t saved_up, saved_wall, writes;
     uint32_t frame_interval_ms;
+    /* ECM admission is independent of TCP pacing. A responsive NOK is NOT a
+     * useful key, but must not close an otherwise healthy shared connection. */
+    unsigned health_mode, health_limited, health_dirty, health_opened;
+    uint64_t health_retry, health_next, health_anchor, health_last_good, health_last_sent;
+    uint64_t health_since_good, health_ramp_since, health_ramp_good, health_probes;
+    uint64_t health_good, health_negative, health_late, health_entries;
+    uint64_t health_probe_sent, health_recoveries;
 };
 static inline int astra_provider_literal(const char **p, const char *literal) {
     size_t n = strlen(literal);
@@ -194,5 +201,97 @@ static inline void astra_provider_positive(struct astra_provider_budget *b, uint
 static inline int astra_provider_take_frame(struct astra_provider_budget *b, uint64_t now) {
     if(!b->attempted || !astra_provider_owned(b) || now < b->next_frame) { return 0; }
     b->next_frame = now + (b->frame_interval_ms >= 50 && b->frame_interval_ms <= 1000 ? b->frame_interval_ms : 50); ++b->frames; return 1;
+}
+
+/* A separate, account-locked latch leaves the v1 connection budget compatible.
+ * Write only transitions, never every ECM. Restart/reboot of a limited account
+ * resumes sparse probes, not full-rate work. No credentials/ECMs/CWs on disk. */
+static inline int astra_health_save(struct astra_provider_budget *b, uint64_t now) {
+    if(!astra_provider_owned(b)) { b->health_retry = now + 5000; return 0; }
+    char name[96], temporary[144];
+    snprintf(name, sizeof name, "%s.health.json", b->id);
+    snprintf(temporary, sizeof temporary, ".health-%s-%ld-%llu.tmp", b->id, (long)getpid(), (unsigned long long)++b->writes);
+    int fd = openat(b->dirfd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    const char *data = b->health_limited ? "{\"version\":1,\"limited\":1}\n" : "{\"version\":1,\"limited\":0}\n";
+    size_t length = strlen(data), offset = 0; int ok = fd >= 0;
+    while(ok && offset < length) {
+        ssize_t n = write(fd, data + offset, length - offset);
+        if(n < 0 && errno == EINTR) { continue; }
+        if(n <= 0) { ok = 0; break; } offset += (size_t)n;
+    }
+    if(ok) { ok = fsync(fd) == 0; }
+    if(fd >= 0 && close(fd)) { ok = 0; }
+    if(ok) { ok = astra_provider_owned(b) && renameat(b->dirfd, temporary, b->dirfd, name) == 0; }
+    if(ok) { ok = fsync(b->dirfd) == 0; }
+    if(fd >= 0) { unlinkat(b->dirfd, temporary, 0); }
+    b->health_dirty = !ok; b->health_retry = ok ? 0 : now + 5000;
+    return ok;
+}
+static inline void astra_health_open(struct astra_provider_budget *b, uint64_t now) {
+    if(b->health_opened) { return; }
+    b->health_opened = 1;
+    char name[96], data[128]; snprintf(name, sizeof name, "%s.health.json", b->id);
+    int fd = openat(b->dirfd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if(fd < 0 && errno == ENOENT) { return; }
+    ssize_t n = fd >= 0 ? read(fd, data, sizeof data - 1) : -1;
+    int valid = fd >= 0 && astra_provider_regular(fd) && n > 0 && n < (ssize_t)sizeof data - 1;
+    if(fd >= 0) { close(fd); }
+    if(valid) { data[n] = 0; valid = !strcmp(data, "{\"version\":1,\"limited\":0}\n") || !strcmp(data, "{\"version\":1,\"limited\":1}\n"); }
+    if(valid && !strcmp(data, "{\"version\":1,\"limited\":0}\n")) { return; }
+    b->health_mode = b->health_limited = 1; b->health_probes = 10;
+    b->health_next = now + 15000;
+    if(!valid) { b->health_dirty = 1; (void)astra_health_save(b, now); }
+}
+static inline void astra_health_tick(struct astra_provider_budget *b, uint64_t now) {
+    /* Require both enough real upstream work AND a sustained absence of useful
+     * keys. Idle periods or one unsupported channel cannot trip an active,
+     * otherwise working account. No service blacklist is maintained. */
+    if(b->health_mode != 1 && b->health_since_good >= 32 && b->health_anchor &&
+       now >= b->health_anchor && now - b->health_anchor >= 15000) {
+        b->health_mode = 1; b->health_probes = 0; b->health_next = now + 2000;
+        b->health_ramp_good = b->health_ramp_since = 0; ++b->health_entries;
+        b->health_limited = b->health_dirty = 1;
+    }
+    if(b->health_dirty && now >= b->health_retry) { (void)astra_health_save(b, now); }
+}
+static inline int astra_health_allowed(struct astra_provider_budget *b, uint64_t now) {
+    astra_health_tick(b, now);
+    return !b->health_dirty && astra_provider_owned(b) && now >= b->health_next;
+}
+static inline void astra_health_sent(struct astra_provider_budget *b, uint64_t now) {
+    if(b->health_since_good < 32 && b->health_last_sent && now - b->health_last_sent >= 15000) { b->health_since_good = 0; }
+    b->health_last_sent = now;
+    if(!b->health_since_good) { b->health_anchor = now; }
+    ++b->health_since_good;
+    if(b->health_mode == 1) {
+        ++b->health_probe_sent; ++b->health_probes;
+        b->health_next = now + (b->health_probes < 5 ? 2000 : b->health_probes < 10 ? 5000 : 15000);
+    } else if(b->health_mode >= 2) { b->health_next = now + (b->health_mode == 2 ? 251 : 126); }
+}
+/* Exactly once per matched upstream reply, not per alias/cache result. 'good'
+ * requires a nonzero valid CW AND a live caller within its original deadline. */
+static inline void astra_health_result(struct astra_provider_budget *b, uint64_t now, int good, int positive) {
+    if(!good) { if(positive) { ++b->health_late; } else { ++b->health_negative; } return; }
+    ++b->health_good; b->health_since_good = 0; b->health_anchor = 0;
+    if(b->health_last_good && now - b->health_last_good > 15000) { b->health_ramp_since = b->health_ramp_good = 0; }
+    b->health_last_good = now;
+    if(b->health_mode == 1) {
+        b->health_mode = 2; b->health_ramp_since = now; b->health_ramp_good = 0;
+        b->health_next = now + 251;
+    }
+    if(b->health_limited) {
+        if(!b->health_ramp_since) { b->health_ramp_since = now; }
+        ++b->health_ramp_good;
+        if(b->health_mode == 2 && b->health_ramp_good >= 3) { b->health_mode = 3; }
+        if(b->health_mode == 3 && b->health_ramp_good >= 8 && now - b->health_ramp_since >= 2000) {
+            b->health_mode = 0; ++b->health_recoveries;
+        }
+        /* Keep the durable latch through the initial ramp. A process crash
+         * during tentative recovery must not grant a new full-rate startup. */
+        if(b->health_mode == 0 && now - b->health_ramp_since >= 30000) {
+            b->health_limited = 0; b->health_dirty = 1;
+            (void)astra_health_save(b, now);
+        }
+    }
 }
 #endif

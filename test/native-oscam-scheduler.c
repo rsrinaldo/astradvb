@@ -387,6 +387,25 @@ static void absolute_orphan_age_and_ready_reply_boundary(void)
 	assert(astra_semantic_recovery_decision(&q, 32000, 8000, 1) == 3);
 }
 
+static void long_running_request_ids(void)
+{
+	struct astra_semantic_slot slots[2];
+	struct astra_semantic_core q;
+	astra_semantic_init(&q, slots, 2);
+	for(uint64_t n = 0; n < 140000; ++n)
+	{
+		uint64_t now = n * 51;
+		int slot = astra_semantic_enqueue(&q, now, now + 8000, 1, 0);
+		assert(slot >= 0);
+		uint16_t id = astra_semantic_next_id(&q, 0);
+		assert(id == n % 65535 + 1);
+		astra_semantic_dispatch(&q, (size_t)slot, now, id);
+		assert(astra_semantic_note_reply(&q, (size_t)slot, id, now + 1));
+		astra_semantic_release(&q, (size_t)slot);
+	}
+	assert(q.dispatched == 140000 && q.matched == 140000 && q.sent == 0);
+}
+
 int main(int argc, char **argv)
 {
 	if(argc == 2 && !strcmp(argv[1], "--dispatch-deadline"))
@@ -410,6 +429,7 @@ int main(int argc, char **argv)
 	original_deadline_and_progress_boundaries();
 	partial_drop_pressure_retirement();
 	absolute_orphan_age_and_ready_reply_boundary();
+	long_running_request_ids();
 	puts("PASS: semantic pacing, bounded silence/orphan recovery, progress-safe backlog, dispatch response interval, ready-reply boundary and IDs");
 	return 0;
 }

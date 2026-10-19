@@ -11,11 +11,11 @@ const install = readFileSync(new URL('../install.sh', import.meta.url), 'utf8');
 const casInstall = readFileSync(new URL('../install-cas.sh', import.meta.url), 'utf8');
 const docker = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
 
-test('application and dashboard asset caches identify release 0.8.55', () => {
+test('application and dashboard asset caches identify release 0.8.56', () => {
   const packageInfo = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
-  assert.equal(packageInfo.version, '0.8.55');
-  assert.match(html, /\/styles\.css\?v=0\.8\.55/); assert.match(html, /\/app\.js\?v=0\.8\.55/);
+  assert.equal(packageInfo.version, '0.8.56');
+  assert.match(html, /\/styles\.css\?v=0\.8\.56/); assert.match(html, /\/app\.js\?v=0\.8\.56/);
 });
 
 test('installers and Docker RUN commands parse without executing installation or a container build', () => {

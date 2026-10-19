@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { buildOscamConfiguration, CASProxyManager } from '../src/cas-proxy.mjs';
-import { DirectCASController, parseDirectStatus } from '../src/direct-cas-controller.mjs';
+import { DirectCASController, parseDirectStatus, parseHealthStatus } from '../src/direct-cas-controller.mjs';
 import { encryptSecret } from '../src/secrets.mjs';
 import { openProviderBudgetStore } from '../src/provider-budget.mjs';
 import { RingLogger } from '../src/logger.mjs';
@@ -112,6 +112,18 @@ test('numeric native status is strict and cannot retain provider text or extra f
   const value = parseDirectStatus(line); assert.equal(value.frames, 10);
   assert.equal(JSON.stringify(value).includes('private-context'), false);
   for (const invalid of [line+' credential=x', line.replace('ready=1','ready=2'), line.replace('attempts=1','attempts=4'), line.replace('frames=10','frames=-1')]) assert.equal(parseDirectStatus(invalid), null);
+});
+test('account health diagnostics retain only strict numeric evidence, not payloads or names', async () => {
+  const line='private astra health status: port=23000 mode=1 limited=1 good=20 negative=40 late=2 entries=1 probes=8 recoveries=0 nextMs=15000';
+  const value=parseHealthStatus(line);assert.equal(value.good,20);
+  for(const invalid of [line+' key=secret',line.replace('mode=1','mode=4'),line.replace('nextMs=15000','nextMs=15001'),line.replace('good=20','good=-1')]) assert.equal(parseHealthStatus(invalid),null);
+  const c=new DirectCASController({reportPort:23000});
+  try {
+    c.updateHealth(value);assert.equal(c.snapshot().ecmHealth.mode,1);
+    c.beginGeneration();assert.equal(c.snapshot().ecmHealth.good,20);
+    c.updateHealth({...value,good:1});assert.equal(c.snapshot().ecmHealth.good,21);
+    assert.equal(c.snapshot().connectionResets,0);
+  } finally {await c.stop();}
 });
 test('direct mode preserves an explicit provider pause and lower configured rate', async () => {
   const previous={secret:process.env.ASTRA_SECRET_KEY,pause:process.env.ASTRA_CAS_PROVIDER_PAUSED,rate:process.env.ASTRA_CAS_REQUESTS_PER_SECOND};

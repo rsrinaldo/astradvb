@@ -258,7 +258,7 @@ export async function startNewcamdProvider({ host = '127.0.0.1', port = 0, polic
                 // Diagnostic only: protocol correlation/checksums are valid,
                 // but the provider deliberately supplies another channel's CW.
                 const replyChannel = action.wrongCW ? channelId === 65535 ? 1 : channelId + 1 : channelId;
-                const response = action.reject ? Buffer.from([command, 0, 0]) : Buffer.concat([Buffer.from([command, 0x10, 0]), cwForEpoch(replyChannel, epoch, replyMode)]);
+                const response = action.reject ? Buffer.from([command, 0, 0]) : Buffer.concat([Buffer.from([command, 0x10, 0]), action.zeroCW ? Buffer.alloc(16) : cwForEpoch(replyChannel, epoch, replyMode)]);
                 if (!await write(encode(response, key, message), action)) return;
                 if (!semantic.reply(token, { rejected: Boolean(action.reject) })) return; unanswered.delete(token);
                 counts.replies++; if (action.reject) counts.rejected++; else if (action.wrongCW) counts.wrongCWReplies++;

@@ -4,8 +4,9 @@ import { open } from 'node:fs/promises';
 const SEMANTIC = ['generation', 'queued', 'aliases', 'sent', 'peak', 'dispatched', 'matched', 'coalesced', 'expired', 'rejected', 'resets', 'abandoned', 'closes', 'oldestMs', 'resetReason'];
 const GUARD = ['framesSent', 'replyFramesReceived', 'connectionResets', 'expiredConnections', 'queuedFrames', 'oldestQueuedAgeMs', 'negativeECMReplies'];
 const INGRESS = ['accepted', 'connected', 'forwardedFrames', 'peakFramesPerSecond', 'minimumFrameIntervalMs', 'sessions', 'queuedFrames', 'queuedBytes', 'capacityCloses', 'expiredCloses', 'protocolCloses', 'transportCloses', 'peerCloses', 'maxQueueAgeMs'];
+const HEALTH = ['mode', 'limited', 'nextMs', 'good', 'negative', 'late', 'entries', 'probes', 'recoveries'];
 const STATES = new Set(['paused', 'idle', 'connecting', 'connected', 'reconnecting']);
-const REASONS = new Set(['reply_wait', 'semantic_reset', 'transport_reset', 'local_failures']);
+const REASONS = new Set(['reply_wait', 'semantic_reset', 'transport_reset', 'local_failures', 'key_probe']);
 const MAX_FILE = 1024 * 1024, RING_BYTES = 256 * 1024, INCIDENT_BYTES = 128 * 1024;
 const numeric = (value, fields) => Object.fromEntries(fields.filter(key => Number.isFinite(value?.[key]) && value[key] >= 0 && value[key] <= Number.MAX_SAFE_INTEGER).map(key => [key, Math.round(value[key] * 100) / 100]));
 const timestamp = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value) && Number.isFinite(Date.parse(value));
@@ -15,6 +16,7 @@ function safePoint(value) {
   return { at: value.at, guards: value.guards.slice(0, 8).map((guard, index) => ({ index: index + 1,
     state: STATES.has(guard.state) ? guard.state : 'idle', ...numeric(guard, GUARD),
     ...(guard.semantic ? { semantic: numeric(guard.semantic, SEMANTIC) } : {}),
+    ...(guard.ecmHealth ? { ecmHealth: numeric(guard.ecmHealth, HEALTH) } : {}),
     ...(guard.ingress ? { ingress: numeric(guard.ingress, INGRESS) } : {}) })),
     ...numeric(value, ['localTimeouts', 'localRejected', 'mainLoopMaxMs']), truncatedProfiles: value.truncatedProfiles === true };
 }
@@ -63,6 +65,7 @@ export class CASRequestHistory {
     const reasons = new Set();
     for (const [index, guard] of point.guards.entries()) {
       if (guard.state === 'paused') continue;
+      if (guard.ecmHealth?.mode === 1) reasons.add('key_probe');
       const before = this.previous?.guards[index];
       if ((guard.semantic?.sent || 0) > 0 && ((guard.semantic.sent || 0) >= 32 || (guard.semantic.oldestMs || 0) >= 4000)) reasons.add('reply_wait');
       if (before && (guard.semantic?.resets || 0) > (before.semantic?.resets || 0)) reasons.add('semantic_reset');

@@ -60,6 +60,77 @@ test('many delayed replies retain one provider session without a local queue-pre
   assert.equal(s.ingress.expiredCloses+s.ingress.capacityCloses+s.ingress.transportCloses,0);
   console.log(JSON.stringify({case:'local-delayed-40',correctKeys:40,providerConnections:1,providerPeak:s.provider.peakRequestsPerSecond,localPeak:s.ingress.peakFramesPerSecond}));
 });
+test('prolonged account-wide key failure reduces fresh upstream work and recovers without TCP reset', { skip: !enabled, timeout: 115000 }, async t => {
+  let reject=false, running=true;
+  const lab=await fixture(t,{policy:()=>({reject,delayMs:25})}),clients=[];
+  for(let i=0;i<20;i++)clients.push(await lab.client());
+  const warm=await Promise.all(clients.map((c,i)=>c.requestECM({channelId:i+1,epoch:7500})));
+  assert.ok(warm.every(r=>r.ok)); reject=true;
+  const loops=clients.map(async(c,i)=>{let epoch=7501;while(running){const r=await c.requestECM({channelId:i+1,epoch:epoch++});assert.equal(r.closed,undefined);}});
+  const work=Promise.all(loops);work.catch(()=>{});
+  t.after(async()=>{running=false;for(const c of clients)c.close();await work.catch(()=>{});});
+  await until(()=>lab.snapshot().guard.ecmHealth.mode===1,30000);
+  await delay(18000);
+  const before=lab.provider.snapshot().requests;
+  await delay(20000);
+  const after=lab.provider.snapshot().requests;
+  assert.ok(after-before<=5,`Prolonged failure forwarded ${after-before} requests in 20 seconds`);
+  assert.equal(lab.provider.snapshot().connections,1);
+  reject=false;
+  await until(()=>lab.snapshot().guard.ecmHealth.recoveries>=1,30000);
+  running=false;await work;
+  const r=await clients[0].requestECM({channelId:1,epoch:8500});assert.equal(r.ok,true);
+  assert.deepEqual(r.controlWords,cwForEpoch(1,8500,lab.transportMode));
+  const s=lab.snapshot();assert.equal(s.provider.connections,1);assert.equal(s.guard.connectionResets,0);
+  assert.equal(s.ingress.expiredCloses+s.ingress.capacityCloses+s.ingress.transportCloses,0);
+  assert.ok(s.provider.peakRequestsPerSecond<=20);
+  console.log(JSON.stringify({case:'prolonged-negative-recovery',failureRequestsPer20Seconds:after-before,health:s.guard.ecmHealth,providerConnections:1}));
+});
+test('unsupported channels cannot throttle an otherwise working account', { skip: !enabled, timeout: 45000 }, async t => {
+  const lab=await fixture(t,{policy:({channelId})=>({reject:channelId!==1,delayMs:20})}),clients=[];
+  for(let i=0;i<20;i++)clients.push(await lab.client());
+  const due=Date.now()+24000;
+  await Promise.all(clients.map(async(c,i)=>{let n=0;while(Date.now()<due){const r=await c.requestECM({channelId:i+1,epoch:9000+n++});assert.equal(r.ok,i===0);assert.equal(r.closed,undefined);}}));
+  const s=lab.snapshot();assert.equal(s.guard.ecmHealth.mode,0);assert.equal(s.guard.ecmHealth.entries,0);
+  assert.equal(s.provider.connections,1);assert.ok(s.provider.peakRequestsPerSecond<=20);
+  console.log(JSON.stringify({case:'mixed-entitlements',health:s.guard.ecmHealth,providerConnections:1}));
+});
+test('matched late positive replies cannot falsely reopen full-rate admission', { skip: !enabled, timeout: 55000 }, async t => {
+  const lab=await fixture(t,{policy:({channelId})=>channelId%2?{reject:true}:{delayMs:9500}}),clients=[];
+  for(let i=0;i<20;i++)clients.push(await lab.client());
+  let running=true;
+  const work=Promise.all(clients.map(async(c,i)=>{let n=0;while(running){const r=await c.requestECM({channelId:i+1,epoch:10000+n++,timeoutMs:12000});assert.equal(r.ok,false);assert.equal(r.closed,undefined);}}));
+  work.catch(()=>{});t.after(async()=>{running=false;for(const c of clients)c.close();await work.catch(()=>{});});
+  await until(()=>lab.snapshot().guard.ecmHealth.mode===1&&lab.snapshot().guard.ecmHealth.late>0,35000);
+  const s=lab.snapshot();assert.equal(s.guard.ecmHealth.good,0);assert.equal(s.guard.ecmHealth.recoveries,0);
+  assert.equal(s.provider.connections,1);assert.equal(s.guard.connectionResets,0);
+  running=false;await work;
+  console.log(JSON.stringify({case:'late-positive-not-recovery',health:lab.snapshot().guard.ecmHealth,providerConnections:1}));
+});
+test('positive packets with invalid null keys cannot grant healthy admission', { skip: !enabled, timeout: 40000 }, async t => {
+  const lab=await fixture(t,{policy:()=>({zeroCW:true})}),clients=[];
+  for(let i=0;i<20;i++)clients.push(await lab.client());
+  const due=Date.now()+23000;
+  await Promise.all(clients.map(async(c,i)=>{let n=0;while(Date.now()<due){const r=await c.requestECM({channelId:i+1,epoch:11000+n++});assert.equal(r.ok,false);assert.equal(r.closed,undefined);}}));
+  const s=lab.snapshot();assert.equal(s.guard.ecmHealth.good,0);assert.equal(s.guard.ecmHealth.mode,1);
+  assert.ok(s.guard.ecmHealth.late>0);assert.equal(s.provider.connections,1);
+  console.log(JSON.stringify({case:'invalid-positive-not-recovery',health:s.guard.ecmHealth,providerConnections:1}));
+});
+test('a full 90-channel failed account has fresh fair probes and all channels recover', { skip: !enabled, timeout: 120000 }, async t => {
+  let reject=true,running=true;
+  const lab=await fixture(t,{policy:()=>({reject,delayMs:30})}),clients=[],recovered=new Set();
+  for(let i=0;i<90;i++)clients.push(await lab.client({timeoutMs:15000}));
+  const work=Promise.all(clients.map(async(c,i)=>{let n=0;while(running){const epoch=12000+n++,r=await c.requestECM({channelId:i+1,epoch,timeoutMs:15000});assert.equal(r.closed,undefined);if(r.ok){assert.deepEqual(r.controlWords,cwForEpoch(i+1,epoch,lab.transportMode));recovered.add(i+1);}}}));
+  work.catch(()=>{});t.after(async()=>{running=false;for(const c of clients)c.close();await work.catch(()=>{});});
+  await until(()=>lab.snapshot().guard.ecmHealth.mode===1&&lab.snapshot().guard.ecmHealth.probes>=1,40000);
+  reject=false;
+  await until(()=>recovered.size===90,45000);
+  running=false;await work;
+  const s=lab.snapshot();assert.equal(s.provider.connections,1);assert.equal(s.guard.connectionResets,0);
+  assert.ok(s.provider.peakRequestsPerSecond<=20);assert.ok(s.ingress.peakFramesPerSecond<=20);
+  assert.equal(s.ingress.expiredCloses+s.ingress.capacityCloses+s.ingress.transportCloses,0);
+  console.log(JSON.stringify({case:'full-account-recovery',correctRecoveredChannels:recovered.size,health:s.guard.ecmHealth,providerConnections:1,providerPeak:s.provider.peakRequestsPerSecond}));
+});
 test('closing and replacing the Node local guard with work in flight leaves the provider socket alive', { skip: !enabled, timeout: 20000 }, async t => {
   const lab=await fixture(t,{policy:()=>({delayMs:2000})});
   const old=await lab.client(),pending=old.requestECM({channelId:1,epoch:7400});

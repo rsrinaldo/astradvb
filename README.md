@@ -73,13 +73,41 @@ node src/server.mjs
 
 Open `http://server-address:8000/` and sign in as `admin`. Read the unique initial password from `data/initial-admin-password`, then change it in **Settings → Administrator account**. All example streams are disabled.
 
+## Failure-aware provider admission (v0.8.56)
+
+The direct native reader now reduces ECM work when **at least 32 real dispatches
+and 15 seconds pass without a useful fresh key**. A matched NOK proves TCP
+responsiveness, not successful descrambling. Cache hits, late replies and answers
+rejected by OSCam validation cannot reopen full-rate admission. An idle account
+alone does not trigger this mode; a working account is not throttled just because
+some channels are unsupported.
+
+Recovery uses fresh, fairly scheduled requests: initially one probe every two
+seconds, then five seconds after five failed probes, then fifteen seconds after
+ten. A useful reply ramps admission through roughly 4/s and 8/s before the normal
+ceiling (at most 20/s, or a lower configured rate). There is no permanent channel
+blacklist, manual unblock requirement, replay of old work or health-driven TCP
+reset. Already-sent requests can still finish. Caller deadlines and bounded
+queues remain in force; unavailable keys still mean interrupted encrypted video.
+
+The per-account durable health latch survives native/service restart. It is
+cleared only after sustained useful recovery, and writes happen on transitions,
+not every key. Numeric good/NOK/late/probe counters are retained privately.
+The installer requires a newly verified **direct native policy 2** OSCam build;
+the decoder and media buffers are unchanged. Preserve the entire budget
+directory including `*.health.json`; never restore an old budget snapshot.
+Explicit operator pause and lower rate settings remain unchanged.
+
+These are conservative safety thresholds, not a claim about provider capacity
+or proof of the initial provider failure. See [verification](VERIFICATION-0.8.56.md).
+
 ## Shared local admission guard (v0.8.55)
 
 In direct mode the complete path is now `tsdecrypt → Node local admission guard
 → local OSCam → provider`. Equivalent account profiles share one local guard,
 not one allowance per decoder. OSCam still owns the only provider socket and its
 native request/reconnect protection. The legacy `guarded` transport is unchanged.
-No native binary rebuild is needed when upgrading from the verified v0.8.54 pair.
+That release reused v0.8.54 native binaries; v0.8.56 requires the rebuild above.
 
 The local guard admits encrypted client frames, including login and keepalive,
 at least 51 ms apart (at most 20/s, or a lower configured rate). Local connection

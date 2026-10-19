@@ -15,7 +15,7 @@ import { buildOscamConfiguration, parseSemanticStatus } from '../../src/cas-prox
 import { MPEGTSAnalyzer, TransportStreamFramer } from '../../src/mpegts.mjs';
 import { protectedOscamBuild } from '../../src/oscam-integrity.mjs';
 import { ProviderGuard } from '../../src/provider-guard.mjs';
-import { DirectCASController, parseDirectStatus } from '../../src/direct-cas-controller.mjs';
+import { DirectCASController, parseDirectStatus, parseHealthStatus } from '../../src/direct-cas-controller.mjs';
 import { CASIngress } from '../../src/cas-ingress.mjs';
 import { openProviderBudgetStore } from '../../src/provider-budget.mjs';
 import { encryptSecret } from '../../src/secrets.mjs';
@@ -150,6 +150,7 @@ export async function createCASLab({ policy = () => ({}), fragmentSizes = [], fr
       const lines = `${logRemainder}${bytes}`.split(/\r?\n/); logRemainder = lines.pop().slice(-16384);
       for (const line of lines) {
         if (directTransport) { const status = parseDirectStatus(line); if (status) guard.update(status); }
+        if (directTransport) { const status = parseHealthStatus(line); if (status) guard.updateHealth(status); }
         const status = parseLabSemanticStatus(line);
         if (status) {
           const previous = semanticStatus.latest;
