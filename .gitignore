@@ -1,19 +1,18 @@
-# Local runtime state, credentials and generated native binaries.
+# Private runtime state must never be published.
 /data/
 /.env*
 /config.json
+/tvheadend.json
+/environment
 /**/epg-published.json
 /**/admin-auth.json
 /**/initial-admin-password
 /**/oscam.conf
 /**/oscam.server
 /**/oscam.user
-/bin/*.so
-/bin/*.node
 /**/media-delivery.json
-/test/native-dvb-buffer
-/test/native-dvb-buffer-abi
 /node_modules/
 /coverage/
 *.log
 *.pid
+.DS_Store

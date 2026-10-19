@@ -1,0 +1,32 @@
+[Unit]
+Description=Astra TVHeadend native media backend
+After=network-online.target
+Wants=network-online.target
+Before=astra-linux.service
+
+[Service]
+Type=simple
+User=astra-tvheadend
+Group=video
+WorkingDirectory=/var/lib/astra-tvheadend
+ExecStartPre=+/usr/local/bin/astra-node /opt/astra-linux/bin/tvheadend-exclusive.mjs
+ExecStart=/usr/local/bin/astra-tvheadend --config /var/lib/astra-tvheadend --bindaddr 127.0.0.1 --http_port 9981 --htsp_port 9982 --pid /run/astra-tvheadend/tvheadend.pid --nosatipcli --nosyslog
+ExecStartPost=+/usr/local/bin/astra-node /opt/astra-linux/bin/tvheadend-ready.mjs
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+RuntimeDirectory=astra-tvheadend
+RuntimeDirectoryMode=0755
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+InaccessiblePaths=-/usr/local/src -/usr/share/tvheadend -/usr/local/share/tvheadend
+ReadWritePaths=/var/lib/astra-tvheadend /run/astra-tvheadend
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitNOFILE=65536
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

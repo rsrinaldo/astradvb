@@ -1,12 +1,12 @@
 {
   "name": "astra-linux",
-  "version": "0.8.59",
+  "version": "0.9.0-dev.6",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22" },
   "scripts": {
-    "start": "node src/server.mjs",
-    "check": "node --check src/server.mjs && node --check src/stream-manager.mjs && node --check public/app.js",
+    "start": "node src/panel-server.mjs",
+    "check": "node --check src/panel-server.mjs && node --check src/panel-manager.mjs && node --check public/app.js",
     "test": "node --test test/*.test.mjs"
   }
 }

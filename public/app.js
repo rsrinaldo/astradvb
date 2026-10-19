@@ -35,7 +35,6 @@ async function loadConfig() {
 
 function render() {
   const status = state.status || { engine: 'offline', uptimeSeconds: 0, streams: {}, sessions: 0, memory: {} };
-  $('#engine-status').textContent = status.engine === 'online' ? 'Engine online' : 'Engine offline';
   $('#engine-detail').textContent = `Uptime ${duration(status.uptimeSeconds)} · v${status.version || '?'}`;
   for (const [id, path] of [['playlist-url', '/playlist.m3u'], ['epg-xml-url', '/epg.xml'], ['epg-json-url', '/api/epg']]) { const link = $(`#${id}`); link.href = path; link.textContent = `${location.origin}${path}`; }
   const epg = status.epg;
@@ -50,10 +49,10 @@ function render() {
   const ram = status.resources?.memory;
   $('#metrics').innerHTML = [
     ['●', 'Running streams', `${running}/${state.streams.length}`, `${scrambled} scrambled · ${status.streams?.warning || 0} need attention`],
-    ['⌁', 'Stream output', outputRates.length ? `${(bitrate / 1000).toFixed(1)} Mb/s` : '—', 'Emitted transport, before client fan-out'],
+    ['⌁', 'Stream output', outputRates.length ? `${(bitrate / 1000).toFixed(1)} Mb/s` : '—', 'Media engine channel-subscription rate; not viewer fan-out'],
     ['↓', 'Host network IN (RX)', networkRate(status.network, 'rxMbps'), networkDetail(status.network, 'rxBytes')],
     ['↑', 'Host network OUT (TX)', networkRate(status.network, 'txMbps'), networkDetail(status.network, 'txBytes')],
-    ['◉', 'DVB hardware', `${cards.length} cards`, `${state.adapters.length} tuners available`],
+    ['◉', 'DVB hardware', `${cards.length} ${cards.length === 1 ? 'card' : 'cards'}`, `${state.adapters.length} tuners available`],
     ['♙', 'HTTP sessions', `${state.sessions.length}`, `${state.sessions.filter(session => session.protocol === 'hls').length} HLS · ${state.sessions.filter(session => session.protocol !== 'hls').length} MPEG-TS`],
     ['◴', 'Server CPU', percent(cpu?.usagePercent), cpu?.cores ? `Across ${number(cpu.cores)} logical CPUs` : 'Waiting for a CPU sample', cpu?.usagePercent],
     ['▤', 'Server RAM', percent(ram?.usagePercent), Number.isFinite(ram?.usedBytes) && Number.isFinite(ram?.totalBytes) ? `${(ram.usedBytes / 1073741824).toFixed(1)} / ${(ram.totalBytes / 1073741824).toFixed(1)} GiB used` : 'Memory usage unavailable', ram?.usagePercent],
@@ -95,23 +94,23 @@ function tunerIndicators(adapter) {
   const cnr = tunerMetric(adapter.cnr?.value, adapter.cnr?.unit, 0, 20);
   const strengthText = adapter.signal ? `${number(adapter.signal.value).toFixed(1)} ${escapeHTML(adapter.signal.unit || '')}` : '—';
   const cnrText = adapter.cnr ? `${number(adapter.cnr.value).toFixed(1)} ${escapeHTML(adapter.cnr.unit || '')}` : escapeHTML(adapter.quality || '—');
-  return `<div class="tuner-indicators"><div title="Signal ${strengthText}"><small>Signal <b>${strengthText}</b></small><span><i style="width:${strength.toFixed(1)}%"></i></span></div><div title="C/N ${cnrText}"><small>C/N <b>${cnrText}</b></small><span><i style="width:${cnr.toFixed(1)}%"></i></span></div></div>`;
+  return `<div class="tuner-indicators"><div title="Signal ${strengthText}"><small>Signal <b>${strengthText}</b></small><progress class="tuner-meter" max="100" value="${strength.toFixed(1)}" aria-label="Signal ${strengthText}"></progress></div><div title="C/N ${cnrText}"><small>C/N <b>${cnrText}</b></small><progress class="tuner-meter" max="100" value="${cnr.toFixed(1)}" aria-label="C/N ${cnrText}"></progress></div></div>`;
 }
 
 function renderAdapters() {
   const cards = groupAdapterCards();
-  $('#adapter-count').textContent = cards.length ? `${cards.length} cards · ${state.adapters.length} tuners` : '0';
+  $('#adapter-count').textContent = cards.length ? `${cards.length} ${cards.length === 1 ? 'card' : 'cards'} · ${state.adapters.length} tuners` : '0';
   $('#adapters').innerHTML = cards.length ? cards.map((card) => {
     const capability = state.cardCapabilities[card.id];
     const configured = card.tuners.filter((item) => item.configured).length;
-    const locked = card.tuners.filter((item) => item.lock).length;
+    const locked = card.tuners.filter((item) => item.active).length;
     const title = capability?.hardwareName || `DVB card ${card.number}`;
     const rows = card.tuners.map((adapter, tunerIndex) => {
       const status = adapter.configured ? adapter.status : 'not configured';
       const tuning = adapter.configured ? `${number(adapter.frequencyMHz)} MHz · ${escapeHTML((adapter.polarization || '').slice(0, 1))} · ${number(adapter.symbolRateKsym)} kSym/s` : 'Click to configure';
-      return `<button type="button" class="tuner-row" data-adapter-id="${escapeHTML(adapter.id)}"><span class="tuner-number">${tunerIndex + 1}</span><span class="tuner-description"><strong>Tuner ${tunerIndex + 1}</strong><small>${tuning}</small></span>${tunerIndicators(adapter)}<span class="state ${adapter.lock ? 'running' : 'warning'}">${escapeHTML(status)}</span><span class="tuner-arrow">›</span></button>`;
+      return `<button type="button" class="tuner-row" data-adapter-id="${escapeHTML(adapter.id)}"><span class="tuner-number">${tunerIndex + 1}</span><span class="tuner-description"><strong>Tuner ${tunerIndex + 1}</strong><small>${tuning}</small></span>${tunerIndicators(adapter)}<span class="state ${adapter.active ? 'running' : adapter.lock === false ? 'warning' : 'stopped'}">${escapeHTML(status)}</span><span class="tuner-arrow">›</span></button>`;
     }).join('');
-    return `<section class="dvb-card"><header><div><h3>${escapeHTML(title)}</h3><p>Card ${card.number}${card.address ? ` · PCI ${escapeHTML(card.address)}` : ''} · ${card.tuners.length} tuners</p></div><div class="card-summary"><strong>${locked}</strong><small>locked</small><strong>${configured}</strong><small>configured</small></div></header><div class="tuner-list">${rows}</div></section>`;
+    return `<section class="dvb-card"><header><div><h3>${escapeHTML(title)}</h3><p>Card ${card.number}${card.address ? ` · PCI ${escapeHTML(card.address)}` : ''} · ${card.tuners.length} tuners</p></div><div class="card-summary"><strong>${locked}</strong><small>active</small><strong>${configured}</strong><small>configured</small></div></header><div class="tuner-list">${rows}</div></section>`;
   }).join('') : '<div class="empty">No DVB hardware detected. Connected Linux DVB frontends appear here automatically.</div>';
   loadCardSummaries(cards);
 }
@@ -134,7 +133,7 @@ function renderStreams() {
     .filter((stream) => `${stream.name} ${stream.id}`.toLowerCase().includes(state.query.toLowerCase()))
     .sort((a, b) => (rank[a.state] ?? 8) - (rank[b.state] ?? 8) || a.name.localeCompare(b.name, undefined, { numeric: true }));
   $('#stream-count').textContent = streams.length;
-  $('#streams').innerHTML = streams.length ? streams.map((stream) => `<article class="stream-card${state.selectedStreams.has(stream.id) ? ' selected' : ''}" data-stream="${escapeHTML(stream.id)}"><label class="stream-select" title="Select ${escapeHTML(stream.name)}"><input type="checkbox" aria-label="Select ${escapeHTML(stream.name)}" data-stream-select="${escapeHTML(stream.id)}"${state.selectedStreams.has(stream.id) ? ' checked' : ''} /><span>Select</span></label><button type="button" class="stream-main stream-edit" data-edit-stream="${escapeHTML(stream.id)}" aria-label="Edit ${escapeHTML(stream.name)}"><span class="stream-orb ${escapeHTML(stream.state)}">⌁</span><span class="stream-description"><strong>${escapeHTML(stream.name)}</strong><small>${stream.activeInput >= 0 ? `Input ${stream.activeInput + 1}` : 'No active input'} · ${(stream.clients || 0) + (hlsClients.get(stream.id) || 0)} clients</small></span></button><div class="stream-uptime" title="Continuous output uptime; resets after restart, failover, or an output interruption"><span>Uptime</span><time>${stream.startedAt ? duration(stream.uptimeSeconds) : '—'}</time></div><div class="stream-foot">${streamRatesMarkup(stream)}<span class="state ${escapeHTML(stream.state)}">${escapeHTML(stream.state)}</span></div></article>`).join('') : '<div class="empty">No streams match the current view.</div>';
+  $('#streams').innerHTML = streams.length ? streams.map((stream) => `<article class="stream-card${state.selectedStreams.has(stream.id) ? ' selected' : ''}" data-stream="${escapeHTML(stream.id)}"><label class="stream-select" title="Select ${escapeHTML(stream.name)}"><input type="checkbox" aria-label="Select ${escapeHTML(stream.name)}" data-stream-select="${escapeHTML(stream.id)}"${state.selectedStreams.has(stream.id) ? ' checked' : ''} /><span>Select</span></label><button type="button" class="stream-main stream-edit" data-edit-stream="${escapeHTML(stream.id)}" aria-label="Edit ${escapeHTML(stream.name)}"><span class="stream-orb ${escapeHTML(stream.state)}">⌁</span><span class="stream-description"><strong>${escapeHTML(stream.name)}</strong><small>${stream.backend === 'tvheadend' ? 'Media engine' : stream.activeInput >= 0 ? `Input ${stream.activeInput + 1}` : 'No active input'} · ${(stream.clients || 0) + (hlsClients.get(stream.id) || 0)} clients</small></span></button><div class="stream-uptime" title="Media engine subscription uptime"><span>Uptime</span><time>${stream.startedAt ? duration(stream.uptimeSeconds) : '—'}</time></div><div class="stream-foot">${streamRatesMarkup(stream)}<span class="state ${escapeHTML(stream.state)}">${escapeHTML(stream.state)}</span></div></article>`).join('') : '<div class="empty">No streams match the current view.</div>';
   const visibleIds = streams.map((stream) => stream.id);
   const selectedVisible = visibleIds.filter((id) => state.selectedStreams.has(id)).length;
   const selectAll = $('#select-all-streams');
@@ -173,7 +172,7 @@ async function openAdapter(id = null) {
     const config = state.config || await loadConfig();
     const live = id ? state.adapters.find((item) => item.id === id) : state.adapters.find((item) => !item.configured);
     const saved = id ? config.adapters.find((item) => item.id === id) || (live ? config.adapters.find((item) => item.adapter === live.adapter && item.frontend === live.frontend) : null) : null;
-    const defaults = { id: '', name: '', enabled: true, adapter: 0, frontend: 0, demux: 0, deliverySystem: 'DVBS2X', frequencyMHz: 0, symbolRateKsym: 0, bandwidthMHz: 8, polarization: 'HORIZONTAL', modulation: '', fec: 'AUTO', inversion: 'AUTO', pilot: 'AUTO', rolloff: 'AUTO', streamId: -1, scramblingSequenceIndex: 0, lnb: 'EXTENDED', diseqc: -1, unicableKHz: 0 };
+    const defaults = { id: '', name: '', enabled: true, adapter: 0, frontend: 0, demux: 0, deliverySystem: state.status?.backend?.mode === 'tvheadend' ? 'DVBS2' : 'DVBS2X', frequencyMHz: 0, symbolRateKsym: 0, bandwidthMHz: 8, polarization: 'HORIZONTAL', modulation: '', fec: 'AUTO', inversion: 'AUTO', pilot: 'AUTO', rolloff: 'AUTO', streamId: -1, scramblingSequenceIndex: 0, lnb: 'EXTENDED', diseqc: -1, unicableKHz: 0 };
     const adapter = { ...defaults, ...(live || {}), ...(saved || {}) };
     state.editingAdapter = saved?.id || null;
     state.editingAdapterDeviceId = live?.id || saved?.id || null;
@@ -201,7 +200,7 @@ async function loadAdapterCapabilities(id) {
   if (!id) return;
   const capability = await api(`/api/adapters/${encodeURIComponent(id)}/capabilities`);
   const badges = [capability.s2x ? 'DVB-S2X' : '', capability.multistream ? 'MIS capable' : '', capability.apiVersion ? `API ${capability.apiVersion}` : ''].filter(Boolean);
-  $('#adapter-capabilities').innerHTML = `<strong>${escapeHTML(capability.hardwareName)}</strong><span>${badges.map((badge) => `<b>${escapeHTML(badge)}</b>`).join('')}</span><small>${escapeHTML((capability.deliverySystems || []).join(', ') || 'Delivery systems unavailable')}</small>`;
+  $('#adapter-capabilities').innerHTML = `<strong>${escapeHTML(capability.hardwareName)}</strong><span>${badges.map((badge) => `<b>${escapeHTML(badge)}</b>`).join('')}</span><small>${escapeHTML((capability.deliverySystems || []).join(', ') || 'Delivery systems unavailable')}${capability.note ? ` · ${escapeHTML(capability.note)}` : ''}</small>`;
 }
 
 async function saveAdapter(event) {
@@ -230,8 +229,10 @@ function openAdapterScan() {
   if (!state.editingAdapterDeviceId) return;
   state.scanningAdapter = state.editingAdapterDeviceId; state.scanServices = [];
   const profiles = (state.config?.casProfiles || []).filter((profile) => profile.configured);
-  $('#scan-cam-profile').innerHTML = ['<option value="">None — keep encrypted services scrambled</option>', ...profiles.map((profile) => `<option value="${escapeHTML(profile.id)}">${escapeHTML(profile.name)} (${escapeHTML(profile.id)})</option>`)].join('');
-  $('#adapter-dialog').close(); $('#scan-dialog-title').textContent = `Scan ${state.editingAdapter}`;
+  $('#scan-cam-profile').innerHTML = ['<option value="">Native automatic CA selection</option>', ...profiles.map((profile) => `<option value="${escapeHTML(profile.id)}">${escapeHTML(profile.name)} (${escapeHTML(profile.id)})</option>`)].join('');
+  const adapter = state.adapters.find(a => a.id === state.scanningAdapter);
+  const location = adapter ? adapterLocation(adapter) : null;
+  $('#adapter-dialog').close(); $('#scan-dialog-title').textContent = location ? `Scan · Card ${location.card} · Tuner ${location.tuner}` : 'Scan channels';
   $('#scan-status').textContent = 'Current-transponder scans reuse the live tuner without interrupting streams. NIT network scans require an idle tuner.';
   $('#scan-service-rows').innerHTML = '<tr><td colspan="5" class="muted">No scan results yet.</td></tr>';
   $('#create-scanned-streams').classList.add('hidden'); $('#select-all-services').checked = false;
@@ -253,7 +254,7 @@ async function scanAdapter(event) {
 }
 
 function renderScanServices() {
-  $('#scan-service-rows').innerHTML = state.scanServices.map((service, index) => `<tr class="${service.alreadyAdded ? 'scan-service-existing' : ''}"><td><input type="checkbox" aria-label="Add ${escapeHTML(service.name)}" data-scan-service="${index}"${service.alreadyAdded ? ' disabled' : ' checked'} /></td><td><strong>${escapeHTML(service.name)}</strong>${service.alreadyAdded ? `<small class="scan-existing">Already added${service.existingStreams?.length ? ` as ${escapeHTML(service.existingStreams.map(item => item.name).join(', '))}` : ''}</small>` : ''}</td><td>${number(service.serviceId)}</td><td>${escapeHTML((service.videoPids || []).join(', ') || '—')}</td><td>${escapeHTML((service.audioPids || []).join(', ') || '—')}</td></tr>`).join('');
+  $('#scan-service-rows').innerHTML = state.scanServices.map((service, index) => `<tr class="${service.alreadyAdded ? 'scan-service-existing' : ''}"><td><input type="checkbox" aria-label="Add ${escapeHTML(service.name)}" data-scan-service="${index}"${service.alreadyAdded || service.importable === false ? ' disabled' : ' checked'} /></td><td><strong>${escapeHTML(service.name)}</strong>${service.alreadyAdded ? `<small class="scan-existing">Already added${service.existingStreams?.length ? ` as ${escapeHTML(service.existingStreams.map(item => item.name).join(', '))}` : ''}</small>` : service.importable === false ? '<small class="scan-existing">Map this service to a channel in Media engine first</small>' : ''}</td><td>${number(service.serviceId)}</td><td>${escapeHTML((service.videoPids || []).join(', ') || '—')}</td><td>${escapeHTML((service.audioPids || []).join(', ') || '—')}</td></tr>`).join('');
   updateScanSelection();
 }
 
@@ -274,7 +275,7 @@ async function createScannedStreams() {
   for (const service of selected) {
     const id = `${state.scanningAdapter}-${service.serviceId}`.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64);
     try {
-      await api('/api/streams', { method: 'POST', body: JSON.stringify({ id, name: service.name || `Service ${service.serviceId}`, enabled: true, inputs: [{ url: service.inputUrl }], outputs: [], http: true, hls: true, hlsCompatibility: false, onDemand: false, service: { serviceId: service.serviceId, transportStreamId: service.transportStreamId, originalNetworkId: service.originalNetworkId }, cam: { enabled: Boolean(camProfile), profile: camProfile || 'default' }, scanImport: true }) });
+      await api('/api/streams', { method: 'POST', body: JSON.stringify({ id, name: service.name || `Service ${service.serviceId}`, enabled: true, inputs: [{ url: service.inputUrl }], outputs: [], http: true, hls: true, hlsCompatibility: false, onDemand: false, service: { serviceId: service.serviceId, transportStreamId: service.transportStreamId, originalNetworkId: service.originalNetworkId, ...(service.tvheadendUUID ? { tvheadendUUID: service.tvheadendUUID } : {}), ...(service.tvheadendServiceUUID ? { tvheadendServiceUUID: service.tvheadendServiceUUID } : {}) }, cam: { enabled: Boolean(camProfile), profile: camProfile || 'default' }, scanImport: true }) });
       service.alreadyAdded = true; service.existingStreams = [{ id, name: service.name }];
       created += 1;
     } catch (error) { failed.push(`${service.name}: ${error.message}`); }
@@ -321,10 +322,21 @@ async function openStream(id = null, initialInput = '') {
     form.elements.id.disabled = Boolean(id);
     form.elements.enabled.checked = Boolean(stream.enabled);
     form.elements.inputs.value = initialInput || (stream.inputs || []).map((input) => input.url).join('\n');
+    const tvh = state.status?.backend?.mode === 'tvheadend';
+    $('#tvheadend-channel-field').classList.toggle('hidden', !tvh);
+    form.elements.inputs.disabled = false;
+    if (tvh) {
+      const catalogue = await api('/api/backend/tvheadend/channels');
+      form.elements.tvheadendUUID.innerHTML = '<option value="">Configure from input URL(s)</option>' + catalogue.channels.map(c => `<option value="${escapeHTML(c.uuid)}">${escapeHTML(c.name)}${c.enabled === false ? ' · disabled' : ''}</option>`).join('');
+      form.elements.tvheadendUUID.value = stream.service?.tvheadendUUID || catalogue.bindings?.[id] || '';
+      const selection = () => { form.elements.inputs.disabled = Boolean(form.elements.tvheadendUUID.value); };
+      form.elements.tvheadendUUID.onchange = selection; selection();
+    }
     form.elements.outputs.value = (stream.outputs || []).map((output) => output.url).join('\n');
     form.elements.http.checked = stream.http !== false; form.elements.hls.checked = stream.hls !== false; form.elements.hlsCompatibility.checked = Boolean(stream.hlsCompatibility);
     form.elements.onDemand.checked = Boolean(stream.onDemand); form.elements.keepActiveSeconds.value = stream.keepActiveSeconds || 0;
     form.elements.camEnabled.checked = Boolean(stream.cam?.enabled);
+    form.elements.serviceId.value = stream.service?.serviceId || stream.service?.id || 0;
     const profiles = [{ id: 'default', name: 'Select a profile' }, ...(config.casProfiles || []).filter((profile) => profile.id !== 'default')];
     form.elements.camProfile.innerHTML = profiles.map((profile) => `<option value="${escapeHTML(profile.id)}">${escapeHTML(profile.name)} (${escapeHTML(profile.id)})</option>`).join('');
     form.elements.camProfile.value = stream.cam?.profile || 'default';
@@ -339,7 +351,13 @@ async function saveStream(event) {
   const form = event.currentTarget;
   const id = state.editing || form.elements.id.value.trim();
   const previous = state.config?.streams.find(stream => stream.id === state.editing) || {};
-  const value = { ...previous, id, name: form.elements.name.value.trim(), enabled: form.elements.enabled.checked, inputs: lines(form.elements.inputs.value).map((url) => ({ url })), outputs: lines(form.elements.outputs.value).map((url) => ({ url })), http: form.elements.http.checked, hls: form.elements.hls.checked, hlsCompatibility: form.elements.hlsCompatibility.checked, onDemand: form.elements.onDemand.checked, keepActiveSeconds: Number(form.elements.keepActiveSeconds.value) || 0, cam: { enabled: form.elements.camEnabled.checked, profile: form.elements.camProfile.value.trim() || 'default' } };
+  const value = { ...previous, id, name: form.elements.name.value.trim(), enabled: form.elements.enabled.checked, inputs: lines(form.elements.inputs.value).map((url) => ({ url })), outputs: lines(form.elements.outputs.value).map((url) => ({ url })), http: form.elements.http.checked, hls: form.elements.hls.checked, hlsCompatibility: form.elements.hlsCompatibility.checked, onDemand: form.elements.onDemand.checked, keepActiveSeconds: Number(form.elements.keepActiveSeconds.value) || 0, service: { ...(previous.service || {}), serviceId: Number(form.elements.serviceId.value) || 0 }, cam: { enabled: form.elements.camEnabled.checked, profile: form.elements.camProfile.value.trim() || 'default' } };
+  if (state.status?.backend?.mode === 'tvheadend') {
+    value.service = { ...value.service, tvheadendUUID: form.elements.tvheadendUUID.value, tvheadendUseInputs: !form.elements.tvheadendUUID.value };
+    if (value.service.tvheadendUseInputs) delete value.service.tvheadendServiceUUID;
+    if (value.service.tvheadendUUID !== previous.service?.tvheadendUUID) delete value.service.tvheadendInputSignature;
+    if (!value.inputs.length && value.service.tvheadendUUID) value.inputs = [{ url: `tvheadend://${value.service.tvheadendUUID}` }];
+  }
   try {
     await api(state.editing ? `/api/streams/${encodeURIComponent(id)}` : '/api/streams', { method: state.editing ? 'PUT' : 'POST', body: JSON.stringify(value) });
     $('#stream-dialog').close(); state.config = null; await refresh(); toast(`${value.name} saved`);
@@ -363,8 +381,14 @@ async function deleteSelectedStreams() {
 }
 
 function showView(id) { $$('.view').forEach((view) => view.classList.toggle('active', view.id === id)); $$('.nav').forEach((button) => button.classList.toggle('active', button.dataset.view === id)); if (id === 'settings') loadConfig().catch(() => {}); }
-function selectTab(id) { $$('.tab').forEach((tab) => tab.classList.toggle('active', tab.dataset.tab === id)); $$('.tab-panel').forEach((panel) => panel.classList.toggle('active', panel.dataset.panel === id)); }
-function toast(message, failed = false) { const node = $('#toast'); node.textContent = message; node.style.borderColor = failed ? '#fa707055' : ''; node.classList.add('show'); clearTimeout(toast.timer); toast.timer = setTimeout(() => node.classList.remove('show'), 2800); }
+function selectTab(id) {
+  $$('#stream-dialog .tab').forEach(tab => {
+    const selected = tab.dataset.tab === id;
+    tab.classList.toggle('active', selected); tab.setAttribute('aria-selected', String(selected)); tab.tabIndex = selected ? 0 : -1;
+  });
+  $$('#stream-dialog .tab-panel').forEach(panel => panel.classList.toggle('active', panel.dataset.panel === id));
+}
+function toast(message, failed = false) { const node = $('#toast'); node.textContent = message; node.classList.toggle('failed', failed); node.classList.add('show'); clearTimeout(toast.timer); toast.timer = setTimeout(() => node.classList.remove('show'), 2800); }
 function streamName(id) { return state.streams.find((stream) => stream.id === id)?.name || id; }
 function lines(value) { return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean); }
 function number(value) { return Number.isFinite(Number(value)) ? Number(value) : 0; }
@@ -378,14 +402,20 @@ function networkDetail(network, field) {
 }
 function streamRatesMarkup(stream) {
   const rate = value => Number.isFinite(value) ? `${Math.max(0, Math.round(value)).toLocaleString()} <small>Kbit/s</small>` : '—';
-  const scope = stream.inputBitrateScope === 'dvb-service' ? 'Selected DVB service transport, including shared SI and CA packets' : 'Incoming source transport; may include multiple services in a multiplex';
-  return `<div class="stream-rates"><div title="${scope}; recent ${number(stream.bitrateWindowMs || 5000) / 1000}-second estimate"><small>Source IN</small><strong>${rate(stream.inputBitrateKbps)}</strong></div><div title="Emitted transport before client fan-out; not a guarantee of decodable video"><small>OUT</small><strong>${rate(stream.outputBitrateKbps)}</strong></div></div>`;
+  return `<div class="stream-rates"><div title="Media engine channel subscription input; not pre-descrambling RF/multiplex bitrate"><small>INPUT</small><strong>${rate(stream.inputBitrateKbps)}</strong></div><div title="Media engine channel output, maximum subscription rate rather than viewer fan-out; ${number(stream.backendErrors)} Media engine-reported errors"><small>OUTPUT</small><strong>${rate(stream.outputBitrateKbps)}</strong></div></div>`;
 }
 function duration(seconds) { seconds = Math.max(0, Math.floor(number(seconds))); const days = Math.floor(seconds / 86400); const clock = [Math.floor(seconds % 86400 / 3600), Math.floor(seconds % 3600 / 60), seconds % 60].map((part) => String(part).padStart(2, '0')).join(':'); return `${days ? `${days}d ` : ''}${clock}`; }
 function escapeHTML(value) { return String(value ?? '').replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]); }
 
 $$('.nav').forEach((button) => button.addEventListener('click', () => showView(button.dataset.view)));
 $$('.tab').forEach((button) => button.addEventListener('click', () => selectTab(button.dataset.tab)));
+$('#stream-dialog .tabs').addEventListener('keydown', event => {
+  const tabs = $$('#stream-dialog .tab'), current = tabs.indexOf(event.target);
+  if (current < 0 || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+  event.preventDefault();
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+  selectTab(tabs[next].dataset.tab); tabs[next].focus();
+});
 $$('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => $(`#${button.dataset.closeDialog}`).close()));
 $('#refresh').addEventListener('click', refresh);
 $('#search').addEventListener('input', (event) => { state.query = event.target.value; renderStreams(); });
@@ -398,6 +428,10 @@ $('#select-all-streams').addEventListener('change', (event) => { const visible =
 $('#delete-selected-streams').addEventListener('click', deleteSelectedStreams);
 $('#adapters').addEventListener('click', (event) => { const card = event.target.closest('[data-adapter-id]'); if (card) openAdapter(card.dataset.adapterId); });
 $('#stream-form').addEventListener('submit', saveStream);
+$('#stream-form').addEventListener('invalid', event => {
+  const panel = event.target.closest('[data-panel]');
+  if (panel) selectTab(panel.dataset.panel);
+}, true);
 $('#delete-stream').addEventListener('click', deleteStream);
 $('#settings-form').addEventListener('submit', async (event) => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); for (const key of Object.keys(data)) data[key] = Number(data[key]); try { await api('/api/settings', { method: 'PUT', body: JSON.stringify(data) }); state.config = null; await refresh(); toast('Runtime settings applied'); } catch (error) { toast(error.message, true); } });
 $('#new-cas-profile').addEventListener('click', () => openCASProfile());
@@ -475,4 +509,14 @@ async function initialize() {
     connectEvents();
   } catch (error) { toast(error.message, true); }
 }
+// Native input behavior remains unchanged; names make every visual switch usable
+// with keyboard/screen readers, including the tuner and scan dialogs.
+$$('.switch-row input[type="checkbox"]').forEach(input => {
+  input.setAttribute('role', 'switch');
+  if (!input.hasAttribute('aria-label')) input.setAttribute('aria-label', input.closest('.switch-row').querySelector('strong').textContent);
+});
+$$('.nav').forEach(button => button.setAttribute('aria-label', button.querySelector('span').textContent));
+$$('[data-close-dialog]').filter(button => button.textContent.trim() === '×').forEach(button => button.setAttribute('aria-label', 'Close'));
+$('#search').setAttribute('aria-label', 'Search streams or IDs');
+$('#refresh').setAttribute('aria-label', 'Refresh dashboard');
 initialize();

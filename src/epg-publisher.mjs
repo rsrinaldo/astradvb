@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { EPG_REFRESH_SECONDS, xmltv } from './epg.mjs';
+import { EPG_REFRESH_SECONDS, xmltv } from './epg-output.mjs';
 
 const INTERVAL_MS = EPG_REFRESH_SECONDS * 1000;
 const MAX_FILE_BYTES = 64 * 1024 * 1024;

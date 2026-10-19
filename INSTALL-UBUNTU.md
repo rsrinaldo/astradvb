@@ -1,521 +1,110 @@
-# Astra Linux Control: Ubuntu installation guide
+# Ubuntu Server installation
 
-This guide installs Astra Linux Control as a native, automatically restarting systemd service on Ubuntu Server. The installation has been exercised on Ubuntu 22.04 and 24.04 with an x86-64 host. It is a clean-room MPEG-TS control and relay system; it does not contain Cesbo code or a Cesbo license bypass.
+## 1. Requirements
 
-Only ingest, decrypt, and redistribute services for which you have authorization from the rights holder and conditional-access provider.
+- A **fresh** Ubuntu Server 22.04 or 24.04 installation with systemd.
+- x86-64 or ARM64, Internet/DNS access, and root/sudo privileges.
+- Free TCP port 8000 for the panel; private backend ports 9981/9982 must be free.
+- Linux DVB drivers/firmware if using a tuner. The installer does not replace
+  your kernel or install out-of-tree TBS drivers.
+- `curl` for downloading the script. If missing: `sudo apt install curl`.
 
-## 1. Prepare the server
-
-You need:
-
-- Ubuntu Server 22.04 or 24.04
-- a user with `sudo` access
-- a static server address or stable DNS name
-- Node.js 20 or newer; Node.js 22 or 24 LTS is recommended
-- TCP port 8000 reachable from the management network
-- multicast routing and IGMP support on the relevant network when using UDP multicast
-- a Linux-supported DVB adapter and driver only if DVB input is required
-
-Update Ubuntu and install the download tools:
+## 2. Run the single first-install script
 
 ```bash
-sudo apt update
-sudo apt install -y ca-certificates curl git
+curl -fL https://raw.githubusercontent.com/rsrinaldo/astradvb/main/install-latest.sh -o install-astra.sh
+sudo bash install-astra.sh
 ```
 
-Check the installed Node.js version:
+You can inspect the downloaded script before running it. It obtains the current
+published `main` commit, never an old local checkout. It installs build/FFmpeg
+dependencies and uses an existing supported Node.js LTS 22/24 runtime when
+available. Otherwise it downloads the latest official Node.js 24 LTS binary,
+checks its SHA-256 against the official HTTPS release manifest, and installs it
+under `/opt/astra-runtime`. Services use `/usr/local/bin/astra-node`; distro-owned
+`/usr/bin/node` is not overwritten.
 
-```bash
-/usr/bin/node --version
-```
+The installer builds pinned, **unmodified** TVHeadend without GUI bundles,
+installs its required backend profile/EPG data, creates separate service users
+and private credentials, installs the clean panel, checks startup, and enables
+both services for reboot. Compilation takes several minutes depending on hardware.
 
-If the command is missing or reports a version below 20, install Node.js 22 from the NodeSource Ubuntu repository:
+It refuses to overwrite existing application/configuration paths or active media
+services. Installation failure retains files for diagnosis; it does not erase
+configuration or automatically restart a legacy CAS process. Do not delete an
+existing installation to bypass this refusal.
 
-```bash
-cd /tmp
-curl -fsSL https://deb.nodesource.com/setup_22.x -o nodesource_setup.sh
-sudo -E bash nodesource_setup.sh
-sudo apt install -y nodejs
-/usr/bin/node --version
-```
+## 3. Sign in and configure channels
 
-Review downloaded setup scripts before executing them if that is required by your security policy.
-
-## 2. Download the latest-version installer
-
-Download the installation entry point from the published GitHub `main` branch:
-
-```bash
-cd "$HOME"
-curl --fail --show-error --location --proto '=https' \
-  https://raw.githubusercontent.com/rsrinaldo/astradvb/main/install-latest.sh \
-  -o astra-install-latest.sh
-```
-
-Review `astra-install-latest.sh` before running it. On every run it clones the
-current `main` into a fresh temporary directory and prints the exact commit being
-installed. It does not reuse, reset or alter an existing source checkout. A failed
-download stops before installation and leaves the running service untouched.
-The latest published code is selected when the clone completes; later GitHub
-changes require another upgrade. There is no unattended auto-update service.
-
-## 3. Run the native installer
-
-```bash
-bash astra-install-latest.sh
-```
-
-The entry point requests `sudo` when necessary and runs the native installer from
-the newly downloaded source. The installer:
-
-- installs FFmpeg and Linux DVB tools when missing
-- builds pinned tsdecrypt and OSCam components when missing
-- creates an unprivileged `astra` system account with DVB `video` group access
-- installs the application under `/opt/astra-linux`
-- stores persistent configuration at `/var/lib/astra-linux/config.json`
-- stores the CAS credential encryption key in `/etc/astra-linux/environment`
-- installs and starts the `astra-linux.service` systemd unit
-
-The unit is enabled at boot and restarts automatically after a process failure.
-For an intentionally pinned source installation, clone the repository, check out
-the required commit/tag, then run `sudo ./install.sh` in that checkout instead.
-That lower-level command installs exactly its local source, not necessarily the
-latest published version.
-
-An upgrade preserves both the persistent JSON configuration and encryption key. Version 0.6.0 also removes any legacy `ASTRA_ADMIN_TOKEN` line from the environment file.
-
-## 4. Verify the service
-
-```bash
-sudo systemctl status astra-linux --no-pager
-curl -fsS http://127.0.0.1:8000/healthz
-sudo systemctl is-enabled astra-linux
-```
-
-The health endpoint should return `ok`, and `is-enabled` should return `enabled`.
-`/api/status` requires a signed-in management session; an unauthenticated request
-returning HTTP 401 is expected. Open the dashboard at:
-
-```text
-http://SERVER-IP:8000/
-```
-
-Management requires a login. The username is `admin`. Retrieve the unique initial password:
+Open `http://SERVER_IP:8000`. Username: `admin`.
 
 ```bash
 sudo cat /var/lib/astra-linux/initial-admin-password
 ```
 
-Sign in, then open **Settings → Administrator account** and change the initial password. Use at least 12 characters. Changing it invalidates older management logins without restarting streams. Playback, playlists, and XMLTV/JSON EPG URLs remain public. Administrator credentials are stored as a salted scrypt hash in `/var/lib/astra-linux/admin-auth.json`, separate from the stream configuration; keep this file private and include it in protected backups. The plaintext initial-password file is removed after the password is changed.
+Use that unique password and change it in Settings. Existing first-login password
+changes require at least 12 characters. Credentials are not printed into system logs.
 
-## 5. Restrict management access
+Configure tuners in the panel, scan/import the services you need, and assign an
+authorised Newcamd profile if required. For network sources choose **+ Stream →
+General → Configure from input URL(s)** and add the URL. No provider connection
+or tuner scan is configured automatically on a fresh installation.
 
-Do not expose port 8000 directly to the public internet. The following example permits a management subnet and assumes SSH is already allowed. Replace `10.0.200.0/24` with the actual trusted subnet before running it:
-
-```bash
-sudo ufw allow OpenSSH
-sudo ufw allow proto tcp from 10.0.200.0/24 to any port 8000
-sudo ufw enable
-sudo ufw status verbose
-```
-
-For management outside the trusted network, use a VPN or an HTTPS reverse proxy. HTTP does not encrypt your login password. Behind a trusted TLS proxy, set `ASTRA_PUBLIC_HTTPS=1` and `ASTRA_PUBLIC_ORIGIN=https://your-management-host` in `/etc/astra-linux/environment` and restart the service; restrict direct access to port 8000. This enables Secure cookies without trusting client-supplied forwarding headers.
-
-If the password is lost, stop Astra, reset it, and start the service again:
+## 4. Verify startup and playback
 
 ```bash
-sudo systemctl stop astra-linux
-sudo -u astra env ASTRA_CONFIG=/var/lib/astra-linux/config.json node /opt/astra-linux/bin/reset-admin.mjs
-sudo systemctl start astra-linux
-sudo cat /var/lib/astra-linux/initial-admin-password
-```
-
-## 6. Create a stream
-
-For DVB rescans on a streaming tuner, leave **Scan NIT transponders** off. The normal scan reads the current multiplex through the shared tuner process without reopening the frontend or stopping viewers. NIT network scans require an idle tuner because they can retune it. Results mark existing services **Already added**, disable those checkboxes, and select only new services by default. Existing renamed/disabled streams are matched by frontend and service ID, not by their names.
-
-Optional client restrictions are under **Settings → Streaming and EPG access**. Add the permitted public IPs or CIDR networks to the streaming and/or EPG list. Leave a list empty to allow any IP. Changes apply immediately without restarting streams; newly blocked HTTP relay clients are disconnected. Streaming rules cover HTTP MPEG-TS, HLS, and playlist exports; EPG rules cover XMLTV/JSON downloads. Management still requires login and is not blocked by these media rules. The form shows the IP visible to this server. NAT and proxy clients may share one visible address; untrusted forwarding headers are ignored. If using a reverse proxy, apply original-client IP filtering there. These rules do not restrict configured UDP/RTP output destinations or remove EPG embedded in video.
-
-In the dashboard, choose **+ Stream**.
-
-1. Enter a name and an ID such as `news-hd`.
-2. Enter one input URL per line. The order defines failover priority.
-3. Select **Delivery** and enable **HTTP MPEG-TS** and/or **HLS**.
-4. Enable the stream and save it.
-
-Supported input examples:
-
-```text
-udp://239.10.0.1:1234
-rtp://239.10.0.2:5000
-tcp://192.0.2.20:9000
-http://upstream.example.net/channel.ts
-https://upstream.example.net/channel.ts
-https://upstream.example.net/channel.m3u8
-https://upstream.example.net/manifest.mpd
-srt://upstream.example.net:9000
-rtsp://camera.example.net/live
-rtmp://upstream.example.net/live/channel
-rist://upstream.example.net:9001
-file:///var/lib/astra-linux/sample.ts
-dvb://adapter0-frontend0
-```
-
-The engine handles UDP, RTP, TCP, continuous HTTP MPEG-TS, and MPEG-TS files directly. It automatically starts and supervises its FFmpeg bridge for HLS, DASH, SRT, RTSP, RTMP/RTMPS, RIST, and non-TS media files. Enter the original URL in the dashboard; no separate FFmpeg command is required.
-
-Each multicast socket binds to its own destination group, preventing channels that share a UDP port from being mixed. For reception on a specific interface, append `?interface=LOCAL-IP` to the URL (for example, `udp://239.10.0.1:1234?interface=10.0.20.65`) or set the input object's `interface` address through the API. Without one, the kernel routing table chooses the interface.
-
-For a stream ID of `news-hd`, the playback endpoints are:
-
-```text
-http://SERVER-IP:8000/play/news-hd
-http://SERVER-IP:8000/hls/news-hd/index.m3u8
-```
-
-The HTTP endpoint is an MPEG-TS byte stream and can be opened with VLC or FFplay:
-
-```bash
-ffplay http://SERVER-IP:8000/play/news-hd
-```
-
-## 7. Export playlists and EPG
-
-The dashboard displays the published URLs. The standard endpoints are:
-
-```text
-http://SERVER-IP:8000/playlist.m3u
-http://SERVER-IP:8000/playlist.xspf
-http://SERVER-IP:8000/playlist.txt
-http://SERVER-IP:8000/api/playlist
-http://SERVER-IP:8000/epg.xml
-http://SERVER-IP:8000/api/epg
-```
-
-Choose **Export playlist** to download M3U, XSPF, plain URLs, or JSON. Append `?include_disabled=1` if disabled HTTP streams should appear in an exported playlist.
-
-EPG is populated from DVB EIT tables present in the incoming transport streams. An upstream stream without EIT data cannot produce programme entries automatically.
-
-Use either URL directly as your receiving system's EPG source. No manual file download or import is required: each request to that URL returns the latest published guide. Both URLs serve the same **once-daily publication (every 24 hours / 86,400 seconds)**. Contents and timestamps stay unchanged between publications, even when new broadcast EPG arrives. The server publishes daily independently of the receiving system; if that system offers a URL refresh interval, once daily is sufficient. The receiving system still controls when it requests the URL and whether it caches the result internally. JSON exposes `publishedAt`, `nextRefreshAt`, `publicationIntervalSeconds` and `recommendedRefreshSeconds` (both 86400), plus source `updatedAt` and `lastReceivedAt`. `generatedAt` is the publication time. Both URLs expose `X-EPG-Published-At`, `X-EPG-Next-Refresh-At`, and `X-EPG-Refresh-Seconds: 86400`. The dashboard shows publication time, coverage and the next update. HTTP caching remains disabled so IP access changes apply immediately.
-
-The saved guide is `/var/lib/astra-linux/epg-published.json` for a native installation; include it in protected backups. Restarts preserve the current publication and next update time. On a fresh installation with no saved guide, wait five minutes for collection; the URLs return HTTP 503 with Retry-After until ready. Existing saved guides stay available during warmup or write failures. Weekly/multi-day programme data is retained up to fourteen days ahead, including across restarts and missing broadcast repetitions. Broadcast collection and bounded expiration continue in the background without affecting descrambling or tuner playback; additions, removals and schedule changes appear at the next daily publication. A broadcaster still has to provide the schedule data.
-
-CAS process recovery is automatic and paced. Do not add a cron job that repeatedly restarts the entire engine during a provider outage: failed keys alone do not trigger process restarts. Keep the default 16 MiB DVR capture ring and the legacy unconditional packet delay disabled unless measurements justify a diagnostic change. Policy v6's separate adaptive ciphertext hold is described below; capture capacity is not intentional playback delay.
-
-## 8. Configure a DVB tuner
-
-Starting with v0.8.32, `install.sh` also builds the process-scoped DVR capture-buffer helper. Run the installer when upgrading rather than only copying JavaScript files. The helper requests a 16 MiB capture ring before reading the DVR device, without changing tuning or demux filters; scanner and signal-probe processes are unaffected. An optional `ASTRA_DVB_DVR_BUFFER_BYTES` setting accepts 1–64 MiB. This protects against short reader stalls, not sustained overload. A missing helper stops DVB input with an installation error instead of silently falling back to the small capture buffer.
-
-Version 0.8.42 also starts a small read-only signal-monitoring process before streaming. No separate service or credentials are needed. Signal-bar refreshes no longer launch monitoring utilities from the large media process; monitor failures display unknown status without retuning the active frontend.
-
-First confirm that the Linux driver exposes the adapter:
-
-```bash
-find /dev/dvb -maxdepth 2 \( -type c -o -type l \)
-dvb-fe-tool
-```
-
-If `/dev/dvb` does not exist, fix the kernel driver, firmware, USB/PCIe passthrough, or virtual-machine device assignment first. The application cannot discover hardware that Linux has not exposed.
-
-After the device appears:
-
-1. Open the dashboard and choose **+ Adapter**.
-2. Select the detected frontend.
-3. Choose DVB-S/S2/S2X, DVB-T/T2, DVB-C, or ATSC.
-4. Enter frequency and the delivery-system parameters.
-5. For satellite, set symbol rate, polarization, LNB, DiSEqC, or Unicable values as needed.
-6. For DVB-S2X, set APSK modulation, roll-off, pilots, MIS/ISI stream ID, and PLS Gold scrambling index when required by the transponder.
-7. Save the adapter and choose **Scan channels**.
-8. Select discovered services and create HTTP/HLS streams, or choose **Create full transponder stream** for an unfiltered MPTS input.
-
-Check device access and live service logs if tuning fails:
-
-```bash
-id astra
-ls -l /dev/dvb/adapter*/frontend*
-sudo journalctl -u astra-linux -n 200 --no-pager
-```
-
-## 9. Configure an authorized Newcamd profile
-
-Version 0.8.53 is an application-only recovery update and retains the verified
-policy-10 decoder/policy-4 OSCam from 0.8.52. Install normally with
-`sudo ./install.sh`; no manual native rebuild or budget reset is needed when
-those builds already verify. Negative channel results no longer erase valid
-key-reply health for other channels on the shared connection. Returning to
-baseline backoff still requires sustained fresh positive replies; cached or
-negative-only responses cannot qualify. Rolling connection/rate limits remain
-unchanged. Each transport incident now retains its own bounded error code and
-numeric queue/progress metadata; this cannot itself prevent a remote TCP reset.
-
-Version 0.8.52 requires native CAS bundle policy v10 and OSCam policy v4 (including semantic policy v4). Native v10 preserves recent ownership/CC across non-PUSI clear continuations carrying 1–7 payload bytes, without refreshing encrypted freshness or weakening gap/discontinuity/context safeguards. It also preserves a still-owned raw parity prefix across candidate publication until its first independent PES can certify it; it does not emit an uncertain prefix. OSCam v4 promptly wakes an idle disconnected guarded Newcamd reader through the existing worker and durable account budget, without replay. Future TCP failures retain only a bounded errno code. Rebuild older OSCam readers for progress-safe recovery: expired caller deadlines or a backlog no longer reset a connection that is completing matched replies. Silence recovery measures a full response interval from actual dispatch; original answer deadlines, hard orphan lifetime and provider budgets remain unchanged. Policy v8 retains the subtitle/teletext safety fix and retires unreachable headerless runs immediately, counting them separately as decoder.ciphertext.orphan. Anchored or still-owned runs keep bounded late-key recovery. It discards unanchored encrypted subtitle/teletext tails immediately instead of blocking the shared A/V queue; these are counted separately as `decoder.ciphertext.ancillary`. Only valid type-0x06 DVB subtitle/teletext descriptors opt in: private audio, unknown private data and malformed/conflicting metadata retain their existing handling. A later complete or split PES header restores ordinary bounded validation/recovery. Marked ancillary parity does not drive the A/V phase clock. Ancillary tails can be lost; uncertain ciphertext is never emitted, and anchored missing-key cases can still wait up to the existing two-second deadline. Normal verification requires the executable hash, pinned source, policy 10, ordered patch-set hash and `patches.ciphertextSafety`; even a verified policy-v9 decoder must be rebuilt for this upgrade. Install the application and native binary/manifest as a matching release, using `sudo ./install.sh`; it invokes the native installer when verification requires it. The same seven normal decoder patches/source pins, optimized SIMD batching, bounded stream I/O, synchronized words, stale-work/PES checks and borrowed Newcamd password-hash cleanup remain. Both installers run the portable ciphertext oracle and real scalar libdvbcsa probe before native publication. Older/experimental builds and marker files alone are not accepted. OSCam retains exact-read protection and bounded semantic dispatch/recovery.
-
-No larger buffer, higher CAS rate, reset connection budget or increased production CPU quota is part of this optimization. Before deployment, release testing must preserve exact packet/order and fault oracles and measure CPU, source-feed lateness, pipe backpressure and A/V delivery gaps on comparable inputs/channel counts/key timing/resource limits. Synthetic performance results are not a guarantee of production capacity or a comparison with another product. There is no additional runtime package requirement beyond the existing build/libdvbcsa dependencies.
-
-Fresh changed ECMs are not suppressed by a failed-key cooldown. The shared guard admits decoders only after validated reader authentication. Transport failures use exponential backoff and at most three real upstream connection attempts per rolling minute; healthy negative key replies do not enter that backoff. Equivalent account profiles share one reader and queue. Connection budgets persist outside the generated OSCam configuration in `/var/lib/astra-linux/cas-proxy-budgets` (or beside a custom runtime directory); preserve this directory and `ASTRA_SECRET_KEY` during upgrades. State contains timing/counters, not keys or credentials. Corrupt state/reboot can add a bounded safety hold; unwritable state prevents new provider attempts until storage recovers. The normal installer does not remove this directory. Consult the provider for an allowed rate before enabling a large lineup: 20 local encrypted frame writes/s is neither an arrival guarantee nor an allowance. See README → Provider protection and Isolated CAS fault laboratory. To pause upstream requests, set `ASTRA_CAS_PROVIDER_PAUSED=1` in `/etc/astra-linux/environment` and restart; changing the file alone does not pause a running process. Saved channels/credentials remain and clear channels remain available.
-
-The shared OSCam reader uses 128 local storage slots, but allows at most 32 unanswered provider ECMs and dispatches at most 20/s without catch-up. Timed-out dispatched IDs remain reserved until a matching reply or whole-connection retirement; old exchanges are never replayed. Silence or a hard unanswered lifetime can retire a stuck connection through the same durable reconnect budget; expired caller deadlines or backlog alone do not reset a transport completing matched replies. These are protection bounds, not provider-approved limits. A private bounded `cas-request-history.json` beside the configuration retains numeric pre/post-incident observations only; preserve it for diagnosis, not as a substitute for provider-side measurements. Tuner capture capacity and the legacy fixed input-delay default are unchanged; ciphertext safety has a separate adaptive hold.
-
-OSCam is an integral part of the native and Docker installations. The installer builds and installs it automatically alongside tsdecrypt; Astra starts and stops the proxy itself, including after reboot. No separate manual OSCam installation or service configuration is needed. One upstream Newcamd TCP connection per shared account carries individual channel ECM exchanges.
-
-Leave `ASTRA_CAS_INPUT_BUFFER_MS=0` in `/etc/astra-linux/environment`; restart the service after changing that environment file. The legacy 0–2000 ms unconditional input-delay override is diagnostic only and is **not** required to enable policy v6's adaptive hold. Validated media is released promptly, while uncertain encrypted packets can wait at most **five seconds**, within an **8 MiB per-decoder ciphertext-safety envelope** that includes bounded retention/key/probe bookkeeping. This is not a limit on whole-process RSS, native input/write rings, Node workers or HLS caches. Uncertifiable media is discarded on timeout/capacity/ambiguity rather than emitted using a guessed word. Unknown startup, gap or rekey prefixes are withheld unless a trustworthy observed boundary permits release; a later PES header does not automatically validate an unknown earlier prefix. Finite EOF drains owned input-delay tails without padding or inventing packets. Do not delay ECM reception externally. Decoder starts remain paced at one every 500 ms and no more than five per five seconds (about 87 seconds for 90 decoders).
-
-The safety contract assumes correct provider CWs and stable CW contents within each observed same-PID/same-TSC run; ECM table IDs do not determine even/odd transport parity. A continuation cannot reveal an unannounced same-parity key change. PES syntax is not cryptographic authentication or a guarantee of correct picture decoding. Missing source data/ECM announcements, wrong provider keys, excessive latency or unsupported transport behavior can still interrupt playback; there is no 100% availability guarantee.
-
-Dashboard **Source IN** and **OUT** are separate transport measurements. Full input with PSI-only/low output can be legitimate fail-closed behavior, not a reason to increase buffers. Same-PID payload freshness keeps known withheld DVB video `Scrambled` even if PSI or clear audio continues; public CAS status may show `waiting-for-keys` without restarting anything. `cas.payloadEvidence.scope` is `dvb-service`, `previously-observed` or `incomplete`. Arbitrary MPTS startup, truncated snapshots or legacy metrics cannot prove every expected output PID; unrelated encrypted multiplex services are not treated as missing channel output. Clear delivered TS is not itself proof of successful video decoding.
-
-The installer also applies the bundled tsdecrypt EMM PID correction and rebuilds older unpatched installations during an upgrade. Keep the `patches` and `test` directories with `install-cas.sh` when packaging the installer. Native binaries are replaced atomically; corresponding sources, license files and a retained previous native pair are kept on the server. The local private `/var/lib/astra-linux/diagnostics.json` snapshot refreshes every five seconds for root/service-user troubleshooting, including per-PID input/output errors and guard wire-rate peaks. It is not a public HTTP endpoint and does not contain keys or credentials.
-
-1. Go to **Settings** → **Newcamd profiles** → **+ Profile**.
-2. Enter a profile name and ID.
-3. Enter the provider line in this form:
-
-   ```text
-   N: host port username password 0102030405060708091011121314
-   ```
-
-4. Set the required four-digit CAID, for example `0B00`.
-5. For a multi-program transport stream, set the service ID.
-6. Save the profile. EMM forwarding is disabled and has no configuration option.
-7. Edit a stream, open **Advanced**, enable **Newcamd descrambling**, select the saved profile, and save.
-
-The credential is encrypted at rest with AES-256-GCM using the secret in `/etc/astra-linux/environment`. Back up that environment file with the configuration; without the same secret, saved credentials cannot be recovered.
-
-## 10. Back up and upgrade
-
-### Independent deadlines (0.8.59)
-
-The latest installer requires verified OSCam semantic policy 6 and rebuilds older
-readers before activating the matching application. The managed caller timeout
-remains eight seconds; shared provider response/silence recovery independently
-remains eight seconds.
-Request expiry alone cannot close the shared socket or release an unanswered ID.
-Five-second caller expiry was tested but not activated. Provider pacing,
-inflight caps, durable budgets and explicit pause are unchanged. The decoder
-remains policy 11 with its existing adaptive five-second/8-MiB envelope.
-Use the normal latest-version installation/upgrade steps above; no manual OSCam
-configuration edit is needed. See [verification](VERIFICATION-0.8.59.md).
-
-### Channel-isolated recovery (0.8.58)
-
-The latest installer requires decoder policy 11, semantic policy 5 / direct native
-policy 4 and rebuilds older native binaries. Decoder policy 11 supersedes the
-historical policy-10/two-second descriptions above: the adaptive encrypted-media
-hold is now at most five seconds within the unchanged 8 MiB cap. Capacity can be
-reached sooner at high bitrates; healthy media has no fixed five-second delay.
-The ECM reply timeout remains eight seconds and HLS settings are unchanged.
-Its corresponding app/native pair isolates missing
-channel replies with bounded late-ID quarantine, supports sparse successful
-recovery and paces retries for individually failing services. It retains normal
-aggregate admission and the durable provider attempt/health state. One service
-restart activates the matching application and native binaries. Preserve the whole
-provider-budget directory on upgrade or rollback; never restore old credit.
-See [current verification](VERIFICATION-0.8.58.md) and the README for bounds.
-
-### Stable recovery and ECM tracing (0.8.57, superseded qualification)
-
-Version 0.8.57 required verified direct native policy 3 and rebuilt
-older policy 1/2 binaries. It preserves the existing decoder, secrets,
-authentication, stream/EPG settings, explicit pause and lower rate settings.
-One planned service restart activates the matching application/native pair.
-Preserve the whole provider-budget directory, including `*.health.json`, on
-upgrade or rollback; never restore historical attempt/health credit.
-
-Recovery now stays below full rate until thirty seconds of mostly useful keys,
-limits recovery concurrency to 16, and rejects old queued recovery work. It does
-not blacklist channels or reset a responsive provider socket. Numeric-only
-request-age/duplicate/latency counters help investigate remaining failures;
-raw ECMs, correlation hashes and control words are not logged or persisted.
-See README for exact conditions and [verification](VERIFICATION-0.8.57.md).
-
-### Failure-aware provider admission (0.8.56)
-
-Use the latest installer below: it checks the installed binary and requires the
-verified direct-policy-2 OSCam build, rebuilding older native installations.
-The media decoder is unchanged. One service restart activates the matching pair.
-Existing secrets, authentication, streams, explicit CAS pause and lower rate
-settings are preserved. Do not delete or roll back the provider-budget directory
-or its new `*.health.json` files. Reboot/restart cannot clear a limited account.
-
-After sustained account-wide failure, the native scheduler automatically switches
-to sparse fresh probes (2/5/15 seconds) and ramps back up after useful valid keys.
-It does not blacklist channels, need manual unblocking or close a responsive
-provider connection just because replies are negative. Health safety does not
-guarantee uninterrupted playback while keys are unavailable. See README and
-[v0.8.56 verification](VERIFICATION-0.8.56.md) for conditions and test limitations.
-
-### Local admission guard (0.8.55)
-
-With `ASTRA_CAS_TRANSPORT=direct`, decoders now connect through one Node local
-admission guard per shared account before reaching OSCam. OSCam continues to own
-the provider socket and durable protection. The guard connects only to loopback,
-paces all client frames across all decoders, bounds pending work, and forwards
-replies immediately. It can close an overloaded/broken **local** session, but has
-no provider-reset operation. No fixed video buffer is added; key requests can
-wait under load, and a local session exceeding the five-second safety limit is
-closed instead of forwarding stale queued data. Local and provider metrics are
-separate in private diagnostics/history. See README for exact bounds.
-
-In that release the verified v0.8.54 native pair was unchanged; the current
-installer instead requires the v0.8.56 native policy described above.
-Existing direct/guarded mode and explicit pause settings are preserved.
-Do not clear provider budgets. Activating the application needs one service
-restart; Node's new local guard does not eliminate that interruption or genuine
-provider transport failures.
-
-### Direct OSCam transport (0.8.54)
-
-New installations select `ASTRA_CAS_TRANSPORT=direct`: OSCam connects directly
-to the provider; Node only manages configuration and paced decoder startup.
-The native reader retains duplicate suppression, a bounded unanswered window,
-all-frame pacing and a synced, per-account retry budget. Rebuild the verified
-native components with the release's installer before selecting this mode.
-An arbitrary system OSCam binary does not provide these protections.
-
-Upgrades preserve existing environment settings. After `sudo ./install.sh`
-finishes, set `ASTRA_CAS_TRANSPORT=direct` in `/etc/astra-linux/environment` with
-`sudoedit`, then perform one planned `sudo systemctl restart astra-linux`.
-If already running direct mode, no extra restart is needed beyond the normal
-installer activation. The old `guarded` setting remains available for rollback.
-
-Keep the current `cas-proxy-budgets` directory in place across any switch or
-rollback. Never restore an older budget snapshot or delete its lock files.
-Native/Node retry formats interoperate; clock/schema inconsistency can impose
-one conservative safety window. Playback recovers through the existing paced
-startup queue. There is no additional media buffer, and genuine provider-side
-TCP failures can still interrupt key delivery.
-
-Create a protected backup before upgrading:
-
-```bash
-sudo install -d -m 0700 /root/astra-linux-backup
-sudo cp -a /var/lib/astra-linux/config.json /root/astra-linux-backup/
-sudo cp -a /etc/astra-linux/environment /root/astra-linux-backup/
-```
-
-To upgrade to the latest published GitHub version, use the same entry point
-(even if an older local checkout exists):
-
-```bash
-cd "$HOME"
-curl --fail --show-error --location --proto '=https' \
-  https://raw.githubusercontent.com/rsrinaldo/astradvb/main/install-latest.sh \
-  -o astra-install-latest.sh
-bash astra-install-latest.sh
-```
-
-This preserves configuration, authentication, the encryption key, daily guide and
-current provider budgets. Activation briefly interrupts streams, followed by paced
-decoder recovery. Do not delete or rewind `cas-proxy-budgets` during an upgrade.
-Do not schedule unattended restarts on a live broadcast server without planning
-for that interruption.
-
-If maintaining a source checkout instead, switch to a clean `main` branch, run
-`git pull --ff-only origin main`, then `sudo ./install.sh`. Resolve local changes or
-divergence explicitly; do not use a hard reset to discard them. For reproducible
-installs, deliberately check out a published commit/tag rather than using latest.
-
-Verify the version in the signed-in dashboard and the service after the upgrade (`/api/status` requires a management session):
-
-```bash
+sudo systemctl is-active astra-linux astra-tvheadend
+sudo systemctl is-enabled astra-linux astra-tvheadend
 curl -fsS http://127.0.0.1:8000/healthz
-sudo systemctl status astra-linux --no-pager
 ```
 
-## 11. Logs and troubleshooting
+Check tuning, scan/import, HTTP/HLS playback and your receiving system before
+loading all channels. Test a controlled reboot during maintenance to verify the
+machine's drivers/network also return correctly.
 
-### Optional socket-scoped BBR for HTTP media
+Use `sudo systemctl status astra-linux astra-tvheadend --no-pager` for diagnostics.
+Do not publish private configuration, provider credentials, environment files or
+unredacted logs. Kernel/hardware, provider availability and long-term reliability
+must be checked on your own deployment; automated tests do not guarantee them.
 
-Version 0.8.43 retains idle HTTP connections for 60 seconds and adds bounded server-flush telemetry. It does not add a media buffer or modify CAS. The installer builds the optional TCP helper if `/usr/include/node/node_api.h` or `/usr/local/include/node/node_api.h` exists; otherwise normal streaming continues using system TCP policy. If needed, install headers compatible with your Node package and rerun the staged installer for one planned service restart. Do not overwrite a loaded helper in place.
+## URLs and access
 
-The default remains `system`. To test BBR, first record the current kernel settings and load the distribution's existing module:
+- Panel: `http://SERVER_IP:8000` (login required).
+- MPEG-TS: `/play/CHANNEL-ID`.
+- HLS: `/hls/CHANNEL-ID/index.m3u8`.
+- Playlists: `/playlist.m3u?delivery=mpegts` or `/playlist.m3u?delivery=hls`.
+- EPG: `/epg.xml` and `/api/epg`. One shared snapshot publishes once daily;
+  the previous multi-day guide is retained through restarts/source failures.
 
-```bash
-sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_allowed_congestion_control
-sudo modprobe tcp_bbr
-sysctl net.ipv4.tcp_available_congestion_control
-```
+Playback, playlist and EPG endpoints use the IP allowlists in Settings; empty
+lists allow all IPs. HTTP does not encrypt the management password. Use a trusted
+LAN/VPN or a correctly configured HTTPS reverse proxy before external exposure.
+Firewall rules are left unchanged. Allow port 8000 only from intended networks.
+**Never expose backend ports 9981/9982** or forward its GUI/API routes.
 
-Add `bbr` to the **existing** `net.ipv4.tcp_allowed_congestion_control` list, preserving its other entries. For a system whose recorded allowed list is `reno cubic`:
+## Existing installations and maintenance
 
-```bash
-sudo sysctl -w 'net.ipv4.tcp_allowed_congestion_control=reno cubic bbr'
-```
+Do not run the first-install bootstrap against a live server. Back up the exact
+application, service units and protected state before any upgrade. Never run old
+and new provider/tuner owners simultaneously.
 
-Do **not** set the global `net.ipv4.tcp_congestion_control` to BBR. Leave management, SSH and provider connections on their existing default. After successful comparison, boot persistence may be configured with a dedicated `/etc/modules-load.d/astra-media-tcp.conf` containing `tcp_bbr` and `/etc/sysctl.d/90-astra-media-tcp.conf` containing the tested allowed-algorithm list only. Preserve any existing files first. The application and installer never create these kernel opt-in files automatically.
+From a reviewed source checkout, `sudo bash install.sh --prepare` prepares a
+separate app/build without activating it. It refuses an active backend; replacing
+the backend binary requires a maintenance window first. Review the printed app
+and unit paths, retain the old app/binaries, publish the prepared app to
+`/opt/astra-linux`, and install the prepared panel unit explicitly. Validate
+channel UUID/SID mappings and provider selection before enabling real traffic.
 
-Select the media-only policy atomically (no service restart):
+For panel-only static updates, replace only `public/` with a retained rollback
+copy. A service restart is not needed for those files. Do not replace a running
+backend simply to refresh labels or colours.
 
-```bash
-sudo install -o astra -g astra -m 0600 /dev/null /var/lib/astra-linux/media-delivery.json.new
-printf '%s\n' '{"version":1,"congestionControl":"bbr"}' | sudo tee /var/lib/astra-linux/media-delivery.json.new >/dev/null
-sudo mv /var/lib/astra-linux/media-delivery.json.new /var/lib/astra-linux/media-delivery.json
-```
+Persistent state is in `/var/lib/astra-linux`, `/var/lib/astra-tvheadend` and
+`/etc/astra-linux`. Preserve the encryption secret, authentication, profiles,
+channel IDs, EPG and provider budgets during migration. Do not restore stale
+retry-budget snapshots or overwrite the private backend credentials.
 
-Use `cubic` for the comparison phase and `system` for rollback. Wait at least five seconds for policy application, then verify actual media sockets with `sudo ss -tin 'sport = :8000'`; do not infer successful BBR from the configuration label alone. Compare the same existing HLS clients over several minutes, excluding transitions, and confirm continuity, decoder, provider and worker counters do not regress. Retain BBR only if measured delivery improves without harmful backlog/retransmission or CPU regressions.
-
-For rollback, atomically select `system` using the same procedure, verify sockets restored, restore the recorded allowed list, and remove/restore only the dedicated persistence files you created. Unload `tcp_bbr` only if it was previously unloaded and no sockets still use it; never force module removal. Application rollback uses the previous directory retained by the installer. Keep configuration, auth, encryption keys, native CAS binaries/manifests and daily EPG together with their matching backups.
-
-`serverFlushMs` is OS handoff, not client receipt; a low value alone does not prove fast remote playback. The unchanged HLS URLs and Flussonic configuration need no edits.
-
-Follow logs live:
-
-```bash
-sudo journalctl -u astra-linux -f
-```
-
-Restart the service:
-
-```bash
-sudo systemctl restart astra-linux
-```
-
-Confirm installed helpers:
-
-```bash
-node --version
-ffmpeg -version | head -n 1
-dvbv5-zap --version
-tsdecrypt --version
-oscam --help | head -n 1
-```
-
-Check port 8000:
-
-```bash
-sudo ss -ltnp | grep ':8000'
-```
-
-For multicast problems, verify the route, interface address, group membership, switch IGMP snooping, and upstream TTL:
-
-```bash
-ip route
-ip maddr
-```
-
-Common causes:
-
-- **Dashboard opens but cannot save:** sign in again if your session expired, change the initial password if prompted, and inspect browser errors and service logs. API mutations require a valid session cookie and `X-CSRF-Token`.
-- **Flussonic HLS works but sessions show zero:** upgrade to v0.8.37 or newer. Earlier versions counted only MPEG-TS relay connections. HLS now counts completed segment downloads grouped by stream, source IP and player identity, with uptime and automatic idle expiration (at least 30 seconds). Manifest probes do not count. Flussonic's downstream viewers cannot be counted at this origin server.
-- **Intermittent HLS freezes or expired segment URLs:** v0.8.39 fixes changing target durations, uses programme PCR timing when available, preserves at least three target durations in the live window, and retains retired segment URLs for delayed readers. Default target duration is fixed at nine seconds; normal segments remain approximately six seconds. The configured window count may be extended to satisfy the duration minimum. Retired media has a bounded grace cache, so this consumes additional RAM without changing tuners, CAS/provider pacing, EPG publication or continuous MPEG-TS output. Check network delivery separately: segment downloads slower than their media duration can still drain the player's buffer.
-- **Low total CPU but one busy packet-processing thread:** v0.8.40 uses one-pass DVB dispatch and a bounded multicore packet/EPG/HLS worker pool. Check authenticated `/api/status` → `processing` for active workers, queue/drop/restart counts and main-loop latency; per-stream status reports its worker. Default pool capacity is at most eight and channels on the same tuner share a worker. For diagnostics, set `ASTRA_PACKET_WORKERS=0` in `/etc/astra-linux/environment` and restart the service to use synchronous processing; this briefly interrupts streams but does not change provider settings. Do not start multiple complete engine instances as a shortcut, since that can duplicate tuner/provider access. Source loss and late keys still require separate diagnosis.
-- **HTTP URL returns 404:** enable HTTP MPEG-TS for that stream and check the stream ID.
-- **HTTP connection opens but no video arrives:** inspect input state, bitrate, continuity errors, and service logs.
-- **Multicast input is idle:** confirm the multicast group reaches the correct NIC and Linux has a route for it.
-- **DVB adapter is absent:** confirm `/dev/dvb` exists and the `astra` account belongs to `video`.
-- **DVB has no lock:** recheck frequency units, symbol rate, polarization, delivery system, LNB, DiSEqC, and cabling.
-- **Newcamd stream remains scrambled:** confirm authorization, reachability, DES key, CAID, service ID, and ECM presence in the transport stream.
-- **EPG is empty:** confirm the input contains DVB EIT tables and allow time for collection.
-
-## 12. Docker alternative
-
-Native systemd installation is recommended for direct DVB hardware access. For a container deployment:
-
-```bash
-cd linux
-mkdir -p data
-cp config.example.json data/config.json
-export ASTRA_SECRET_KEY="$(openssl rand -hex 32)"
-docker compose up -d --build
-```
-
-The compose file uses host networking for multicast. To use DVB, uncomment the `/dev/dvb` device mapping in `compose.yaml` after the host exposes the adapter.
+For rollback, stop only the services being replaced, restore the retained
+matching app/unit/binaries and configuration as needed, reload systemd, then
+start the old version. Do not run both versions at once. Consult
+[architecture notes](TVHEADEND-ONLY.md); historical reports are not install guides.

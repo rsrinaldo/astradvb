@@ -1,0 +1,29 @@
+[Unit]
+Description=Astra frontend with TVHeadend-only media backend
+Requires=astra-tvheadend.service
+After=network-online.target astra-tvheadend.service
+
+[Service]
+Type=simple
+User=astra
+Group=astra
+WorkingDirectory=/opt/astra-linux
+Environment=NODE_ENV=production
+Environment=ASTRA_CONFIG=/var/lib/astra-linux/config.json
+EnvironmentFile=/etc/astra-linux/environment
+ExecStart=/usr/bin/env ASTRA_BACKEND=tvheadend /usr/local/bin/astra-node /opt/astra-linux/src/server.mjs
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+LimitCORE=0
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/astra-linux
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

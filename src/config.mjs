@@ -67,6 +67,7 @@ export function normalizeDVBAdapter(adapter = {}) {
     lnb: String(adapter.lnb || 'EXTENDED').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32),
     diseqc: Math.max(-1, Math.min(15, Number.isFinite(Number(adapter.diseqc)) ? Number(adapter.diseqc) : -1)),
     unicableKHz: Math.max(0, Number(adapter.unicableKHz) || 0),
+    ...(adapter.tvheadend ? { tvheadend: Object.fromEntries(Object.entries(adapter.tvheadend).filter(([key, value]) => ['uuid', 'network', 'mux', 'satconf', 'unicable'].includes(key) && /^[a-f0-9]{32}$/i.test(String(value)))) } : {}),
   };
 }
 
@@ -85,6 +86,7 @@ function normalizeCASProfile(profile) {
 export function normalizeStream(stream = {}) {
   const id = String(stream.id || '').trim();
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id)) throw new Error(`Invalid stream id: ${id || '(empty)'}`);
+  if (stream.service?.tvheadendUUID && !/^[a-f0-9]{32}$/i.test(stream.service.tvheadendUUID)) throw new Error('Invalid TVHeadend channel UUID');
   const inputs = Array.isArray(stream.inputs) ? stream.inputs : [];
   const outputs = Array.isArray(stream.outputs) ? stream.outputs : [];
   return {
