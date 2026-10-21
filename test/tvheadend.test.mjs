@@ -90,6 +90,21 @@ test('bindings must exist; never silently select the first channel or mutate sto
   assert.equal(backend.channelFor({ ...stream, service: { tvheadendUseInputs: true } }), '', 'Explicit input reconfiguration must override an old private mapping');
 });
 
+test('disabled channels are requested with all=1 and may be validated before re-enabling', async () => {
+  const { backend, calls } = fixture((path, params) => path === 'channel/grid' ? { entries: params.all === 1 ? [{ uuid, name: stream.name, enabled: false, services: [reader] }] : [] } : undefined);
+  await backend.validate(config, { allowDisabledBindings: true });
+  await assert.rejects(backend.validate(config), /binding/);
+  await backend.refresh();
+  assert.equal(backend.channels[0].enabled, false);
+  assert.ok(calls.filter(c => c.path === 'channel/grid').every(c => c.params.all === 1));
+});
+
+test('network scan refuses a busy tuner before changing network or mux configuration', async () => {
+  const { backend, calls } = fixture(path => path === 'status/inputs' ? { entries: [{ uuid, subs: 3 }] } : undefined);
+  await assert.rejects(backend.scan({ id: 't', tvheadend: { uuid, mux: reader, network: 'c'.repeat(32) } }, { networkScan: true }), /idle tuner/);
+  assert.equal(calls.some(c => c.path === 'idnode/save'), false);
+});
+
 test('overlapping CAIDs and missing CAS profiles cannot choose the wrong TVH reader', async () => {
   const { backend } = fixture();
   const encrypted = { ...stream, cam: { enabled: true, profile: 'a' } };

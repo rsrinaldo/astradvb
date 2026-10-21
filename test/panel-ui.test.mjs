@@ -54,3 +54,42 @@ test('theme text, secondary text and state colours have readable contrast on pan
   assert.ok(contrast('#10223f', token('cyan')) >= 4.5, 'Primary action text contrast');
   assert.match(css, /prefers-reduced-motion/);
 });
+
+test('bulk controls report accepted jobs without optimistic channel changes or duplicate submissions', async () => {
+  const source = await read('app.js'), html = await read('index.html');
+  for (const id of ['enable-selected-streams', 'disable-selected-streams', 'stream-operation-progress', 'clear-stream-selection']) assert.ok(html.includes(`id="${id}"`));
+  const fn = source.slice(source.indexOf('async function setSelectedEnabled('), source.indexOf('function showView('));
+  const requests = [], notices = [], stream = { id: 'one', enabled: false };
+  const state = { selectedStreams: new Set(['one']), streams: [stream], status: {}, config: {} };
+  const context = vm.createContext({ state, confirm: () => true, renderStreams() {}, async refresh() {}, toast: (...args) => notices.push(args),
+    api: async (path, options) => { requests.push({ path, body: JSON.parse(options.body) }); return { job: { id: 'job', state: 'queued' } }; } });
+  vm.runInContext('let bulkRequestPending = false; ' + fn, context);
+  await vm.runInContext('setSelectedEnabled(true)', context);
+  assert.deepEqual(requests, [{ path: '/api/streams/state', body: { ids: ['one'], enabled: true } }]);
+  assert.equal(stream.enabled, false, 'Only refreshed server state may change channel status');
+  assert.equal(state.config, null); assert.equal(state.status.bulkState.state, 'queued');
+  await vm.runInContext('setSelectedEnabled(true)', context); assert.equal(requests.length, 1);
+  delete state.status.bulkState;
+  context.api = async () => { throw new Error('Synthetic failure'); };
+  await vm.runInContext('setSelectedEnabled(true)', context);
+  assert.equal(stream.enabled, false); assert.deepEqual(notices.at(-1), ['Synthetic failure', true]);
+});
+
+test('selection controls count hidden selections and expose server-reported partial failures', async () => {
+  const source = await read('app.js');
+  const fn = source.slice(source.indexOf('function renderStreams('), source.indexOf('function renderSessions('));
+  const elements = new Map();
+  const state = { streams: [{ id: 'one', name: 'Rai', enabled: false, state: 'stopped' }, { id: 'two', name: 'Film', enabled: true, state: 'running' }], selectedStreams: new Set(['one', 'two']), sessions: [], query: 'Rai', status: { bulkState: { enabled: true, total: 2, completed: 1, applied: ['two'], unchanged: [], state: 'failed', error: 'Synthetic failure' } } };
+  const context = vm.createContext({ state, bulkRequestPending: false, escapeHTML: x => String(x ?? ''), streamRatesMarkup: () => '', duration: () => '', $: id => {
+    if (!elements.has(id)) elements.set(id, { classList: { toggle() {} } }); return elements.get(id);
+  } });
+  vm.runInContext(fn + ';renderStreams()', context);
+  assert.equal(elements.get('#enable-selected-streams').disabled, false);
+  assert.equal(elements.get('#disable-selected-streams').disabled, false);
+  assert.match(elements.get('#stream-selection-count').textContent, /2 selected.*1 hidden/);
+  assert.match(elements.get('#stream-operation-progress').textContent, /1\/2.*stopped: Synthetic failure/);
+  state.status.bulkState.state = 'running';
+  vm.runInContext('renderStreams()', context);
+  assert.equal(elements.get('#enable-selected-streams').disabled, true);
+  assert.equal(elements.get('#delete-selected-streams').disabled, true);
+});

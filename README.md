@@ -33,6 +33,20 @@ Use a trusted LAN/VPN or HTTPS reverse proxy for management.
 The first-install script **refuses existing installations**. It is not a live
 upgrader. See [installation, verification and maintenance](INSTALL-UBUNTU.md).
 
+## Channel controls
+
+Select channels, then use **Enable selected**, **Disable selected** or **Delete
+selected**. Enable/disable preserves configuration and synchronizes the native
+channel flag; a shared channel stays enabled while any configured alias needs it.
+The selection count includes entries hidden by a search filter. Bulk operations
+report actual progress and stop/report partial failures rather than claiming all
+channels changed. Reloading the page does not resubmit a running operation.
+
+New background HLS subscriptions, including on-demand requests, are paced two
+seconds apart. This controls panel subscription startup only, not native ECM or
+provider reconnect policy; it is not an account-wide CAS rate limiter. Playback
+can take longer to start during a large enable/startup operation.
+
 ## Architecture
 
 Unmodified [TVHeadend](https://github.com/tvheadend/tvheadend) is the sole backend
@@ -45,7 +59,7 @@ The existing HLS output layer is retained, with optional FFmpeg audio compatibil
 HTTP MPEG-TS is a backpressure-aware proxy. OSCam, tsdecrypt, custom CAS proxies,
 native tuner helpers and the old packet-worker backend are not installed.
 
-[Architecture details](TVHEADEND-ONLY.md) · [Verification](VERIFICATION-TVHEADEND-0.9.0-dev.6.md)
+[Architecture details](TVHEADEND-ONLY.md) · [Verification](VERIFICATION-TVHEADEND-0.9.0-dev.7.md)
 
 Historical verification/migration reports describe older implementations; do not
 use their installation commands for the current release. Full-load/provider and

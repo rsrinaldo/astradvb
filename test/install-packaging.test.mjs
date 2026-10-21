@@ -10,7 +10,7 @@ const read = name => readFile(join(root, name), 'utf8');
 
 test('single runtime and dashboard identify the clean stock-TVH candidate', async () => {
   const info = JSON.parse(await read('package.json')), html = await read('public/index.html');
-  assert.equal(info.version, '0.9.0-dev.6'); assert.equal(info.scripts.start, 'node src/panel-server.mjs');
+  assert.equal(info.version, '0.9.0-dev.7'); assert.equal(info.scripts.start, 'node src/panel-server.mjs');
   assert.ok(html.includes(`app.js?v=${info.version}`)); assert.ok(html.includes(`styles.css?v=${info.version}`));
   assert.doesNotMatch(html, /\bTVHeadend\b|\bTVH\b/);
   assert.doesNotMatch(await read('public/app.js'), /\bTVHeadend\b|\bTVH\b/);

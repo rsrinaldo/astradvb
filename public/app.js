@@ -3,6 +3,7 @@ const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 let administrator = null;
 let events = null;
+let bulkRequestPending = false;
 
 async function api(path, options = {}) {
   const headers = { ...(options.body ? { 'content-type': 'application/json' } : {}), ...(options.headers || {}) };
@@ -48,7 +49,7 @@ function render() {
   const cpu = status.resources?.cpu;
   const ram = status.resources?.memory;
   $('#metrics').innerHTML = [
-    ['●', 'Running streams', `${running}/${state.streams.length}`, `${scrambled} scrambled · ${status.streams?.warning || 0} need attention`],
+    ['●', 'Running streams', `${running}/${state.streams.filter(s => s.enabled).length}`, `${state.streams.length} total · ${state.streams.filter(s => !s.enabled).length} disabled · ${scrambled} scrambled · ${status.streams?.warning || 0} need attention`],
     ['⌁', 'Stream output', outputRates.length ? `${(bitrate / 1000).toFixed(1)} Mb/s` : '—', 'Media engine channel-subscription rate; not viewer fan-out'],
     ['↓', 'Host network IN (RX)', networkRate(status.network, 'rxMbps'), networkDetail(status.network, 'rxBytes')],
     ['↑', 'Host network OUT (TX)', networkRate(status.network, 'txMbps'), networkDetail(status.network, 'txBytes')],
@@ -128,7 +129,7 @@ function loadCardSummaries(cards) {
 function renderStreams() {
   const hlsClients = new Map();
   for (const session of state.sessions) if (session.protocol === 'hls') hlsClients.set(session.streamId, (hlsClients.get(session.streamId) || 0) + 1);
-  const rank = { running: 0, scrambled: 1, starting: 2, connecting: 3, warning: 4, failover: 5, error: 6, stopped: 7 };
+  const rank = { running: 0, scrambled: 1, starting: 2, connecting: 3, warning: 4, 'backend-disabled': 4, unmapped: 4, failover: 5, error: 6, idle: 7, stopped: 8 };
   const streams = state.streams
     .filter((stream) => `${stream.name} ${stream.id}`.toLowerCase().includes(state.query.toLowerCase()))
     .sort((a, b) => (rank[a.state] ?? 8) - (rank[b.state] ?? 8) || a.name.localeCompare(b.name, undefined, { numeric: true }));
@@ -140,8 +141,18 @@ function renderStreams() {
   selectAll.checked = Boolean(visibleIds.length) && selectedVisible === visibleIds.length;
   selectAll.indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
   const deleteButton = $('#delete-selected-streams');
-  deleteButton.disabled = state.selectedStreams.size === 0;
+  const busy = bulkRequestPending || ['queued', 'running'].includes(state.status?.bulkState?.state);
+  const selected = state.streams.filter(s => state.selectedStreams.has(s.id));
+  deleteButton.disabled = busy || state.selectedStreams.size === 0;
   deleteButton.textContent = state.selectedStreams.size ? `Delete selected (${state.selectedStreams.size})` : 'Delete selected';
+  $('#enable-selected-streams').disabled = busy || !selected.some(s => !s.enabled || s.backendEnabled === false);
+  $('#disable-selected-streams').disabled = busy || !selected.some(s => s.enabled);
+  $('#clear-stream-selection').disabled = busy || !selected.length;
+  $('#stream-selection-count').textContent = `${selected.length} selected${selected.length > selectedVisible ? ` · ${selected.length - selectedVisible} hidden by filter` : ''}`;
+  const job = state.status?.bulkState, progress = $('#stream-operation-progress');
+  progress.hidden = !job && !bulkRequestPending;
+  progress.classList.toggle('failed', Boolean(job?.error));
+  progress.textContent = bulkRequestPending ? 'Submitting selected channels…' : !job ? '' : `${job.enabled ? 'Enable' : 'Disable'} selected: ${job.completed}/${job.total} processed · ${job.applied.length} changed · ${job.unchanged.length} already matched${job.error ? ` · stopped: ${job.error}. Refresh the channel states before retrying.` : job.state === 'completed' ? ' · complete' : ' · in progress; enabled playback starts gradually'}`;
 }
 
 function renderSessions() {
@@ -312,7 +323,8 @@ async function deleteCASProfile() {
 
 async function openStream(id = null, initialInput = '') {
   try {
-    const config = state.config || await loadConfig();
+    // Editing must use current settings, including changes made by another tab.
+    const config = await loadConfig();
     const stream = id ? config.streams.find((item) => item.id === id) : { id: '', name: '', enabled: false, inputs: [], outputs: [], hls: true, hlsCompatibility: false, http: true, onDemand: false, keepActiveSeconds: 0, cam: { enabled: false, profile: 'default' } };
     if (!stream) throw new Error('Stream configuration not found');
     state.editing = id;
@@ -380,6 +392,19 @@ async function deleteSelectedStreams() {
   } catch (error) { toast(error.message, true); renderStreams(); }
 }
 
+async function setSelectedEnabled(enabled) {
+  const ids = [...state.selectedStreams];
+  if (!ids.length || bulkRequestPending || ['queued', 'running'].includes(state.status?.bulkState?.state)) return;
+  if (!enabled && !confirm(`Disable ${ids.length} selected channels? Playback and their sessions will stop. Channel configurations are preserved.`)) return;
+  bulkRequestPending = true; renderStreams();
+  try {
+    const { job } = await api('/api/streams/state', { method: 'POST', body: JSON.stringify({ ids, enabled }) });
+    state.status.bulkState = job; state.config = null;
+    toast(`${enabled ? 'Enable' : 'Disable'} operation accepted; progress is shown above the channels`);
+  } catch (error) { toast(error.message, true); }
+  finally { bulkRequestPending = false; await refresh(); renderStreams(); }
+}
+
 function showView(id) { $$('.view').forEach((view) => view.classList.toggle('active', view.id === id)); $$('.nav').forEach((button) => button.classList.toggle('active', button.dataset.view === id)); if (id === 'settings') loadConfig().catch(() => {}); }
 function selectTab(id) {
   $$('#stream-dialog .tab').forEach(tab => {
@@ -426,6 +451,9 @@ $('#streams').addEventListener('click', (event) => { if (event.target.closest('.
 $('#streams').addEventListener('change', (event) => { const checkbox = event.target.closest('[data-stream-select]'); if (!checkbox) return; if (checkbox.checked) state.selectedStreams.add(checkbox.dataset.streamSelect); else state.selectedStreams.delete(checkbox.dataset.streamSelect); renderStreams(); });
 $('#select-all-streams').addEventListener('change', (event) => { const visible = state.streams.filter((stream) => `${stream.name} ${stream.id}`.toLowerCase().includes(state.query.toLowerCase())); for (const stream of visible) { if (event.target.checked) state.selectedStreams.add(stream.id); else state.selectedStreams.delete(stream.id); } renderStreams(); });
 $('#delete-selected-streams').addEventListener('click', deleteSelectedStreams);
+$('#enable-selected-streams').addEventListener('click', () => setSelectedEnabled(true));
+$('#disable-selected-streams').addEventListener('click', () => setSelectedEnabled(false));
+$('#clear-stream-selection').addEventListener('click', () => { state.selectedStreams.clear(); renderStreams(); });
 $('#adapters').addEventListener('click', (event) => { const card = event.target.closest('[data-adapter-id]'); if (card) openAdapter(card.dataset.adapterId); });
 $('#stream-form').addEventListener('submit', saveStream);
 $('#stream-form').addEventListener('invalid', event => {
@@ -433,7 +461,7 @@ $('#stream-form').addEventListener('invalid', event => {
   if (panel) selectTab(panel.dataset.panel);
 }, true);
 $('#delete-stream').addEventListener('click', deleteStream);
-$('#settings-form').addEventListener('submit', async (event) => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); for (const key of Object.keys(data)) data[key] = Number(data[key]); try { await api('/api/settings', { method: 'PUT', body: JSON.stringify(data) }); state.config = null; await refresh(); toast('Runtime settings applied'); } catch (error) { toast(error.message, true); } });
+$('#settings-form').addEventListener('submit', async (event) => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); for (const key of Object.keys(data)) data[key] = Number(data[key]); try { await api('/api/settings', { method: 'PUT', body: JSON.stringify(data) }); await loadConfig(); await refresh(); toast('HLS settings applied'); } catch (error) { toast(error.message, true); } });
 $('#new-cas-profile').addEventListener('click', () => openCASProfile());
 $('#cas-profiles').addEventListener('click', (event) => { const row = event.target.closest('[data-profile]'); if (row) openCASProfile(row.dataset.profile); });
 $('#cas-profile-form').addEventListener('submit', saveCASProfile);
@@ -500,6 +528,7 @@ function connectEvents() {
   events.addEventListener('status', (event) => { state.status = JSON.parse(event.data); render(); });
   events.addEventListener('log', (event) => { state.logs.unshift(JSON.parse(event.data)); state.logs = state.logs.slice(0, 100); renderLogs(); });
   events.addEventListener('sessions', (event) => { state.sessions = JSON.parse(event.data).sessions; if (state.status) state.status.sessions = state.sessions.length; render(); });
+  events.addEventListener('config', () => { state.config = null; void refresh(); });
 }
 async function initialize() {
   try {

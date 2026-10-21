@@ -83,7 +83,8 @@ function status() {
     engine: manager.backend.status === 'online' ? 'online' : 'offline',
     backend: manager.backend.snapshot(),
     authentication: 'enabled',
-    streams: { total: streams.length, running: streams.filter((stream) => stream.state === 'running').length, scrambled: streams.filter((stream) => stream.state === 'scrambled').length, warning: streams.filter((stream) => stream.state === 'warning' || stream.state === 'error' || stream.state === 'failover').length },
+    streams: { total: streams.length, enabled: streams.filter(s => s.enabled).length, disabled: streams.filter(s => !s.enabled).length, running: streams.filter((stream) => stream.state === 'running').length, scrambled: streams.filter((stream) => stream.state === 'scrambled').length, warning: streams.filter((stream) => ['warning', 'error', 'failover', 'backend-disabled', 'unmapped'].includes(stream.state)).length },
+    bulkState: manager.bulkStateSnapshot(),
     sessions: sessions.size,
     cas: manager.casSnapshot(),
     memory: process.memoryUsage(),
@@ -105,6 +106,11 @@ function resolveWorker(key) {
   const direct = manager.get(key);
   if (direct) return direct;
   return manager.get(aliasIndex.resolve(store.value.streams, key));
+}
+
+function streamChanged(saved, previous = saved) {
+  sessions.disconnectWhere(entry => entry.streamId === saved.id && (!saved.enabled || manager.backend.channelFor(previous) !== manager.backend.channelFor(saved) || (entry.protocol === 'mpegts' ? !saved.http : !saved.hls)));
+  broadcast('config', { resource: 'stream', id: saved.id });
 }
 
 function broadcast(event, data) {
@@ -186,9 +192,15 @@ const server = http.createServer(async (request, response) => {
     }
     if (request.method === 'GET' && path === '/api/status') return json(response, 200, status());
     if (request.method === 'GET' && path === '/api/streams') return json(response, 200, { streams: streamList() });
+    if (request.method === 'GET' && path === '/api/streams/state') return json(response, 200, { job: manager.bulkStateSnapshot() });
+    if (request.method === 'POST' && path === '/api/streams/state') {
+      const value = await body(request);
+      const job = manager.beginSetEnabled(value.ids, value.enabled, saved => streamChanged(saved));
+      return json(response, 202, { job });
+    }
     if (request.method === 'GET' && path === '/api/backend/tvheadend/channels') {
       if (!manager.backend) return error(response, 409, 'Media engine backend is not selected');
-      const catalogue = await manager.backend.client.api('channel/grid', { limit: 10000 });
+      const catalogue = await manager.backend.client.api('channel/grid', { limit: 10000, all: 1 });
       return json(response, 200, { channels: (catalogue.entries || []).map(c => ({ uuid: c.uuid, name: c.name, enabled: c.enabled })), bindings: Object.fromEntries(manager.backend.bindings) });
     }
     if (request.method === 'GET' && path === '/api/adapters') return json(response, 200, { adapters: await adapterStatus(url.searchParams.get('refresh') === '1') });
@@ -289,8 +301,7 @@ const server = http.createServer(async (request, response) => {
       const value = normalizeStream({ ...(await body(request)), id: streamRoute[1] });
       const previous = manager.get(value.id)?.config;
       const saved = await manager.upsert(value);
-      if (!saved.enabled || manager.backend.channelFor(previous || {}) !== manager.backend.channelFor(saved)) sessions.disconnectWhere(entry => entry.streamId === saved.id);
-      broadcast('config', { resource: 'stream', id: saved.id }); return json(response, 200, saved);
+      streamChanged(saved, previous || {}); return json(response, 200, saved);
     }
     if (request.method === 'POST' && path === '/api/streams') {
       const incoming = await body(request); const value = normalizeStream(incoming);

@@ -18,8 +18,21 @@ const values = {
   '/api/logs': { logs: [{ time: new Date(now).toISOString(), sourceName: names[0], source: streams[0].id, level: 'info', message: 'Channel is running. Broadcast guide received and daily publication available.' }] },
   '/api/backend/tvheadend/channels': { channels: streams.map(s => ({ uuid, name: s.name })), bindings: {} },
 };
+const interactive = process.argv.includes('--interactive');
 http.createServer(async (req, res) => {
   const path = new URL(req.url, 'http://127.0.0.1').pathname;
+  if (interactive && req.method === 'POST' && path === '/api/streams/state') {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const { ids, enabled } = JSON.parse(Buffer.concat(chunks));
+    const job = status.bulkState = { id: 'synthetic-job', enabled, total: ids.length, completed: 0, applied: [], unchanged: [], state: 'running', error: null };
+    res.writeHead(202, { 'content-type': 'application/json' }); res.end(JSON.stringify({ job }));
+    for (const id of ids) {
+      const stream = streams.find(s => s.id === id);
+      if (stream) { stream.enabled = enabled; stream.backendEnabled = enabled; stream.state = enabled ? 'running' : 'stopped'; stream.outputBitrateKbps = stream.inputBitrateKbps = enabled ? 3500 : 0; stream.startedAt = enabled ? new Date().toISOString() : null; job.applied.push(id); }
+      job.completed++;
+    }
+    job.state = 'completed'; return;
+  }
   if (req.method !== 'GET') { res.writeHead(405); res.end('Visual preview is read-only'); return; }
   if (path === '/api/events') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': preview\n\n'); return; }
   let value = values[path];
@@ -29,4 +42,4 @@ http.createServer(async (req, res) => {
   if (!/^(index\.html|login\.html|app\.js|login\.js|styles\.css|enhancements\.css|auth\.css|favicon\.svg)$/.test(name)) { res.writeHead(404); res.end(); return; }
   res.writeHead(200, { 'content-type': name.endsWith('.css') ? 'text/css' : name.endsWith('.js') ? 'text/javascript' : name.endsWith('.svg') ? 'image/svg+xml' : 'text/html', 'cache-control': 'no-store', 'content-security-policy': "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'" });
   res.end(await readFile(new URL(name, root)));
-}).listen(18765, '127.0.0.1', () => console.log('Read-only synthetic visual preview: http://127.0.0.1:18765'));
+}).listen(18765, '127.0.0.1', () => console.log(`${interactive ? 'Interactive synthetic (memory-only)' : 'Read-only synthetic'} visual preview: http://127.0.0.1:18765`));

@@ -51,7 +51,8 @@ export class TVHeadendBackend {
       if (!/^[A-F0-9]{4}$/.test(caid) || (seenCAIDs.has(caid) && seenCAIDs.get(caid) !== accounts.get(profile.id))) throw new Error('Media engine requires one provider account per CAID; ambiguous reader selection is refused');
       seenCAIDs.set(caid, accounts.get(profile.id)); profileCAIDs.set(profile.id, caid);
     }
-    const entries = await this.client.api('channel/grid', { limit: 10000 });
+    // The native grid hides disabled channels unless an administrator asks for all.
+    const entries = await this.client.api('channel/grid', { limit: 10000, all: 1 });
     this.channels = (entries.entries || []).filter(c => tvhUUID(c.uuid));
     if (Number(entries.total) > 10000 || Number(entries.totalCount) > 10000) throw new Error('Media engine channel catalogue exceeds migration limit');
     const catalogue = await this.client.api('mpegts/service/grid', { limit: 10000, hidemode: 'none' });
@@ -151,8 +152,9 @@ export class TVHeadendBackend {
   }
   async #refresh() {
     try {
-      const [inputs, subscriptions, readers] = await Promise.all([this.client.api('status/inputs'), this.client.api('status/subscriptions'), this.inspectCASReaders()]);
+      const [inputs, subscriptions, readers, channels] = await Promise.all([this.client.api('status/inputs'), this.client.api('status/subscriptions'), this.inspectCASReaders(), this.client.api('channel/grid', { limit: 10000, all: 1 })]);
       if (this.stopped) return;
+      this.channels = (channels.entries || []).filter(c => tvhUUID(c.uuid));
       this.inputs = inputs.entries || []; this.subscriptions = subscriptions.entries || [];
       this.casReaders = readers.filter(managed).map(n => ({ account: n.comment.match(/^Astra direct ([a-f0-9]{24}):/)?.[1] || '', enabled: Boolean(n.enabled), status: String(n.status || 'unknown') }));
       for (const [id, uuid] of this.bindings) {
@@ -221,6 +223,12 @@ export class TVHeadendBackend {
     const binding = adapter.tvheadend || this.frontends[adapter.id], mux = binding?.mux;
     if (!tvhUUID(mux)) throw new Error('Bind a Media engine mux UUID for this tuner before scanning');
     if (networkScan && !tvhUUID(binding.network)) throw new Error('A Media engine network binding is required for NIT scanning');
+    if (networkScan) {
+      const inputs = await this.client.api('status/inputs');
+      const node = this.tuners.nodes.find(n => n.uuid === binding.uuid);
+      if ((inputs.entries || []).some(i => (i.uuid === binding.uuid || (node?.text && i.input === node.text)) && Number(i.subs) > 0))
+        throw new Error('Network scanning requires an idle tuner; current-transponder scanning remains available');
+    }
     if (networkScan) await this.client.api('idnode/save', { node: { uuid: binding.network, autodiscovery: 1 } });
     await this.client.api('idnode/save', { node: { uuid: mux, scan_state: 1 } });
     const deadline = this.now() + Math.min(240000, Math.max(1000, Number(timeoutMs) || 15000));
@@ -255,7 +263,7 @@ export class TVHeadendBackend {
     const grid = await this.client.api('mpegts/service/grid', { limit: 10000, hidemode: 'none' });
     const service = grid.entries?.find(s => s.uuid === serviceUUID && Number(s.sid) === Number(stream.service.serviceId));
     if (!service) throw new Error('Scanned Media engine service is no longer available');
-    const channels = await this.client.api('channel/grid', { limit: 10000 });
+    const channels = await this.client.api('channel/grid', { limit: 10000, all: 1 });
     const existing = channels.entries?.find(c => c.services?.includes(serviceUUID));
     const created = existing || await this.client.api('channel/create', { conf: { name: stream.name, enabled: true, services: [serviceUUID] } });
     const uuid = Array.isArray(created.uuid) ? created.uuid[0] : created.uuid;

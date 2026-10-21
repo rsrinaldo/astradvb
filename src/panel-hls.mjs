@@ -12,11 +12,12 @@ export class PanelHLS {
     this.framer = new HLSInputFramer(); this.metadata = new StreamMetadata(config.name);
     this.abort = null; this.bridge = null; this.retry = null; this.demandUntil = 0; this.lastDataAt = 0;
     this.state = 'idle'; this.stopped = false; this.task = null;
+    this.requestStart = () => this.start();
   }
   touchHLS() {
     if (!this.config.enabled || !this.config.hls || this.stopped) return;
     this.demandUntil = Date.now() + Math.max(30000, this.hls.targetDuration * 3000, this.config.keepActiveSeconds * 1000);
-    this.start();
+    this.requestStart();
   }
   start() {
     if (this.abort || this.retry || this.stopped || !this.config.enabled || !this.config.hls) return;
@@ -39,7 +40,7 @@ export class PanelHLS {
         this.hls.markDiscontinuity(); this.framer.reset();
         // Delivery reconnect only: never reconfigure the native CAS reader.
         if (!this.stopped && (!this.config.onDemand || Date.now() < this.demandUntil)) {
-          this.retry = setTimeout(() => { this.retry = null; this.start(); }, 5000); this.retry.unref();
+          this.retry = setTimeout(() => { this.retry = null; this.requestStart(); }, 5000); this.retry.unref();
         }
       });
   }

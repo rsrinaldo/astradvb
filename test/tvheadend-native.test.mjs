@@ -109,5 +109,14 @@ test('real TVHeadend authenticates, discovers an IPTV service and descrambles ge
   const restarted = new TVHeadendBackend(options, new RingLogger(), { client });
   await restarted.syncCAS([profile]); await delay(500);
   assert.equal(provider.snapshot().connections, 1, 'Management restart must not reconfigure an unchanged native provider reader');
+  await client.api('idnode/save', { node: { uuid: channel, enabled: false } });
+  const visible = await client.api('channel/grid', { limit: 10000 });
+  assert.equal(visible.entries.some(c => c.uuid === channel), false, 'Stock catalogue hides disabled channels by default');
+  await backend.validate({ streams: [stream], casProfiles: [profile] }, { allowDisabledBindings: true });
+  assert.equal(backend.channels.find(c => c.uuid === channel).enabled, false);
+  await client.api('idnode/save', { node: { uuid: channel, enabled: true } });
+  await backend.validate({ streams: [stream], casProfiles: [profile] });
+  assert.equal(provider.snapshot().connections, 1, 'Channel flag changes must not reconnect an unchanged reader');
+  console.log(JSON.stringify({ case: 'native-disabled-channel-catalogue', disabledBindingValidated: true, providerConnections: provider.snapshot().connections }));
   console.log(JSON.stringify({ case: 'tvheadend-direct-only', upstreamConnections: status.connections, upstreamPeak: status.peakRequestsPerSecond, oscamProcesses: 0 }));
 });
